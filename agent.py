@@ -1,14 +1,13 @@
-"""
-Plan-then-execute against a local Ollama server.
-Requires a recent Ollama (the `think` param needs ~0.9+).
-"""
- 
-from itertools import count
 
 import requests
 import re
- 
+import datetime
+import functools
+import time
+
 URL = "http://192.168.1.134:11434"
+
+# ─── Prompts ──────────────────────────────────────────────────
  
 # Standing instructions for the planner (goes in the system message).
 PLANNER_SYSTEM = """You are a planning assistant. Produce a concrete, actionable plan.  
@@ -49,7 +48,28 @@ Current work on the project is {exe1_var}
 
 output the solution to the goal as best you can, only give output that is part of the solution, 
 """
- 
+
+# ─── TOOL REGISTRY ──────────────────────────────────────────────────
+tools = {
+    #NONE RIGHT NOW
+}
+
+
+#TODO
+#fuctnion to get current, time and run the code, and find out how much time has gone by
+#STUDY THIS CODE
+def timed(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = func(*args, **kwargs)
+        elapsed = time.perf_counter() - start
+        print(f"[{func.__name__}] took {elapsed:.2f}s")
+        return result
+    return wrapper
+
+
+@timed
 def chat(model, system, user, think=True) -> list[str]:
     """One system + one user turn. Returns the assistant's content."""
     resp = requests.post(
@@ -70,6 +90,11 @@ def chat(model, system, user, think=True) -> list[str]:
         print("Thinking:\n", msg["thinking"], "\n")
     print("Answer:\n", msg["content"], "\n")
     return msg["content"]
+
+#TODO
+#NEED A VERSION WITH CHAT THAT CALL TOOLS
+def chat_with_tools(): 
+    pass
  
 def models() -> list[str]:
     url_models = URL + "/api/tags"
@@ -87,16 +112,14 @@ def write_text_file(text: str, name: str):
     with open(name, "w") as f:
         f.write(text)
 
-#TODO
-#fuctnion to get current, time and run the code, and find out how much time has gone by
-def timmer_function():
-    pass
 
 #main loop
 def main():
     #TODO
     #model picking should be dyamic
-    model = "qwen3:14b"
+    #model = "qwen3:14b"
+    model = "qwen3.5:9b"
+    model = "qwen3.6:27b"
  
     #TODO
     #THIS NEEDS TO BE DYNAMIC, based on user input, add down the line
@@ -167,6 +190,7 @@ def main():
         goal_bool = False
         print("got into the no if, meaning your goal isnt done")
         while(goal_bool !=True):
+
             message_loop = worker_probt.format(
                 goal_var = goal,
                 situation_var = situation,
@@ -180,27 +204,34 @@ def main():
                 exe1
             )
 
-             #asking the model did we complet the goal
+            #asking the model did we complet the goal
             did_we_do_it = chat(
                 model,
                 message,
                 exe1
             )
-            
+
+            #TODO, NEED TO SEE IF THIS RIGTH
+            exe1 = next_step  #THIS MIGHT BE A PROBLE
+
+
             #TODO
             #REMOVE THIS
             #REMOVE PRINT LINES LATER, FOR TEST
             print(f"loop data from past step {message_loop}")
             print(f"IN LOOP, DID WE DO IT {did_we_do_it}")
 
-        if yes_pattern.match(string_list):
-        #the model returned yes, meaning that you did completed the goal
-            goal_bool = True
-        
-        #TODO
-        #remove the print line
-        counter = counter + 1 #TODO REMOVE THIS
-        print(f"IN LOOP, DOING ANOTHER RUN COUNT {count}")
+            if counter == 20:
+                break
+            #make the list a string
+            string_list = "".join(did_we_do_it)
+            if yes_pattern.match(string_list):
+                #the model returned yes, meaning that you did completed the goal
+                goal_bool = True
+            #TODO
+            #remove the print line
+            counter = counter + 1 #TODO REMOVE THIS
+            print(f"IN LOOP, DOING ANOTHER RUN COUNT {counter}")
 
         pass
     else:
