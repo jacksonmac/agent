@@ -1,6 +1,7 @@
 # Plan-Then-Execute Agent
 
 A lightweight autonomous agent that breaks a goal into a plan, executes it phase-by-phase, and self-reviews — all powered by a local [Ollama](https://ollama.com/) instance.
+   - main idea is to have it running on a differnt computer on your network
 
 > **Status:** Early prototype. The core loop works, but several pieces (dynamic model selection, user input, the Python tool) are stubbed out. See the roadmap below. The main loop isnt done yet, in the regx if it complets a goal, noting happens. file saving not a thing yet, lots of problems
 
@@ -94,6 +95,10 @@ Rough priorities based on the TODOs in the code:
 5. **Multi-phase execution** — iterate through all phases of the plan, not just Phase 1.
 6. **Write output to files** — use `write_text_file()` to persist deliverables.
 
+Other things to deal with
+- update read me
+   - add the steps on how to connect to your own computer
+   - how to step how the networking steps
 
 ## License
 
