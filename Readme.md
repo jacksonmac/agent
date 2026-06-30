@@ -7,7 +7,7 @@ A lightweight autonomous agent that breaks a goal into a plan, executes it phase
 
 ---
 ## Current architecture
-![Plan-Then-Execute Agent](Screenshot.png)
+![Plan-Then-Execute Agent](agent_main_loop_control_flow.svg)
 - image made with claude from current code
 - need to finsih up the main loop and add tool calling
 
@@ -44,6 +44,8 @@ pip install requests
 #    URL = "http://192.168.1.134:11434"
 ```
 ## sever computer
+   
+
 
 ## Usage
 
@@ -99,6 +101,9 @@ Other things to deal with
 - update read me
    - add the steps on how to connect to your own computer
    - how to step how the networking steps
+   - Need to split the code up in more files to make it readable,
+       - tools are gonna end up being separated
+       - need to develop the main loop fully FRIST
 
 ## License
 
