@@ -1,11 +1,16 @@
 
+
+#TODO REVIEW WHAT WE ARE USING ALL THE LIBRARIES FOR THIS PROJECT
 import requests
 import re
 import functools
 import time
 import os
-
+import math
+import subprocess
 from typing import Optional
+
+
 
 
 #this should be taken out
@@ -56,7 +61,10 @@ Current work on the project is {exe1_var}
 output the solution to the goal as best you can, only give output that is part of the solution, 
 """
 
+past_messages = {}
+
 total_time = {}
+counter_runs = 0 #TODO, THIS IS NEEDED FOR TIMED, BUT IS A SUPER LAZEY WAY TO DO IT AND REALLY SHOULDNT BE DOING IT THIS WAY
 
 # ─── Time function ──────────────────────────────────────────────────
 
@@ -67,13 +75,33 @@ def timed(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         start = time.perf_counter()
-        result = func(*args, **kwargs)
+        result = func(*args, **kwargs) #function caller
         elapsed = time.perf_counter() - start
+        global counter_runs #TODO, SUPER LAZY WAY OF DOING THIS, WILL DEAL WITH LATER
+        global total_time
         print(f"[{func.__name__}] took {elapsed:.2f}s")
-        total_time[func.__name__] = elapsed
+        if elapsed > 60:
+            min = int(math.ceil(elapsed/60))
+            print(f"The amount of minutes it took {min}mins")
+        #if total_time[func.__name__] == None: this is key error, i need coffee
+        #if total_time[func.__name__] not in total_time:
+        if func.__name__ not in total_time:
+            total_time[func.__name__] = elapsed
+            counter_runs += 1
+        else:
+            time_name = str(func.__name__) + str(counter_runs)
+            total_time[time_name] = elapsed
+            counter_runs += 1
         return result
     return wrapper
 
+def run_python(code: str) -> str:
+    proc = subprocess.run(
+        ["python3", "-c", code],
+        capture_output=True, text=True, timeout=30, #TIMEOUT COULD BE to small
+    )
+    #return f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}\nexit: {proc.returncode}
+    return f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}\nexit code: {proc.returncode}"
 
 @timed
 def chat(model, system, user, think=True) -> list[str]:
@@ -96,6 +124,9 @@ def chat(model, system, user, think=True) -> list[str]:
         print("Thinking:\n", msg["thinking"], "\n")
     print("Answer:\n", msg["content"], "\n")
     return msg["content"]
+
+def call_claude():
+    pass
 
 # ─── CORE CHAT WITH TOOL LOOP ───────────────────────────────────────
  
@@ -230,6 +261,8 @@ def main():
     #model = "qwen3:14b"
     #model = "qwen3.5:9b"
     model = "qwen3.6:27b"
+
+    message_counter = 0
  
     #TODO
     #THIS NEEDS TO BE DYNAMIC, based on user input, add down the line
@@ -252,6 +285,8 @@ def main():
         PLANNER_SYSTEM,
         f"GOAL:\n{goal}\n\nMY SITUATION:\n{situation}",
     )
+    past_messages[message_counter] = plan
+    message_counter += 1 
 
     #first run
     print("\n=== EXECUTING (Phase 1) ===")
@@ -264,6 +299,8 @@ def main():
         f"CURRENT FOCUS: Phase 1\n\n"
         "Execute Phase 1 now and produce the actual deliverable.",
     )
+    past_messages[message_counter] =exe1
+    message_counter += 1
     print("\n===Done EXECUTING (Phase 1) ===")
 
     print(f"what did we get as output {exe1}")
@@ -281,6 +318,8 @@ def main():
         message,
         exe1
     )
+    past_messages[message_counter] = did_we_do_it
+    message_counter += 1
     print(f"how did it go output: {did_we_do_it}")
 
     #regex for yes and no 
@@ -326,6 +365,8 @@ def main():
                 #exe1
                 next_step #this used to be "exe1" this was a problem
             )
+            past_messages[message_counter] = did_we_do_it
+            message_counter += 1
 
             if counter == 20:
                 last_step = next_step #save for review doc
@@ -344,7 +385,7 @@ def main():
             if yes_pattern.match(string_list):
                 #the model returned yes, meaning that you did completed the goal
                 goal_bool = True
-                #TODO, I SHOULDNT HAVE TO DO THIS
+                #TODO, I SHOULDNT HAVE TO DO THIS, review doc will be overworte once it hits the break 
                 review_doc = {
                     "goal": goal,
                     "last_step": exe1,
@@ -355,6 +396,7 @@ def main():
                 #write_text_file(str(review_doc), "output_file.txt")
                 print("NEW REPORT METHOD")
                 write_report(review_doc, "output_file.txt")
+                last_step = message_loop #fixes the overwrite problem, but should remove the review_doc part, it is one of the TODO's
             #TODO
             #remove the print line
             counter = counter + 1 #TODO REMOVE THIS
@@ -381,19 +423,20 @@ def main():
         write_text_file(str(review_doc), "output_file.txt")
 
 
-
-    
-#TODO
-#IMPLENT THIS FUNCTION
-#will give a str, and run the string, and return the output
-#the string should, should be in python format that can be run
-def python_tool():
-    pass
- 
  
 if __name__ == "__main__":
     main()
     #time loop
     print("about of time everything took")
-    for exe, total_times in total_time:
-        print(f"{exe}:{total_time:.2f}s")
+    print(f'TOTALT TIME OBJECT {total_time}')
+
+    #test if python tool works
+    #python_path = "/Users/jacksonmcadams/agent/test.py"
+    #with open(python_path, "r") as f:
+    #    con = f.read()
+    #print(f"Trying to run test file: {run_python(con)}")
+
+
+
+    
+

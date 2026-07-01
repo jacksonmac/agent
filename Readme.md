@@ -44,7 +44,18 @@ pip install requests
 #    URL = "http://192.168.1.134:11434"
 ```
 ## sever computer
-   
+
+1. Change the fire wall rules
+```bash
+New-NetFirewallRule -DisplayName "Ollama LAN Access" -Direction Inbound -LocalPort 11434 -Protocol TCP -Action Allow -Profile Private
+#this will allow anyone computer on your network work to access ollama
+```
+2. Find your ip address on the sever computer
+```bash
+ipconfig
+```
+3. Use the ip address from step 2
+4. Test that its working "http://192.168.1.74:11434" (your ip will be different based on step 2)
 
 
 ## Usage
@@ -104,6 +115,7 @@ Other things to deal with
    - Need to split the code up in more files to make it readable,
        - tools are gonna end up being separated
        - need to develop the main loop fully FRIST
+       - make pastmessages an sqklitdb so can use that for other things later
 
 ## License
 
