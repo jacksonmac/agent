@@ -1,12 +1,43 @@
-"""Execute -> review -> retry agent harness for a local Ollama server.
+"""agent.py v2 — execute -> review -> retry agent harness for a local Ollama server.
 
 Usage:
     python3 agent.py -g "A script fizzbuzz.py that prints FizzBuzz for 1-30"
     python3 agent.py -sg "I need a folder called output with a readme in it"
     python3 agent.py -g "..." --model qwen3.5:9b --attempts 3 --num-ctx 32768
+    python3 agent.py -g "..." --reviewer-model llama3.1:8b --temperature 0.4 --seed 7
     python3 agent.py -g "..." --full-context --num-ctx 65536
     python3 agent.py -g "..." --mcp                    # + Docker MCP Toolkit tools
     python3 agent.py -g "..." --mcp --mcp-profile dev  # a specific Toolkit profile
+
+What's new in v2:
+  * Per-run WORKSPACE: every run gets its own directory under ./runs/ (or
+    --workspace PATH). The agent can no longer touch files outside it —
+    including this script. All artifacts, logs and attempt files land there.
+  * More tools: read_file, edit_file (surgical find/replace — no more
+    re-emitting whole files to fix one line), list_files, delete_file.
+  * Structured review: the goalsmith emits acceptance CRITERIA and the
+    reviewer returns machine-parsed JSON (PASS/FAIL per criterion) via
+    Ollama structured outputs — with automatic fallback to the old YES/NO
+    protocol on servers/models that don't support `format`.
+  * Streaming by default: tokens print live as the model generates
+    (--no-stream to disable). Great feedback on slow CPU boxes.
+  * Real token accounting from Ollama's prompt_eval_count/eval_count,
+    plus an end-of-run usage table. The chars-per-token estimate used for
+    compaction self-calibrates from observed counts.
+  * Robust HTTP layer: retries with backoff on connect errors / 5xx, and
+    graceful capability fallbacks when a model rejects `think`, `format`,
+    or streaming-with-tools.
+  * Stall breaking: near-identical retries now also bump the sampling
+    temperature so the model actually explores a different path.
+  * Model preflight (/api/tags): typo'd model names fail fast with the
+    list of models you actually have.
+  * fetch_page hardening: proper private-address blocking via `ipaddress`
+    (the old prefix list blocked ALL of 172.* — including public IPs like
+    Google's 172.217.*), redirect re-validation, content-type checks and a
+    2 MB download cap.
+  * Run artifacts: events.jsonl (structured log of every LLM call, tool
+    call and verdict), transcript.md (human-readable), attempt_history.json.
+  * Ctrl-C safe: an interrupted run still writes its history and summary.
 
 --mcp : connect to the Docker MCP Toolkit gateway ('docker mcp gateway run')
 and expose every tool from your enabled MCP servers to the executor, alongside
@@ -18,20 +49,27 @@ tool results, retries, or thinking. Pair it with a big --num-ctx, because
 anything past num_ctx is silently dropped by ollama (oldest first).
 
 -g  : use your text as the goal (the task sent to the executor is the same text)
--sg : "smart goal" — the LM rewrites your input into a proper GOAL + TASK first
+-sg : "smart goal" — the LM rewrites your input into GOAL + TASK + CRITERIA first
+
+Env vars: OLLAMA_URL (or OLLAMA_HOST) overrides the default server address,
+AGENT_MODEL overrides the default model.
 
 Optional deps for the research tools:
     pip install ddgs trafilatura
 """
 
+__version__ = "2.0"
+
 import argparse
 import difflib
-import functools
+import ipaddress
 import json
 import os
 import re
 import shlex
+import socket
 import subprocess
+import sys
 import time
 from collections import defaultdict
 from typing import Optional
@@ -40,9 +78,25 @@ from urllib.parse import urlparse
 import requests
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-URL = "http://192.168.1.134:11434"
-DEFAULT_MODEL = "gemma4:26b"
 
+
+def _default_url() -> str:
+    """Server address: OLLAMA_URL > OLLAMA_HOST (scheme added if missing) > LAN default."""
+    url = os.environ.get("OLLAMA_URL")
+    if url:
+        return url.rstrip("/")
+    host = os.environ.get("OLLAMA_HOST")
+    if host:
+        if "://" not in host:
+            host = "http://" + host
+        return host.rstrip("/")
+    return "http://192.168.1.134:11434"
+
+
+URL = _default_url()
+DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "gemma4:26b")
+
+CONNECT_TIMEOUT = 15   # seconds to establish the HTTP connection
 REQUEST_TIMEOUT = 600  # seconds per LLM call — big models on CPU can be slow
 
 # ─── Context budget ─────────────────────────────────────────────────
@@ -51,7 +105,7 @@ REQUEST_TIMEOUT = 600  # seconds per LLM call — big models on CPU can be slow
 # under budget so the model never loses the system prompt or the task.
 
 NUM_CTX = 16384              # requested context window (more = more RAM/VRAM)
-CHARS_PER_TOKEN = 3          # conservative estimate for budgeting
+CHARS_PER_TOKEN = 3.0        # budgeting estimate — self-calibrates from real counts
 TOOL_RESULT_MAX = 4_000      # chars of any single tool result kept in history
 RETRY_PREV_MAX = 6_000       # chars of a failed attempt fed into the retry
 PAGE_TEXT_MAX = 6_000        # chars of a fetched web page returned to the model
@@ -59,6 +113,69 @@ COMPACT_KEEP_LAST = 6        # never compact the most recent N messages
 
 FULL_CONTEXT = False  # --full-context: disable ALL trimming, send everything
 
+# ─── Run-wide toggles (set from the CLI in __main__) ────────────────
+
+WORKSPACE: Optional[str] = None  # per-run sandbox dir; ALL file tools live here
+STREAM = True                    # stream tokens live (--no-stream to disable)
+THINK_DEFAULT = True             # --no-think turns extended thinking off
+RUN_TEMPERATURE: Optional[float] = None  # --temperature; auto-bumped on stalls
+SEED: Optional[int] = None       # --seed for reproducible sampling
+MAX_TOKENS: Optional[int] = None  # --max-tokens -> ollama's num_predict
+KEEP_ALIVE = "10m"               # keep the model loaded between calls
+
+# Capability flags — flipped off automatically if the server/model rejects
+# the corresponding request field, so we only pay for the failed call once.
+SUPPORTS_THINK = True
+SUPPORTS_FORMAT = True   # structured outputs ("format": <json schema>)
+
+
+# ─── Run directory: workspace + logs ────────────────────────────────
+
+def init_workspace(path: Optional[str]) -> str:
+    """Create (or reuse) the per-run directory. Everything the agent writes,
+    plus our own logs and attempt files, lives inside it — so a run can never
+    clobber this script, and every run's artifacts stay together."""
+    ws = os.path.abspath(path) if path else os.path.join(
+        HERE, "runs", time.strftime("run_%Y%m%d_%H%M%S"))
+    os.makedirs(ws, exist_ok=True)
+    return ws
+
+
+def _ts() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _short(value, max_chars: int = 1_500) -> str:
+    s = str(value)
+    return s if len(s) <= max_chars else s[:max_chars] + f"...(+{len(s) - max_chars} chars)"
+
+
+def log_event(kind: str, **fields) -> None:
+    """Append one JSON line to <workspace>/events.jsonl — a structured trace
+    of every LLM call, tool call and verdict, for post-mortems and tooling."""
+    if not WORKSPACE:
+        return
+    record = {"ts": _ts(), "event": kind}
+    record.update({k: _short(v) if isinstance(v, str) else v for k, v in fields.items()})
+    try:
+        with open(os.path.join(WORKSPACE, "events.jsonl"), "a") as f:
+            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except OSError:
+        pass  # logging must never take the run down
+
+
+def transcript(text: str) -> None:
+    """Append to <workspace>/transcript.md — the human-readable run log."""
+    if not WORKSPACE:
+        return
+    try:
+        with open(os.path.join(WORKSPACE, "transcript.md"), "a") as f:
+            f.write(text + "\n")
+    except OSError:
+        pass
+
+
+# ─── Truncation / compaction ────────────────────────────────────────
 
 def truncate_middle(text: str, max_chars: int) -> str:
     """Cap text length, keeping the head and tail (that's where the signal
@@ -67,7 +184,8 @@ def truncate_middle(text: str, max_chars: int) -> str:
         return text
     marker = f"\n[... {len(text) - max_chars} chars truncated ...]\n"
     half = max(0, (max_chars - len(marker)) // 2)
-    return text[:half] + marker + text[-half:]
+    tail = text[len(text) - half:] if half else ""   # NB: text[-0:] would be the whole string
+    return text[:half] + marker + tail
 
 
 def cap(text: str, max_chars: int) -> str:
@@ -77,7 +195,7 @@ def cap(text: str, max_chars: int) -> str:
 
 def estimate_tokens(messages: list) -> int:
     total = sum(len(str(m.get("content") or "")) for m in messages)
-    return total // CHARS_PER_TOKEN
+    return int(total / CHARS_PER_TOKEN)
 
 
 def compact_messages(messages: list) -> None:
@@ -116,16 +234,34 @@ def compact_messages(messages: list) -> None:
 # ─── Prompts ────────────────────────────────────────────────────────
 
 EXECUTOR_SYSTEM = """You are executing a plan to achieve a goal. Do the work — produce real,
-complete, usable output. Use the tools available: write files with write_file, test code with
-run_python, install packages or inspect the project with run_shell (e.g. 'pip install flask').
+complete, usable output. You are inside a dedicated workspace directory; files persist
+between attempts.
+
+Tools:
+- write_file / read_file / edit_file / list_files / delete_file operate on the workspace.
+  Prefer edit_file for small fixes instead of rewriting a whole file with write_file.
+- run_python executes code in the workspace — use it to test everything you write.
+- run_shell runs one allowlisted command (e.g. 'pip install flask', 'ls', 'cat app.py').
 
 For research: use web_search to find sources, then fetch_page on the 1-3 most promising URLs
 to read them, then synthesize what you learned into your answer. Do not answer research
 questions from memory alone when you can verify with a search.
 
-If a test fails, fix the code and test again before finishing."""
+If a test fails, fix the code and test again before finishing. End with a short summary of
+what you built, where it lives, and how you verified it."""
 
-REVIEWER_SYSTEM = """You are a strict reviewer. You will be given a GOAL and the OUTPUT
+REVIEWER_SYSTEM_JSON = """You are a strict reviewer. You will be given a GOAL, acceptance
+CRITERIA, and the OUTPUT of an agent that tried to achieve it, plus the real files it wrote.
+Judge the FILES on disk, not the agent's claims.
+
+Respond with ONLY a JSON object, nothing else:
+{"verdict": "PASS" or "FAIL",
+ "criteria": [{"criterion": "...", "met": true or false, "note": "short reason"}],
+ "feedback": "one short paragraph: what is missing or broken (empty string if PASS)"}
+
+verdict must be PASS only if EVERY criterion is met."""
+
+REVIEWER_SYSTEM_LEGACY = """You are a strict reviewer. You will be given a GOAL and the OUTPUT
 of an agent that tried to achieve it. Decide if the output actually meets the goal.
 
 The FIRST word of your reply must be exactly YES or NO.
@@ -135,13 +271,16 @@ If YES, say nothing else."""
 REVIEW_USER = """GOAL:
 {goal}
 
+ACCEPTANCE CRITERIA:
+{criteria}
+
 AGENT OUTPUT:
 {output}
 
-FILES THE AGENT WROTE THIS ATTEMPT (actual on-disk content, possibly truncated):
+WORKSPACE STATE (actual on-disk content, possibly truncated):
 {files}
 
-Did the output meet the goal? Judge the FILES, not just the agent's claims."""
+Did the work meet the goal? Judge the FILES, not just the agent's claims."""
 
 RETRY_NOTE = """
 
@@ -150,13 +289,26 @@ A previous attempt did NOT meet the goal according to the reviewer.
 Reviewer feedback so far (fix ALL of it, not just the latest):
 {feedback}
 
+Files currently in the workspace (they persist between attempts — read_file /
+edit_file them instead of starting from scratch where that makes sense):
+{workspace}
+
 Here is the most recent attempt — fix what is missing or broken and finish the goal:
 
 --- PREVIOUS ATTEMPT ---
 {previous}
 --- END PREVIOUS ATTEMPT ---"""
 
-GOALSMITH_SYSTEM = """You turn a rough user request into two things:
+GOALSMITH_SYSTEM_JSON = """You turn a rough user request into a plan for an agent that has
+write_file / read_file / edit_file / list_files / run_python / run_shell / web_search /
+fetch_page tools.
+
+Respond with ONLY a JSON object, nothing else:
+{"goal": "one or two sentences — a single concrete, checkable success condition",
+ "task": "one paragraph of instructions: what to build, save, run, and verify",
+ "criteria": ["3 to 7 short acceptance criteria, each individually checkable"]}"""
+
+GOALSMITH_SYSTEM_LEGACY = """You turn a rough user request into two things:
 
 GOAL: a single, concrete, checkable success condition (what a reviewer will verify).
 TASK: instructions for an agent with write_file / run_python / run_shell /
@@ -166,57 +318,218 @@ Reply in EXACTLY this format, nothing before or after:
 GOAL: <one or two sentences>
 TASK: <one paragraph>"""
 
-# ─── Timing ─────────────────────────────────────────────────────────
+# JSON schemas for Ollama structured outputs (the "format" request field).
 
-total_time: dict[str, list[float]] = defaultdict(list)
+REVIEW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["PASS", "FAIL"]},
+        "criteria": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "criterion": {"type": "string"},
+                    "met": {"type": "boolean"},
+                    "note": {"type": "string"},
+                },
+                "required": ["criterion", "met"],
+            },
+        },
+        "feedback": {"type": "string"},
+    },
+    "required": ["verdict", "feedback"],
+}
+
+GOALSMITH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "goal": {"type": "string"},
+        "task": {"type": "string"},
+        "criteria": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["goal", "task", "criteria"],
+}
 
 
-def timed(func):
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        start = time.perf_counter()
-        result = func(*args, **kwargs)
-        elapsed = time.perf_counter() - start
-        if elapsed > 60:
-            print(f"[{func.__name__}] took {elapsed:.2f}s (~{elapsed / 60:.1f} min)")
-        else:
-            print(f"[{func.__name__}] took {elapsed:.2f}s")
-        total_time[func.__name__].append(elapsed)
-        return result
-    return wrapper
+# ─── Timing + token accounting ──────────────────────────────────────
+
+total_time: dict[str, list[float]] = defaultdict(list)     # label -> per-call secs
+token_totals: dict[str, list[int]] = defaultdict(lambda: [0, 0])  # label -> [in, out]
 
 
-def print_timing_summary():
+def print_run_summary() -> None:
     if not total_time:
         return
-    print("\n─── timing summary ───")
-    for name, times in total_time.items():
-        print(f"  {name}: {len(times)} call(s), total {sum(times):.1f}s, "
-              f"avg {sum(times) / len(times):.1f}s")
+    print("\n─── run summary ───")
+    for label, times in total_time.items():
+        tin, tout = token_totals.get(label, [0, 0])
+        print(f"  {label}: {len(times)} call(s), total {sum(times):.1f}s, "
+              f"avg {sum(times) / len(times):.1f}s, tokens {tin} in / {tout} out")
+    grand_in = sum(v[0] for v in token_totals.values())
+    grand_out = sum(v[1] for v in token_totals.values())
+    print(f"  TOTAL: {sum(sum(t) for t in total_time.values()):.1f}s of LLM time, "
+          f"{grand_in} in / {grand_out} out tokens "
+          f"(calibrated ~{CHARS_PER_TOKEN:.1f} chars/token)")
 
 
-# ─── Tools ──────────────────────────────────────────────────────────
+# ─── Workspace file tools ───────────────────────────────────────────
+# Every path is resolved with realpath and must land inside WORKSPACE, so
+# neither the model nor a crafted '../' name can touch anything else —
+# including this script (v1 wrote into the script's own directory!).
 
-def run_python(code: str) -> str:
-    """Execute python code in a subprocess."""
+def _safe_path(name: str):
+    """Resolve `name` inside the workspace. Returns (path, None) on success
+    or (None, error_string) if it would escape (also catches symlink tricks)."""
+    if not WORKSPACE:
+        return None, "[ERROR] no workspace initialised"
+    root = os.path.realpath(WORKSPACE)
+    path = os.path.realpath(os.path.join(root, name))
+    if path != root and not path.startswith(root + os.sep):
+        return None, f"[ERROR] refusing to touch a path outside the workspace: {name}"
+    return path, None
+
+
+def write_text_file(text: str, name: str) -> str:
+    path, err = _safe_path(name)
+    if err:
+        return err
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        with open(path, "w") as f:
+            f.write(text)
+    except OSError as e:
+        return f"[ERROR] could not write {name}: {e}"
+    print("WROTE:", path)
+    return f"WROTE {len(text)} chars to {name}"
+
+
+def read_file(name: str, max_chars: int = 6_000) -> str:
+    """Read a workspace file back (head+tail if longer than max_chars)."""
+    max_chars = max(200, min(int(max_chars), 20_000))
+    path, err = _safe_path(name)
+    if err:
+        return err
+    if os.path.isdir(path):
+        return f"[ERROR] {name} is a directory — use list_files"
+    try:
+        with open(path, errors="replace") as f:
+            content = f.read()
+    except OSError as e:
+        return f"[ERROR] could not read {name}: {e}"
+    return f"--- {name} ({len(content)} chars) ---\n" + cap(content, max_chars)
+
+
+def edit_file(name: str, find_text: str, replace_text: str,
+              replace_all: bool = False) -> str:
+    """Surgical edit: replace an exact substring. Cheaper and safer than
+    re-emitting a whole file, and it can't silently drop the rest of it."""
+    if not find_text:
+        return "[ERROR] find_text must not be empty"
+    path, err = _safe_path(name)
+    if err:
+        return err
+    try:
+        with open(path) as f:
+            content = f.read()
+    except OSError as e:
+        return f"[ERROR] could not read {name}: {e}"
+    count = content.count(find_text)
+    if count == 0:
+        return (f"[ERROR] find_text not found in {name} (the match is exact, "
+                f"including whitespace) — read_file it first and copy the text verbatim")
+    if count > 1 and not replace_all:
+        return (f"[ERROR] find_text occurs {count} times in {name} — include more "
+                f"surrounding context to make it unique, or set replace_all=true")
+    new = content.replace(find_text, replace_text, -1 if replace_all else 1)
+    try:
+        with open(path, "w") as f:
+            f.write(new)
+    except OSError as e:
+        return f"[ERROR] could not write {name}: {e}"
+    n = count if replace_all else 1
+    print(f"EDITED: {path} ({n} occurrence(s))")
+    return f"EDITED {name}: replaced {n} occurrence(s); file is now {len(new)} chars"
+
+
+def list_files(subdir: str = "", max_lines: int = 200) -> str:
+    """List the workspace tree (dirs and files with sizes). Hidden entries
+    (like our .agent_tmp scratch dir) are skipped."""
+    path, err = _safe_path(subdir or ".")
+    if err:
+        return err
+    if not os.path.isdir(path):
+        return f"[ERROR] not a directory: {subdir or '.'}"
+    root = os.path.realpath(WORKSPACE)
+    lines = []
+    for dirpath, dirnames, filenames in os.walk(path):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+        rel_dir = os.path.relpath(dirpath, root)
+        if rel_dir != ".":
+            lines.append(rel_dir + "/")
+        for fn in sorted(f for f in filenames if not f.startswith(".")):
+            rel = os.path.relpath(os.path.join(dirpath, fn), root)
+            try:
+                size = os.path.getsize(os.path.join(dirpath, fn))
+            except OSError:
+                size = -1
+            lines.append(f"{rel} ({size} bytes)")
+        if len(lines) > max_lines:
+            lines = lines[:max_lines] + [f"[... listing truncated at {max_lines} entries ...]"]
+            break
+    return "\n".join(lines) if lines else "(workspace is empty)"
+
+
+def delete_file(name: str) -> str:
+    path, err = _safe_path(name)
+    if err:
+        return err
+    if os.path.isdir(path):
+        return f"[ERROR] {name} is a directory — refusing to delete directories"
+    try:
+        os.remove(path)
+    except OSError as e:
+        return f"[ERROR] could not delete {name}: {e}"
+    print("DELETED:", path)
+    return f"DELETED {name}"
+
+
+# ─── Execution tools ────────────────────────────────────────────────
+
+def run_python(code: str, timeout: int = 120) -> str:
+    """Execute python code in a subprocess inside the workspace. The code is
+    written to a scratch file first, so tracebacks show real line numbers and
+    relative paths resolve against the workspace."""
+    try:
+        timeout = max(5, min(int(timeout), 600))
+    except (TypeError, ValueError):
+        timeout = 120
+    if not WORKSPACE:
+        return "[ERROR] no workspace initialised"
+    tmp_dir = os.path.join(WORKSPACE, ".agent_tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    snippet = os.path.join(tmp_dir, "snippet.py")
+    with open(snippet, "w") as f:
+        f.write(code)
     try:
         proc = subprocess.run(
-            ["python3", "-c", code],
-            capture_output=True, text=True, timeout=120,
-            cwd=HERE,
+            ["python3", snippet],
+            capture_output=True, text=True, timeout=timeout,
+            cwd=WORKSPACE,
         )
     except subprocess.TimeoutExpired:
-        return "[ERROR] code timed out after 120 seconds"
+        return f"[ERROR] code timed out after {timeout} seconds"
     return f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}\nexit code: {proc.returncode}"
 
 
-ALLOWED_COMMANDS = ["pip", "pip3", "python3", "ls", "mkdir", "cat", "echo"]
+ALLOWED_COMMANDS = ["pip", "pip3", "python3", "ls", "mkdir", "cat", "echo",
+                    "head", "tail", "wc", "grep", "pwd"]
 _SHELL_META = set(";|&<>`$\n")
 
 
 def run_shell(command: str) -> str:
-    """Run an allowlisted shell command. shell=False + shlex so the allowlist
-    can't be bypassed with 'echo hi; curl ... | sh' style chaining."""
+    """Run an allowlisted shell command in the workspace. shell=False + shlex
+    so the allowlist can't be bypassed with 'echo hi; curl ... | sh' chaining."""
     if any(ch in _SHELL_META for ch in command):
         return ("[ERROR] shell metacharacters (; | & < > ` $) are not allowed. "
                 "Run one plain command at a time.")
@@ -226,6 +539,10 @@ def run_shell(command: str) -> str:
         return f"[ERROR] could not parse command: {e}"
     if not parts:
         return "[ERROR] empty command"
+    if parts[0] in ("pip", "pip3"):
+        # 'pip' on PATH isn't always the same interpreter as python3 — route
+        # installs through python3 -m pip so run_python actually sees them
+        parts = ["python3", "-m", "pip"] + parts[1:]
     if parts[0] not in ALLOWED_COMMANDS:
         return (f"[ERROR] command '{parts[0]}' is not allowed. "
                 f"Allowed commands: {', '.join(ALLOWED_COMMANDS)}")
@@ -234,24 +551,13 @@ def run_shell(command: str) -> str:
         proc = subprocess.run(
             parts,
             capture_output=True, text=True, timeout=360,
-            cwd=HERE,
+            cwd=WORKSPACE or HERE,
         )
     except subprocess.TimeoutExpired:
         return "[ERROR] command timed out after 360 seconds"
     except FileNotFoundError:
         return f"[ERROR] program not found: {parts[0]}"
     return f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}\nexit code: {proc.returncode}"
-
-
-def write_text_file(text: str, name: str) -> str:
-    path = os.path.abspath(os.path.join(HERE, name))
-    if not path.startswith(HERE + os.sep):
-        return f"[ERROR] refusing to write outside the project directory: {name}"
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
-        f.write(text)
-    print("WROTE:", path)
-    return f"WROTE {len(text)} chars to {name}"
 
 
 # ─── Research tools ─────────────────────────────────────────────────
@@ -282,26 +588,80 @@ def web_search(query: str, max_results: int = 5) -> str:
     return "\n".join(lines)
 
 
-_BLOCKED_HOSTS = ("localhost", "127.", "0.0.0.0", "10.", "192.168.", "169.254.", "172.")
+MAX_DOWNLOAD_BYTES = 2_000_000
+_ALLOWED_CTYPES = ("text/", "application/json", "application/xml",
+                   "application/xhtml", "application/rss", "application/atom")
+
+
+def _host_is_public(host: str):
+    """Resolve a hostname and check every address it maps to is a public IP.
+    Replaces v1's string-prefix list, which over-blocked (all of 172.* — most
+    of that is public space, e.g. Google's 172.217.*) and under-blocked
+    (any private range not on the list). Returns (ok, error_string)."""
+    if not host:
+        return False, "empty hostname"
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as e:
+        return False, f"could not resolve {host}: {e}"
+    for _family, _type, _proto, _canon, sockaddr in infos:
+        ip_text = str(sockaddr[0]).split("%")[0]  # strip IPv6 zone id
+        try:
+            ip = ipaddress.ip_address(ip_text)
+        except ValueError:
+            return False, f"{host} resolved to an unparsable address {ip_text!r}"
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return False, f"{host} resolves to a non-public address ({ip})"
+    return True, ""
 
 
 def fetch_page(url: str) -> str:
     """Fetch a web page and return its readable text, capped at PAGE_TEXT_MAX
-    chars so one giant page can't blow the context window."""
+    chars so one giant page can't blow the context window. Blocks private
+    addresses (including via redirects), skips non-text content types, and
+    stops downloading after MAX_DOWNLOAD_BYTES."""
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         return "[ERROR] only http/https URLs are allowed"
-    host = (parsed.hostname or "").lower()
-    if any(host == b.rstrip(".") or host.startswith(b) for b in _BLOCKED_HOSTS):
-        return "[ERROR] refusing to fetch local/private network addresses"
+    ok, why = _host_is_public((parsed.hostname or "").lower())
+    if not ok:
+        return f"[ERROR] refusing to fetch: {why}"
     try:
-        resp = requests.get(url, timeout=30, headers={
-            "User-Agent": "Mozilla/5.0 (compatible; research-agent/1.0)"})
+        resp = requests.get(url, timeout=(CONNECT_TIMEOUT, 30), stream=True,
+                            allow_redirects=True, headers={
+                                "User-Agent": "Mozilla/5.0 (compatible; research-agent/2.0)"})
         resp.raise_for_status()
     except requests.RequestException as e:
         return f"[ERROR] fetch failed: {type(e).__name__}: {e}"
 
-    html = resp.text
+    # re-validate every hop — a public URL that 302s into 127.0.0.1 or the
+    # LAN gets dropped before the model ever sees the content
+    for hop in list(resp.history) + [resp]:
+        ok, why = _host_is_public((urlparse(hop.url).hostname or "").lower())
+        if not ok:
+            resp.close()
+            return f"[ERROR] redirect into a private network blocked: {why}"
+
+    ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if ctype and not ctype.startswith(_ALLOWED_CTYPES):
+        resp.close()
+        return f"[skipped] content-type {ctype!r} — fetch_page only reads text/HTML/JSON pages"
+
+    buf = bytearray()
+    truncated = False
+    try:
+        for chunk in resp.iter_content(65_536):
+            buf += chunk
+            if len(buf) >= MAX_DOWNLOAD_BYTES:
+                truncated = True
+                break
+    except requests.RequestException as e:
+        return f"[ERROR] download broke mid-stream: {type(e).__name__}: {e}"
+    finally:
+        resp.close()
+
+    html = bytes(buf).decode(resp.encoding or "utf-8", errors="replace")
     text = None
     try:
         import trafilatura  # pip install trafilatura — best-quality extraction
@@ -315,7 +675,8 @@ def fetch_page(url: str) -> str:
         text = re.sub(r"\s+", " ", text).strip()
     if not text:
         return f"[ERROR] no readable text extracted from {url}"
-    return f"[{url}]\n" + truncate_middle(text, PAGE_TEXT_MAX)
+    note = " [download capped at 2MB]" if truncated else ""
+    return f"[{resp.url}]{note}\n" + cap(text, PAGE_TEXT_MAX)
 
 
 # ─── Docker MCP Toolkit ─────────────────────────────────────────────
@@ -405,7 +766,7 @@ class MCPGateway:
         result = self._request("initialize", {
             "protocolVersion": "2025-06-18",
             "capabilities": {},
-            "clientInfo": {"name": "agent.py", "version": "1.0"},
+            "clientInfo": {"name": "agent.py", "version": __version__},
         })
         self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         info = result.get("serverInfo", {})
@@ -494,7 +855,8 @@ def setup_mcp_tools(profile: Optional[str] = None) -> list[str]:
 # ─── Per-attempt file tracking ──────────────────────────────────────
 # The reviewer used to see only the agent's prose, so it graded CLAIMS
 # ("I wrote fizzbuzz.py") instead of artifacts. Track what the agent
-# actually writes each attempt and show the reviewer the real content.
+# actually writes each attempt and show the reviewer the real content —
+# plus the full workspace tree, so even mkdir-created structure counts.
 
 attempt_written_files: list[str] = []
 
@@ -502,6 +864,14 @@ attempt_written_files: list[str] = []
 def tracked_write_file(text: str, name: str) -> str:
     result = write_text_file(text, name)
     if result.startswith("WROTE"):
+        attempt_written_files.append(name)
+    return result
+
+
+def tracked_edit_file(name: str, find_text: str, replace_text: str,
+                      replace_all: bool = False) -> str:
+    result = edit_file(name, find_text, replace_text, replace_all)
+    if result.startswith("EDITED"):
         attempt_written_files.append(name)
     return result
 
@@ -515,9 +885,12 @@ def snapshot_files(names: list[str], per_file: int = 2_000,
         return "(the agent wrote no files this attempt)"
     chunks, used = [], 0
     for name in dict.fromkeys(names):  # dedupe, keep order
-        path = os.path.join(HERE, name)
+        path, err = _safe_path(name)
+        if err:
+            chunks.append(f"--- {name} --- [unreadable: {err}]")
+            continue
         try:
-            with open(path) as f:
+            with open(path, errors="replace") as f:
                 content = f.read()
         except OSError as e:
             chunks.append(f"--- {name} --- [unreadable: {e}]")
@@ -534,6 +907,10 @@ def snapshot_files(names: list[str], per_file: int = 2_000,
 
 tools = {
     "write_file": tracked_write_file,
+    "read_file": read_file,
+    "edit_file": tracked_edit_file,
+    "list_files": list_files,
+    "delete_file": delete_file,
     "run_python": run_python,
     "run_shell": run_shell,
     "web_search": web_search,
@@ -545,12 +922,12 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "Write text content to a file in the project directory. Overwrites if the file already exists.",
+            "description": "Write text content to a file in the workspace. Overwrites if the file already exists. Subdirectories in the name are created automatically.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "text": {"type": "string", "description": "The full text content of the file."},
-                    "name": {"type": "string", "description": "Filename to write, e.g. 'app.py'."},
+                    "name": {"type": "string", "description": "Filename to write, e.g. 'app.py' or 'src/util.py'."},
                 },
                 "required": ["text", "name"],
             },
@@ -559,12 +936,73 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "read_file",
+            "description": "Read a file from the workspace. Long files are returned head+tail truncated. Use this before edit_file so your find_text matches exactly.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Filename to read, e.g. 'app.py'."},
+                    "max_chars": {"type": "integer", "description": "Max characters to return, 200-20000 (default 6000)."},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Replace an exact substring in a workspace file. Much cheaper than rewriting a whole file with write_file. find_text must match exactly (including whitespace) and must be unique unless replace_all is true.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Filename to edit."},
+                    "find_text": {"type": "string", "description": "Exact text to find (copy it from read_file output)."},
+                    "replace_text": {"type": "string", "description": "Text to replace it with (can be empty to delete)."},
+                    "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of requiring a unique match (default false)."},
+                },
+                "required": ["name", "find_text", "replace_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": "List the files and folders in the workspace (or a subfolder), with sizes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subdir": {"type": "string", "description": "Optional subfolder to list (default: the whole workspace)."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_file",
+            "description": "Delete a single file from the workspace (directories are refused).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Filename to delete."},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "run_python",
-            "description": "Execute python code in a subprocess. Returns stdout, stderr and the exit code. Use this to test code you have written.",
+            "description": "Execute python code in a subprocess inside the workspace. Returns stdout, stderr and the exit code. Use this to test code you have written.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "code": {"type": "string", "description": "The python code to execute."},
+                    "timeout": {"type": "integer", "description": "Seconds before the run is killed, 5-600 (default 120)."},
                 },
                 "required": ["code"],
             },
@@ -574,7 +1012,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "run_shell",
-            "description": "Run a single shell command in the project directory. Only these commands are allowed: pip, pip3, python3, ls, mkdir, cat, echo. No pipes, chaining, or redirection. Use this to install packages (e.g. 'pip install flask') or inspect the project.",
+            "description": "Run a single shell command in the workspace. Only these commands are allowed: pip, pip3, python3, ls, mkdir, cat, echo, head, tail, wc, grep, pwd. No pipes, chaining, or redirection. Use this to install packages (e.g. 'pip install flask') or inspect the project.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -616,8 +1054,6 @@ TOOL_SCHEMAS = [
 ]
 
 
-# ─── Core chat with tool loop ───────────────────────────────────────
-
 def execute_tool_call(name: str, arguments) -> str:
     func = tools.get(name)
     if not func:
@@ -628,250 +1064,583 @@ def execute_tool_call(name: str, arguments) -> str:
         except json.JSONDecodeError as e:
             return f"[ERROR] Could not parse arguments for {name}: {e}"
     try:
-        return str(func(**arguments))
+        result = str(func(**arguments))
     except TypeError as e:
-        return f"[ERROR] Bad arguments for {name}: {e}"
+        result = f"[ERROR] Bad arguments for {name}: {e}"
     except Exception as e:
-        return f"[ERROR] {name} raised {type(e).__name__}: {e}"
+        result = f"[ERROR] {name} raised {type(e).__name__}: {e}"
+    log_event("tool", name=name, args=json.dumps(arguments, default=str)[:500],
+              ok=not result.startswith("[ERROR]"), result_chars=len(result))
+    return result
 
 
-def _post_chat(payload: dict) -> dict:
-    payload.setdefault("options", {})["num_ctx"] = NUM_CTX
-    resp = requests.post(URL + "/api/chat", json=payload, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    return resp.json()["message"]
+# ────────────────────────────────────────────────────────────────────────────
+# TALKING TO OLLAMA
+# ────────────────────────────────────────────────────────────────────────────
+
+def _options() -> dict:
+    """Build the Ollama options dict from run-wide settings."""
+    opts: dict = {"num_ctx": NUM_CTX}
+    if RUN_TEMPERATURE is not None:
+        opts["temperature"] = RUN_TEMPERATURE
+    if SEED is not None:
+        opts["seed"] = SEED
+    if MAX_TOKENS is not None:
+        opts["num_predict"] = MAX_TOKENS
+    return opts
 
 
-@timed
-def chat_v2(model: str, system: str, user: str, tool_schemas: Optional[list],
-            think: bool = True, max_tool_rounds: int = 15) -> str:
-    """One system + one user turn, with an optional tool-calling loop."""
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]
+def _backoff(i: int, err) -> None:
+    wait = 2 ** i
+    print(f"  [retry] {err} — waiting {wait}s and retrying...")
+    time.sleep(wait)
 
-    for round_num in range(max_tool_rounds):
+
+def _chat_once(payload: dict, label: str, print_stream: bool) -> dict:
+    """One POST to /api/chat with retries, capability fallbacks, and
+    token accounting. Returns the assistant message dict."""
+    global SUPPORTS_THINK, SUPPORTS_FORMAT, STREAM, CHARS_PER_TOKEN
+
+    if not SUPPORTS_THINK:
+        payload.pop("think", None)
+    if not SUPPORTS_FORMAT:
+        payload.pop("format", None)
+    payload.setdefault("options", {}).update(_options())
+    payload["keep_alive"] = KEEP_ALIVE
+
+    sent_chars = sum(len(str(m.get("content", ""))) for m in payload["messages"])
+
+    start = time.time()
+    last_err: Exception = RuntimeError("no attempts made")
+    for i in range(4):
+        try:
+            resp = requests.post(
+                URL + "/api/chat", json=payload, stream=payload.get("stream", False),
+                timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT))
+        except (requests.ConnectionError, requests.Timeout) as e:
+            last_err = e
+            _backoff(i, type(e).__name__)
+            continue
+
+        if resp.status_code == 400:
+            body = resp.text[:2_000].lower()
+            if "does not support tools" in body:
+                raise SystemExit(
+                    f"\nModel '{payload.get('model')}' does not support tool calling.\n"
+                    "This harness needs a tool-capable model (e.g. qwen3, llama3.1, "
+                    "mistral-nemo, command-r). Pick one with --model.")
+            if "think" in body and "think" in payload:
+                print("  [fallback] model rejected 'think' — disabling thinking for this run")
+                SUPPORTS_THINK = False
+                payload.pop("think", None)
+                continue
+            if "format" in body and "format" in payload:
+                print("  [fallback] model rejected 'format' — falling back to legacy text parsing")
+                SUPPORTS_FORMAT = False
+                payload.pop("format", None)
+                continue
+            if payload.get("stream") and payload.get("tools"):
+                print("  [fallback] server rejected stream+tools — disabling streaming for this run")
+                STREAM = False
+                payload["stream"] = False
+                continue
+            raise RuntimeError(f"Ollama returned 400: {resp.text[:300]}")
+
+        if resp.status_code >= 500:
+            last_err = RuntimeError(f"HTTP {resp.status_code}")
+            _backoff(i, f"HTTP {resp.status_code}")
+            continue
+        if resp.status_code != 200:
+            raise RuntimeError(f"Ollama returned {resp.status_code}: {resp.text[:300]}")
+
+        if payload.get("stream"):
+            msg, metrics = _consume_stream(resp, print_stream)
+        else:
+            data = resp.json()
+            msg = data.get("message", {}) or {}
+            metrics = {"prompt_eval_count": data.get("prompt_eval_count", 0),
+                       "eval_count": data.get("eval_count", 0)}
+
+        secs = time.time() - start
+        p_tok = metrics.get("prompt_eval_count", 0) or 0
+        e_tok = metrics.get("eval_count", 0) or 0
+        total_time[label].append(secs)
+        token_totals[label][0] += p_tok
+        token_totals[label][1] += e_tok
+        if p_tok > 0 and sent_chars > 0:
+            observed = sent_chars / p_tok
+            CHARS_PER_TOKEN = max(2.0, min(6.0, 0.8 * CHARS_PER_TOKEN + 0.2 * observed))
+        print(f"  [{label}] {secs:.1f}s · {p_tok}→{e_tok} tokens")
+        log_event("llm", label=label, secs=round(secs, 2),
+                  prompt_tokens=p_tok, eval_tokens=e_tok,
+                  stream=bool(payload.get("stream")))
+        return msg
+
+    raise last_err
+
+
+def _consume_stream(resp, do_print: bool):
+    """Read an NDJSON /api/chat stream, printing thinking/content live.
+    Returns (assistant_message_dict, metrics_dict)."""
+    content_parts: list[str] = []
+    thinking_parts: list[str] = []
+    tool_calls: list[dict] = []
+    metrics: dict = {}
+    printed_think_head = printed_answer_head = False
+
+    try:
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            chunk = json.loads(line)
+            if chunk.get("error"):
+                raise RuntimeError(f"stream error: {chunk['error']}")
+            msg = chunk.get("message", {}) or {}
+
+            t = msg.get("thinking")
+            if t:
+                thinking_parts.append(t)
+                if do_print:
+                    if not printed_think_head:
+                        sys.stdout.write("\n[thinking] ")
+                        printed_think_head = True
+                    sys.stdout.write(t)
+                    sys.stdout.flush()
+
+            c = msg.get("content")
+            if c:
+                content_parts.append(c)
+                if do_print:
+                    if not printed_answer_head:
+                        sys.stdout.write("\n[answer] " if printed_think_head else "")
+                        printed_answer_head = True
+                    sys.stdout.write(c)
+                    sys.stdout.flush()
+
+            if msg.get("tool_calls"):
+                tool_calls.extend(msg["tool_calls"])
+
+            if chunk.get("done"):
+                metrics = {"prompt_eval_count": chunk.get("prompt_eval_count", 0),
+                           "eval_count": chunk.get("eval_count", 0)}
+    except requests.RequestException as e:
+        raise RuntimeError(f"connection lost mid-stream: {e}")
+
+    if do_print and (printed_think_head or printed_answer_head):
+        print()
+
+    out: dict = {"role": "assistant", "content": "".join(content_parts)}
+    if thinking_parts:
+        out["thinking"] = "".join(thinking_parts)
+    if tool_calls:
+        out["tool_calls"] = tool_calls
+    return out, metrics
+
+
+def chat(model: str, system: str, user: str, tool_schemas=None, think: bool = True,
+         label: str = "llm", max_tool_rounds: int = 15, fmt=None,
+         stream=None, echo: bool = True) -> str:
+    """Multi-round chat loop: send → maybe execute tool calls → repeat.
+    Returns the model's final text answer."""
+    messages = [{"role": "system", "content": system},
+                {"role": "user", "content": user}]
+
+    for round_no in range(max_tool_rounds):
+        do_stream = STREAM if stream is None else stream
+        if fmt is not None:
+            do_stream = False  # structured outputs come back as one JSON blob
+
         compact_messages(messages)
-        print(f"  [context ~{estimate_tokens(messages)} tokens / {NUM_CTX}]")
+        if echo:
+            print(f"\n--- round {round_no + 1} · ~{estimate_tokens(messages)} tokens in context ---")
 
-        payload = {"model": model, "messages": messages, "think": think, "stream": False}
+        payload: dict = {"model": model, "messages": messages, "stream": do_stream}
+        if think and SUPPORTS_THINK:
+            payload["think"] = True
+        if fmt is not None and SUPPORTS_FORMAT:
+            payload["format"] = fmt
         if tool_schemas:
             payload["tools"] = tool_schemas
 
-        msg = _post_chat(payload)
+        msg = _chat_once(payload, label, print_stream=(do_stream and echo))
+        streamed_live = bool(payload.get("stream"))  # _chat_once may have flipped it
 
-        if msg.get("thinking"):
-            print(f"  [thinking round {round_num}]:\n", msg["thinking"][:500], "\n")
-        # don't resend the thinking text every round — it's context we pay
-        # for on every subsequent call and the model doesn't need it back
-        # (in full-context mode we keep it: the model gets everything)
+        if echo and not streamed_live:
+            if msg.get("thinking"):
+                print(f"\n[thinking] {truncate_middle(msg['thinking'], 500)}")
+            if msg.get("content"):
+                print(f"\nAnswer: {msg['content']}")
+
         if not FULL_CONTEXT:
             msg.pop("thinking", None)
 
-        tool_calls = msg.get("tool_calls")
-        if not tool_calls:
-            print("Answer:\n", msg["content"], "\n")
-            return msg["content"]
+        if not msg.get("tool_calls"):
+            return msg.get("content", "")
 
         messages.append(msg)
-        for tc in tool_calls:
-            func_info = tc["function"]
-            tool_name = func_info["name"]
-            tool_args = func_info.get("arguments", {})
-            print(f"  [tool call] {tool_name}({json.dumps(tool_args)[:200]})")
-            result = execute_tool_call(tool_name, tool_args)
-            print(f"  [tool result] {result[:300]}")
-            messages.append({
-                "role": "tool",
-                "tool_name": tool_name,  # ollama matches the result to the call by this
-                # cap what enters history — a huge stdout or web page stays
-                # useful (head + tail) without eating the whole window
-                "content": cap(result, TOOL_RESULT_MAX),
-            })
+        for call in msg["tool_calls"]:
+            fn = call.get("function", {}) or {}
+            name = fn.get("name", "?")
+            args = fn.get("arguments", {}) or {}
+            if echo:
+                print(f"\n  [tool call] {name}({truncate_middle(json.dumps(args, default=str), 300)})")
+            result = execute_tool_call(name, args)
+            if echo:
+                print(f"  [tool result] {truncate_middle(result, 300)}")
+            messages.append({"role": "tool", "tool_name": name,
+                             "content": cap(result, TOOL_RESULT_MAX)})
 
-    # Exhausted all rounds: one final call with no tools so it must answer in text
-    print("[WARNING] Hit max tool rounds, forcing final response")
+    # Ran out of tool rounds — force a final, tool-free answer.
+    print(f"\nWARNING: hit {max_tool_rounds} tool rounds — forcing a final answer without tools.")
+    messages.append({"role": "user", "content":
+                     "You have used all available tool calls. Give your final answer "
+                     "now, based on the work completed so far."})
     compact_messages(messages)
-    msg = _post_chat({"model": model, "messages": messages, "think": think, "stream": False})
-    print("Answer (forced):\n", msg["content"], "\n")
-    return msg["content"]
+    payload = {"model": model, "messages": messages, "stream": False}
+    if think and SUPPORTS_THINK:
+        payload["think"] = True
+    msg = _chat_once(payload, label, print_stream=False)
+    if echo and msg.get("content"):
+        print(f"\nAnswer: {msg['content']}")
+    return msg.get("content", "")
 
 
-# ─── Reviewer ───────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────
+# REVIEW + GOALSMITH
+# ────────────────────────────────────────────────────────────────────────────
 
-YES_PAT = re.compile(r"^(yes|y|yeah|yep|yup)\b", re.IGNORECASE)
-NO_PAT = re.compile(r"^(no|n|nah|nope)\b", re.IGNORECASE)
-
-
-def review(model: str, goal: str, output: str, files_text: str = "(none)") -> str:
-    """Ask the reviewer if the goal was met. Returns the raw verdict text.
-    A verdict that doesn't start with YES/NO gets ONE stricter re-ask; if it's
-    still malformed we treat it as NO (with the text as feedback) rather than
-    aborting the whole run over a formatting slip."""
-    user = REVIEW_USER.format(goal=goal,
-                              output=cap(output, RETRY_PREV_MAX),
-                              files=files_text)
-    for strict in (False, True):
-        verdict = chat_v2(
-            model,
-            REVIEWER_SYSTEM,
-            user + ("\n\nREMINDER: the FIRST word of your reply MUST be exactly "
-                    "YES or NO." if strict else ""),
-            tool_schemas=None,
-            think=False,
-        ).strip()
-        if YES_PAT.match(verdict) or NO_PAT.match(verdict):
-            return verdict
-        print("  [review] verdict didn't start with YES/NO, re-asking once")
-    print("  [review] still malformed — treating as NO")
-    return "NO (reviewer verdict was malformed) " + verdict
+YES_PAT = re.compile(r"^\s*yes\b", re.IGNORECASE)
+NO_PAT = re.compile(r"^\s*no\b", re.IGNORECASE)
+GOAL_TASK_PAT = re.compile(r"GOAL:\s*(?P<goal>.+?)\s*TASK:\s*(?P<task>.+)", re.DOTALL)
 
 
-# ─── Smart goal (-sg) ───────────────────────────────────────────────
-
-GOAL_TASK_PAT = re.compile(r"GOAL:\s*(.+?)\s*TASK:\s*(.+)", re.DOTALL | re.IGNORECASE)
-
-
-def make_goal_task(model: str, prompt: str) -> tuple[str, str]:
-    """Have the LM rewrite a rough user prompt into a (goal, task) pair."""
-    reply = chat_v2(
-        model,
-        GOALSMITH_SYSTEM,
-        f"User request: {prompt}",
-        tool_schemas=None,
-        think=True,
-    )
-    m = GOAL_TASK_PAT.search(reply)
-    if not m:
-        print("[WARNING] could not parse GOAL/TASK from model reply, "
-              "using your prompt as both")
-        return prompt, prompt
-    goal, task = m.group(1).strip(), m.group(2).strip()
-    print(f"\nGOAL: {goal}\nTASK: {task}\n")
-    return goal, task
+def _strip_fences(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    return text.strip()
 
 
-# ─── Main loop: execute -> review -> retry ──────────────────────────
-
-def main(model: str, goal: str, task: str, max_attempts: int = 5):
-    attempts = []            # keep EVERY attempt + verdict, nothing gets overwritten
-    feedback_history = []    # ALL reviewer feedback, so retries fix everything at once
-    prev_answer = None
-    answer = None
-    user_msg = task          # first attempt gets the plain task
-
-    for attempt in range(1, max_attempts + 1):
-        print(f"\n=== EXECUTING (attempt {attempt}/{max_attempts}) ===")
-        attempt_written_files.clear()
-        answer = chat_v2(model, EXECUTOR_SYSTEM, user_msg, tool_schemas=TOOL_SCHEMAS)
-
-        # Stall detection: if this attempt is nearly identical to the last
-        # failed one, reviewing it again is a waste of an expensive LLM call —
-        # skip straight to a retry that demands a different approach.
-        stalled = (prev_answer is not None and
-                   difflib.SequenceMatcher(None, answer[:5_000],
-                                           prev_answer[:5_000]).ratio() > 0.95)
-        if stalled:
-            print(f"attempt {attempt} is nearly identical to the previous one — "
-                  f"skipping review, demanding a new approach")
-            verdict = "NO (skipped review: output nearly identical to the previous failed attempt)"
-        else:
-            print(f"\n=== REVIEWING (attempt {attempt}) ===")
-            files_text = snapshot_files(attempt_written_files)
-            verdict = review(model, goal, answer, files_text)
-            print(f"reviewer said: {verdict!r}")
-
-        attempts.append({"attempt": attempt, "output": answer,
-                         "files": list(dict.fromkeys(attempt_written_files)),
-                         "verdict": verdict})
-
-        if YES_PAT.match(verdict):
-            print(f"WE DID IT on attempt {attempt}")
-            write_text_file(answer, "final_output.txt")
-            break
-
-        # everything else (NO or malformed-treated-as-NO) → retry
-        print(f"goal not met on attempt {attempt}, saving output and retrying")
-        write_text_file(answer, f"attempt_{attempt}_failed.txt")
-        feedback_history.append(f"[attempt {attempt}] {cap(verdict, 800)}")
-        # feed ALL recent feedback (not just the latest) + a CAPPED slice of
-        # the failure back in — an uncapped 30KB failed attempt would
-        # dominate the window
-        user_msg = task + RETRY_NOTE.format(
-            feedback="\n".join(feedback_history[-3:]),
-            previous=cap(answer, RETRY_PREV_MAX),
-        )
-        if stalled:
-            user_msg += ("\n\nIMPORTANT: your last two attempts were nearly "
-                         "identical. Take a DIFFERENT approach this time.")
-        prev_answer = answer
+def review(model: str, goal: str, output: str, files_text: str,
+           criteria: Optional[list]) -> dict:
+    """Ask the reviewer whether the goal was met.
+    Returns {"passed": bool, "feedback": str, "criteria": list|None, "raw": str}."""
+    if criteria:
+        crit_text = "\n".join(f"{i + 1}. {c}" for i, c in enumerate(criteria))
     else:
-        print(f"[WARNING] hit max attempts ({max_attempts}) without meeting the goal")
-        if answer is not None:
-            # don't leave the user empty-handed — the last attempt is still
-            # the best artifact we have, just unverified
-            write_text_file(answer, "final_output_UNVERIFIED.txt")
+        crit_text = ("(none provided — derive 3-6 concrete, checkable criteria "
+                     "from the GOAL yourself)")
 
-    write_text_file(json.dumps(attempts, indent=2), "attempt_history.json")
-    print_timing_summary()
+    user = REVIEW_USER.format(goal=goal, criteria=crit_text,
+                              output=cap(output, 8_000), files=files_text)
+
+    # ── structured path ──
+    if SUPPORTS_FORMAT:
+        prompt = user
+        for attempt in range(2):
+            raw = chat(model, REVIEWER_SYSTEM_JSON, prompt, think=False,
+                       label="reviewer", fmt=REVIEW_SCHEMA, stream=False, echo=False)
+            if not SUPPORTS_FORMAT:
+                break  # capability got disabled mid-call — fall through to legacy
+            try:
+                data = json.loads(_strip_fences(raw))
+                verdict = str(data.get("verdict", "")).upper()
+                if verdict not in ("PASS", "FAIL"):
+                    raise ValueError(f"bad verdict {verdict!r}")
+                crits = data.get("criteria") or []
+                unmet = [c for c in crits if not c.get("met")]
+                passed = verdict == "PASS" and not unmet  # guard inconsistent verdicts
+                feedback = str(data.get("feedback", "")).strip()
+                if unmet:
+                    details = "; ".join(
+                        f"{c.get('criterion', '?')} ({c.get('note', 'not met')})"
+                        for c in unmet)
+                    feedback = (feedback + "\nUnmet: " + details).strip()
+                print(f"\nReviewer verdict: {verdict}"
+                      + (f" — {len(unmet)} unmet criteria" if unmet else ""))
+                if feedback:
+                    print(f"Reviewer feedback: {truncate_middle(feedback, 600)}")
+                return {"passed": passed, "feedback": feedback,
+                        "criteria": crits, "raw": raw}
+            except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as e:
+                print(f"  [reviewer] could not parse structured verdict ({e}) — retrying")
+                prompt = (user + "\n\nREMINDER: respond with ONLY the JSON object "
+                          "matching the schema. No prose, no code fences.")
+        else:
+            print("  [reviewer] structured output failed twice — using legacy YES/NO")
+
+    # ── legacy path ──
+    raw = chat(model, REVIEWER_SYSTEM_LEGACY, user, think=False,
+               label="reviewer", stream=False, echo=False)
+    print(f"\nReviewer says: {truncate_middle(raw, 600)}")
+    if YES_PAT.match(raw):
+        return {"passed": True, "feedback": "", "criteria": None, "raw": raw}
+    if not NO_PAT.match(raw):
+        strict = (user + "\n\nIMPORTANT: your reply MUST start with the single word "
+                  "YES or NO on the first line, then your reasoning.")
+        raw = chat(model, REVIEWER_SYSTEM_LEGACY, strict, think=False,
+                   label="reviewer", stream=False, echo=False)
+        print(f"Reviewer (re-asked) says: {truncate_middle(raw, 600)}")
+        if YES_PAT.match(raw):
+            return {"passed": True, "feedback": "", "criteria": None, "raw": raw}
+    return {"passed": False, "feedback": raw.strip(), "criteria": None, "raw": raw}
+
+
+def make_goal_task(model: str, prompt: str):
+    """Turn a rough user prompt into (goal, task, criteria|None)."""
+    print("\nAsking the model to write a GOAL and TASK from your prompt...")
+
+    if SUPPORTS_FORMAT:
+        raw = chat(model, GOALSMITH_SYSTEM_JSON, prompt, think=False,
+                   label="goalsmith", fmt=GOALSMITH_SCHEMA, stream=False, echo=False)
+        if SUPPORTS_FORMAT:
+            try:
+                data = json.loads(_strip_fences(raw))
+                goal = str(data["goal"]).strip()
+                task = str(data["task"]).strip()
+                criteria = [str(c).strip() for c in (data.get("criteria") or []) if str(c).strip()]
+                print(f"\nGOAL: {goal}\nTASK: {task}")
+                if criteria:
+                    print("CRITERIA:")
+                    for i, c in enumerate(criteria, 1):
+                        print(f"  {i}. {c}")
+                return goal, task, criteria or None
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                print(f"  [goalsmith] could not parse structured plan ({e}) — using legacy format")
+
+    raw = chat(model, GOALSMITH_SYSTEM_LEGACY, prompt, think=False,
+               label="goalsmith", stream=False, echo=False)
+    m = GOAL_TASK_PAT.search(raw)
+    if not m:
+        print("WARNING: could not parse GOAL/TASK — using your prompt as both.")
+        return prompt, prompt, None
+    goal, task = m.group("goal").strip(), m.group("task").strip()
+    print(f"\nGOAL: {goal}\nTASK: {task}")
+    return goal, task, None
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# MAIN LOOP: EXECUTE → REVIEW → RETRY
+# ────────────────────────────────────────────────────────────────────────────
+
+def main(model: str, reviewer_model: str, goal: str, task: str,
+         criteria: Optional[list], max_attempts: int, max_tool_rounds: int) -> None:
+    global RUN_TEMPERATURE
+
+    attempts: list[dict] = []
+    feedback_history: list[str] = []
+    prev_answer = ""
+    user_msg = task
+    status = "max_attempts"
+
+    log_event("run_start", goal=goal, task=_short(task), model=model,
+              reviewer=reviewer_model, max_attempts=max_attempts)
+    transcript(f"# Agent run {_ts()}\n\n**Goal:** {goal}\n\n**Task:** {task}\n")
+
+    try:
+        for attempt in range(1, max_attempts + 1):
+            print(f"\n{'=' * 70}\nATTEMPT {attempt} of {max_attempts}\n{'=' * 70}")
+            attempt_written_files.clear()
+
+            answer = chat(model, EXECUTOR_SYSTEM, user_msg,
+                          tool_schemas=TOOL_SCHEMAS, think=THINK_DEFAULT,
+                          label="executor", max_tool_rounds=max_tool_rounds)
+
+            # ── stall detection: near-identical answer to last attempt ──
+            stalled = False
+            if prev_answer:
+                ratio = difflib.SequenceMatcher(
+                    None, prev_answer[:5_000], answer[:5_000]).ratio()
+                if ratio > 0.95:
+                    stalled = True
+                    print(f"\nSTALL DETECTED (similarity {ratio:.2f}) — skipping review, "
+                          "demanding a different approach.")
+            prev_answer = answer
+
+            if stalled:
+                RUN_TEMPERATURE = min((RUN_TEMPERATURE or 0.7) + 0.3, 1.3)
+                print(f"  [stall] bumping temperature to {RUN_TEMPERATURE:.1f}")
+                verdict = {"passed": False, "criteria": None, "raw": "(stall)",
+                           "feedback": ("Your answer was nearly identical to the previous "
+                                        "attempt. It was rejected. Take a DIFFERENT approach: "
+                                        "re-read the goal, use different tools or steps, and "
+                                        "produce substantively new work.")}
+            else:
+                files_text = ("WORKSPACE TREE:\n" + list_files(max_lines=60)
+                              + "\n\nFILES THE AGENT WROTE THIS ATTEMPT:\n"
+                              + snapshot_files(attempt_written_files))
+                verdict = review(reviewer_model, goal, answer, files_text, criteria)
+
+            attempts.append({"attempt": attempt, "passed": verdict["passed"],
+                             "stalled": stalled,
+                             "feedback": verdict["feedback"],
+                             "criteria": verdict.get("criteria"),
+                             "answer": answer})
+            transcript(f"\n## Attempt {attempt} — "
+                       f"{'PASSED' if verdict['passed'] else 'FAILED'}\n\n"
+                       f"{cap(answer, 4_000)}\n\n"
+                       f"**Reviewer:** {cap(verdict['feedback'] or verdict['raw'], 1_500)}\n")
+            log_event("attempt", n=attempt, passed=verdict["passed"], stalled=stalled,
+                      feedback=_short(verdict["feedback"]))
+
+            if verdict["passed"]:
+                print(f"\n{'=' * 70}\nWE DID IT — goal met on attempt {attempt}.\n{'=' * 70}")
+                write_text_file(answer, "final_output.txt")
+                status = "passed"
+                break
+
+            write_text_file(answer, f"attempt_{attempt}_failed.txt")
+            feedback_history.append(
+                f"[attempt {attempt}] {cap(verdict['feedback'] or verdict['raw'], 800)}")
+            user_msg = task + RETRY_NOTE.format(
+                feedback="\n".join(feedback_history[-3:]),
+                workspace=list_files(max_lines=40),
+                previous=cap(answer, RETRY_PREV_MAX))
+            if stalled:
+                user_msg += ("\n\nIMPORTANT: your last two answers were nearly identical. "
+                             "You MUST take a different approach this time.")
+        else:
+            print(f"\n{'=' * 70}\nWARNING: goal NOT verified after {max_attempts} attempts.\n"
+                  f"Saving the last attempt anyway.\n{'=' * 70}")
+            write_text_file(prev_answer, "final_output_UNVERIFIED.txt")
+
+    except KeyboardInterrupt:
+        status = "interrupted"
+        print("\n\nInterrupted — saving progress before exiting.")
+    finally:
+        try:
+            with open(os.path.join(WORKSPACE, "attempt_history.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"goal": goal, "task": task, "criteria": criteria,
+                           "status": status, "attempts": attempts}, f,
+                          indent=2, ensure_ascii=False)
+        except OSError as e:
+            print(f"WARNING: could not save attempt_history.json: {e}")
+        log_event("run_end", status=status, attempts=len(attempts))
+        transcript(f"\n---\n**Run finished:** {status} after {len(attempts)} attempt(s)\n")
+        print_run_summary()
+        print(f"\nRUN SUMMARY\n  status:    {status}\n  attempts:  {len(attempts)}\n"
+              f"  workspace: {WORKSPACE}")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# STARTUP CHECKS + CLI
+# ────────────────────────────────────────────────────────────────────────────
+
+def check_model(model: str) -> None:
+    """Fail fast (with a helpful message) if the model isn't on the server."""
+    try:
+        resp = requests.get(URL + "/api/tags", timeout=10)
+        resp.raise_for_status()
+        names = [m.get("name", "") for m in resp.json().get("models", [])]
+    except requests.RequestException as e:
+        print(f"NOTE: could not list models ({type(e).__name__}) — skipping model check.")
+        return
+    if model in names:
+        return
+    if ":" not in model and f"{model}:latest" in names:
+        return
+    listing = "\n".join(f"  - {n}" for n in sorted(names)) or "  (none)"
+    raise SystemExit(
+        f"\nModel '{model}' is not available on {URL}.\n"
+        f"Available models:\n{listing}\n\n"
+        f"Pull it first:  ollama pull {model}")
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="execute -> review -> retry agent harness")
+    p = argparse.ArgumentParser(
+        description="Agent harness for a local Ollama server: execute → review → retry.")
     g = p.add_mutually_exclusive_group(required=True)
-    g.add_argument("-g", "--goal", help="use this text as the goal (and the task)")
+    g.add_argument("-g", "--goal", help="the goal; also used verbatim as the task")
     g.add_argument("-sg", "--smart-goal",
-                   help="LM rewrites your input into a proper GOAL + TASK, then runs")
-    p.add_argument("--model", default=DEFAULT_MODEL, help=f"ollama model (default: {DEFAULT_MODEL})")
-    p.add_argument("--attempts", type=int, default=5, help="max execute/review attempts (default: 5)")
-    p.add_argument("--url", default=None, help=f"ollama server URL (default: {URL})")
-    p.add_argument("--full-context", action="store_true",
-                   help="send everything: no compaction or truncation of tool results, "
-                        "retries, or thinking (pair with a big --num-ctx)")
+                   help="rough prompt — the model writes the GOAL, TASK, and criteria")
+    p.add_argument("--model", default=DEFAULT_MODEL, help=f"executor model (default {DEFAULT_MODEL})")
+    p.add_argument("--reviewer-model", default=None,
+                   help="reviewer model (default: same as --model)")
+    p.add_argument("--attempts", type=int, default=5, help="max attempts (default 5)")
+    p.add_argument("--url", default=None, help=f"Ollama base URL (default {URL})")
+    p.add_argument("--workspace", default=None,
+                   help="directory for all agent files (default ./runs/run_<timestamp>)")
     p.add_argument("--num-ctx", type=int, default=NUM_CTX,
-                   help=f"context window to request from ollama (default: {NUM_CTX}; more = more RAM/VRAM)")
+                   help=f"context window in tokens (default {NUM_CTX})")
+    p.add_argument("--temperature", type=float, default=None, help="sampling temperature")
+    p.add_argument("--seed", type=int, default=None, help="sampling seed (reproducibility)")
+    p.add_argument("--max-tokens", type=int, default=None,
+                   help="max tokens per response (Ollama num_predict)")
+    p.add_argument("--keep-alive", default="10m",
+                   help="how long the server keeps the model loaded (default 10m)")
+    p.add_argument("--max-tool-rounds", type=int, default=15,
+                   help="max tool-calling rounds per attempt (default 15)")
+    p.add_argument("--no-stream", action="store_true", help="disable live token streaming")
+    p.add_argument("--no-think", action="store_true", help="disable model thinking")
+    p.add_argument("--full-context", action="store_true",
+                   help="disable ALL trimming/compaction — send everything (needs big num_ctx)")
     p.add_argument("--mcp", action="store_true",
-                   help="connect to the Docker MCP Toolkit gateway "
-                        "('docker mcp gateway run') and expose its tools to the agent")
+                   help="connect to the Docker MCP Toolkit gateway for extra tools")
     p.add_argument("--mcp-profile", default=None,
-                   help="MCP Toolkit profile to use (passed as --profile to the gateway)")
+                   help="MCP profile name passed to the gateway")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+
     if args.url:
-        URL = args.url
+        URL = args.url.rstrip("/")
     NUM_CTX = args.num_ctx
     FULL_CONTEXT = args.full_context
-    if FULL_CONTEXT:
-        print(f"[full-context mode] no trimming; num_ctx={NUM_CTX}")
+    STREAM = not args.no_stream
+    THINK_DEFAULT = not args.no_think
+    RUN_TEMPERATURE = args.temperature
+    SEED = args.seed
+    MAX_TOKENS = args.max_tokens
+    KEEP_ALIVE = args.keep_alive
 
-    if args.mcp:
-        try:
-            mcp_tool_names = setup_mcp_tools(profile=args.mcp_profile)
-        except (RuntimeError, TimeoutError) as e:
-            raise SystemExit(f"[ERROR] Docker MCP gateway: {e}")
-        if mcp_tool_names:
-            # tell the executor these extra tools exist so it reaches for them
-            EXECUTOR_SYSTEM += (
-                "\n\nAdditional tools are available via the Docker MCP Toolkit: "
-                + ", ".join(mcp_tool_names)
-                + ". Use them when they fit the task better than the built-in tools."
-            )
+    WORKSPACE = init_workspace(args.workspace)
+
+    reviewer_model = args.reviewer_model or args.model
+    print(f"agent.py v{__version__}")
+    print(f"  server:    {URL}")
+    print(f"  executor:  {args.model}")
+    print(f"  reviewer:  {reviewer_model}")
+    print(f"  workspace: {WORKSPACE}")
+    print(f"  num_ctx:   {NUM_CTX} · stream={'on' if STREAM else 'off'} · "
+          f"think={'on' if THINK_DEFAULT else 'off'}"
+          + (f" · temp={RUN_TEMPERATURE}" if RUN_TEMPERATURE is not None else "")
+          + (f" · seed={SEED}" if SEED is not None else ""))
 
     try:
+        check_model(args.model)
+        if reviewer_model != args.model:
+            check_model(reviewer_model)
+
+        if args.mcp:
+            try:
+                extra = setup_mcp_tools(args.mcp_profile)
+            except (RuntimeError, TimeoutError) as e:
+                raise SystemExit(f"\nMCP gateway failed to start: {e}\n"
+                                 "Is Docker Desktop running with the MCP Toolkit enabled?")
+            if extra:
+                EXECUTOR_SYSTEM += ("\n\nYou also have these extra MCP tools available: "
+                                    + ", ".join(extra))
+
         if args.smart_goal:
-            goal, task = make_goal_task(args.model, args.smart_goal)
+            goal, task, criteria = make_goal_task(args.model, args.smart_goal)
         else:
-            goal, task = args.goal, args.goal
-        main(args.model, goal, task, max_attempts=args.attempts)
+            goal, task, criteria = args.goal, args.goal, None
+
+        main(args.model, reviewer_model, goal, task, criteria,
+             args.attempts, args.max_tool_rounds)
+
     except requests.ConnectionError:
-        print(f"[ERROR] could not reach the ollama server at {URL} — is it running? "
-              f"(override with --url)")
+        print(f"\nERROR: could not reach Ollama at {URL}.\n"
+              "Is the server running? Set --url or OLLAMA_URL/OLLAMA_HOST if it lives elsewhere.")
     except requests.Timeout:
-        print(f"[ERROR] the model took longer than {REQUEST_TIMEOUT}s to respond")
+        print(f"\nERROR: request timed out after {REQUEST_TIMEOUT}s. The model may be "
+              "too large for this hardware, or the server is stuck.")
+    except requests.RequestException as e:
+        print(f"\nERROR: HTTP problem talking to Ollama: {e}")
     finally:
         if mcp_gateway is not None:
             mcp_gateway.close()
