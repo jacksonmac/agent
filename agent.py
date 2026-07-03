@@ -61,12 +61,14 @@ Optional deps for the research tools:
 __version__ = "2.0"
 
 import argparse
+import base64
 import difflib
 import ipaddress
 import json
 import os
 import re
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -76,6 +78,8 @@ from typing import Optional
 from urllib.parse import urlparse
 
 import requests
+
+from ui import ui
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -139,6 +143,62 @@ def init_workspace(path: Optional[str]) -> str:
         HERE, "runs", time.strftime("run_%Y%m%d_%H%M%S"))
     os.makedirs(ws, exist_ok=True)
     return ws
+
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+MAX_ATTACH_BYTES = 20 * 1024 * 1024
+
+
+def stage_attachments(paths: list) -> tuple:
+    """Copy user-supplied files into WORKSPACE so the file tools can reach them.
+    Returns (copied_names, base64_images). Image files are also base64-encoded
+    for vision models. Must be called after init_workspace()."""
+    copied: list[str] = []
+    images: list[str] = []
+    for raw in paths:
+        src = os.path.abspath(os.path.expanduser(raw))
+        if not os.path.isfile(src):
+            ui.warning(f"attachment not found, skipping: {raw}")
+            continue
+        if os.path.getsize(src) > MAX_ATTACH_BYTES:
+            ui.warning(f"attachment over {MAX_ATTACH_BYTES // (1024 * 1024)} MB, "
+                       f"skipping: {raw}")
+            continue
+        name = os.path.basename(src)
+        base, ext = os.path.splitext(name)
+        n = 2
+        while os.path.exists(os.path.join(WORKSPACE, name)):
+            name = f"{base}_{n}{ext}"
+            n += 1
+        shutil.copy2(src, os.path.join(WORKSPACE, name))
+        copied.append(name)
+        is_image = ext.lower() in IMAGE_EXTS
+        if is_image:
+            with open(src, "rb") as f:
+                images.append(base64.b64encode(f.read()).decode("ascii"))
+        log_event("attachment", name=name, source=src, image=is_image)
+    return copied, images
+
+
+_AT_TOKEN = re.compile(r'@("[^"]+"|\'[^\']+\'|\S+)')
+
+
+def extract_at_paths(text: str) -> tuple:
+    """Find @path tokens in goal text that resolve to existing files.
+    Returns (rewritten_text, absolute_paths). Tokens that don't point at a
+    real file (emails, @handles) are left untouched; matches are replaced
+    with the bare filename so the goal reads naturally."""
+    found: list[str] = []
+
+    def _sub(m):
+        cand = m.group(1).strip("\"'").rstrip(".,;:!?")
+        p = os.path.abspath(os.path.expanduser(cand))
+        if os.path.isfile(p):
+            found.append(p)
+            return os.path.basename(p)
+        return m.group(0)
+
+    return _AT_TOKEN.sub(_sub, text), found
 
 
 def _ts() -> str:
@@ -208,9 +268,9 @@ def compact_messages(messages: list) -> None:
         # silently drop the OLDEST tokens (system prompt first!), so shout
         est = estimate_tokens(messages)
         if est > NUM_CTX:
-            print(f"  [WARNING] full-context mode: sending ~{est} tokens but "
-                  f"num_ctx is {NUM_CTX} — ollama will silently drop the oldest. "
-                  f"Raise --num-ctx.")
+            ui.warning(f"  [WARNING] full-context mode: sending ~{est} tokens but "
+                       f"num_ctx is {NUM_CTX} — ollama will silently drop the oldest. "
+                       f"Raise --num-ctx.")
         return
     budget_tokens = int(NUM_CTX * 0.75)  # leave headroom for the reply
     if estimate_tokens(messages) <= budget_tokens:
@@ -227,8 +287,8 @@ def compact_messages(messages: list) -> None:
             return
 
     if estimate_tokens(messages) > budget_tokens:
-        print(f"  [WARNING] history still ~{estimate_tokens(messages)} tokens "
-              f"after compaction (budget {budget_tokens})")
+        ui.warning(f"  [WARNING] history still ~{estimate_tokens(messages)} tokens "
+                   f"after compaction (budget {budget_tokens})")
 
 
 # ─── Prompts ────────────────────────────────────────────────────────
@@ -299,6 +359,12 @@ Here is the most recent attempt — fix what is missing or broken and finish the
 {previous}
 --- END PREVIOUS ATTEMPT ---"""
 
+ATTACHMENT_NOTE = """
+
+The user attached these files; they are already in your workspace — read them with
+read_file (or run_python for binary/CSV work) before answering:
+{names}"""
+
 GOALSMITH_SYSTEM_JSON = """You turn a rough user request into a plan for an agent that has
 write_file / read_file / edit_file / list_files / run_python / run_shell / web_search /
 fetch_page tools.
@@ -361,16 +427,7 @@ token_totals: dict[str, list[int]] = defaultdict(lambda: [0, 0])  # label -> [in
 def print_run_summary() -> None:
     if not total_time:
         return
-    print("\n─── run summary ───")
-    for label, times in total_time.items():
-        tin, tout = token_totals.get(label, [0, 0])
-        print(f"  {label}: {len(times)} call(s), total {sum(times):.1f}s, "
-              f"avg {sum(times) / len(times):.1f}s, tokens {tin} in / {tout} out")
-    grand_in = sum(v[0] for v in token_totals.values())
-    grand_out = sum(v[1] for v in token_totals.values())
-    print(f"  TOTAL: {sum(sum(t) for t in total_time.values()):.1f}s of LLM time, "
-          f"{grand_in} in / {grand_out} out tokens "
-          f"(calibrated ~{CHARS_PER_TOKEN:.1f} chars/token)")
+    ui.timing_summary(total_time, token_totals, CHARS_PER_TOKEN)
 
 
 # ─── Workspace file tools ───────────────────────────────────────────
@@ -1092,7 +1149,7 @@ def _options() -> dict:
 
 def _backoff(i: int, err) -> None:
     wait = 2 ** i
-    print(f"  [retry] {err} — waiting {wait}s and retrying...")
+    ui.warning(f"  [retry] {err} — waiting {wait}s and retrying...")
     time.sleep(wait)
 
 
@@ -1130,17 +1187,17 @@ def _chat_once(payload: dict, label: str, print_stream: bool) -> dict:
                     "This harness needs a tool-capable model (e.g. qwen3, llama3.1, "
                     "mistral-nemo, command-r). Pick one with --model.")
             if "think" in body and "think" in payload:
-                print("  [fallback] model rejected 'think' — disabling thinking for this run")
+                ui.note("  [fallback] model rejected 'think' — disabling thinking for this run")
                 SUPPORTS_THINK = False
                 payload.pop("think", None)
                 continue
             if "format" in body and "format" in payload:
-                print("  [fallback] model rejected 'format' — falling back to legacy text parsing")
+                ui.note("  [fallback] model rejected 'format' — falling back to legacy text parsing")
                 SUPPORTS_FORMAT = False
                 payload.pop("format", None)
                 continue
             if payload.get("stream") and payload.get("tools"):
-                print("  [fallback] server rejected stream+tools — disabling streaming for this run")
+                ui.note("  [fallback] server rejected stream+tools — disabling streaming for this run")
                 STREAM = False
                 payload["stream"] = False
                 continue
@@ -1170,7 +1227,7 @@ def _chat_once(payload: dict, label: str, print_stream: bool) -> dict:
         if p_tok > 0 and sent_chars > 0:
             observed = sent_chars / p_tok
             CHARS_PER_TOKEN = max(2.0, min(6.0, 0.8 * CHARS_PER_TOKEN + 0.2 * observed))
-        print(f"  [{label}] {secs:.1f}s · {p_tok}→{e_tok} tokens")
+        ui.llm_timing(label, secs, p_tok, e_tok)
         log_event("llm", label=label, secs=round(secs, 2),
                   prompt_tokens=p_tok, eval_tokens=e_tok,
                   stream=bool(payload.get("stream")))
@@ -1201,21 +1258,16 @@ def _consume_stream(resp, do_print: bool):
             if t:
                 thinking_parts.append(t)
                 if do_print:
-                    if not printed_think_head:
-                        sys.stdout.write("\n[thinking] ")
-                        printed_think_head = True
-                    sys.stdout.write(t)
-                    sys.stdout.flush()
+                    ui.stream_thinking(t, first=not printed_think_head)
+                    printed_think_head = True
 
             c = msg.get("content")
             if c:
                 content_parts.append(c)
                 if do_print:
-                    if not printed_answer_head:
-                        sys.stdout.write("\n[answer] " if printed_think_head else "")
-                        printed_answer_head = True
-                    sys.stdout.write(c)
-                    sys.stdout.flush()
+                    ui.stream_answer(c, first=not printed_answer_head,
+                                     after_thinking=printed_think_head)
+                    printed_answer_head = True
 
             if msg.get("tool_calls"):
                 tool_calls.extend(msg["tool_calls"])
@@ -1227,7 +1279,7 @@ def _consume_stream(resp, do_print: bool):
         raise RuntimeError(f"connection lost mid-stream: {e}")
 
     if do_print and (printed_think_head or printed_answer_head):
-        print()
+        ui.stream_end()
 
     out: dict = {"role": "assistant", "content": "".join(content_parts)}
     if thinking_parts:
@@ -1239,11 +1291,15 @@ def _consume_stream(resp, do_print: bool):
 
 def chat(model: str, system: str, user: str, tool_schemas=None, think: bool = True,
          label: str = "llm", max_tool_rounds: int = 15, fmt=None,
-         stream=None, echo: bool = True) -> str:
+         stream=None, echo: bool = True, images: Optional[list] = None) -> str:
     """Multi-round chat loop: send → maybe execute tool calls → repeat.
     Returns the model's final text answer."""
-    messages = [{"role": "system", "content": system},
-                {"role": "user", "content": user}]
+    user_message: dict = {"role": "user", "content": user}
+    if images:
+        # Ollama vision format: base64 images ride alongside the text content.
+        # Non-vision models ignore the field, so no capability fallback needed.
+        user_message["images"] = images
+    messages = [{"role": "system", "content": system}, user_message]
 
     for round_no in range(max_tool_rounds):
         do_stream = STREAM if stream is None else stream
@@ -1252,7 +1308,7 @@ def chat(model: str, system: str, user: str, tool_schemas=None, think: bool = Tr
 
         compact_messages(messages)
         if echo:
-            print(f"\n--- round {round_no + 1} · ~{estimate_tokens(messages)} tokens in context ---")
+            ui.round_marker(round_no + 1, estimate_tokens(messages))
 
         payload: dict = {"model": model, "messages": messages, "stream": do_stream}
         if think and SUPPORTS_THINK:
@@ -1267,9 +1323,9 @@ def chat(model: str, system: str, user: str, tool_schemas=None, think: bool = Tr
 
         if echo and not streamed_live:
             if msg.get("thinking"):
-                print(f"\n[thinking] {truncate_middle(msg['thinking'], 500)}")
+                ui.thinking(truncate_middle(msg['thinking'], 500))
             if msg.get("content"):
-                print(f"\nAnswer: {msg['content']}")
+                ui.answer(msg['content'])
 
         if not FULL_CONTEXT:
             msg.pop("thinking", None)
@@ -1283,15 +1339,15 @@ def chat(model: str, system: str, user: str, tool_schemas=None, think: bool = Tr
             name = fn.get("name", "?")
             args = fn.get("arguments", {}) or {}
             if echo:
-                print(f"\n  [tool call] {name}({truncate_middle(json.dumps(args, default=str), 300)})")
+                ui.tool_call(name, truncate_middle(json.dumps(args, default=str), 300))
             result = execute_tool_call(name, args)
             if echo:
-                print(f"  [tool result] {truncate_middle(result, 300)}")
+                ui.tool_result(truncate_middle(result, 300))
             messages.append({"role": "tool", "tool_name": name,
                              "content": cap(result, TOOL_RESULT_MAX)})
 
     # Ran out of tool rounds — force a final, tool-free answer.
-    print(f"\nWARNING: hit {max_tool_rounds} tool rounds — forcing a final answer without tools.")
+    ui.force_final(max_tool_rounds)
     messages.append({"role": "user", "content":
                      "You have used all available tool calls. Give your final answer "
                      "now, based on the work completed so far."})
@@ -1301,7 +1357,7 @@ def chat(model: str, system: str, user: str, tool_schemas=None, think: bool = Tr
         payload["think"] = True
     msg = _chat_once(payload, label, print_stream=False)
     if echo and msg.get("content"):
-        print(f"\nAnswer: {msg['content']}")
+        ui.answer(msg['content'])
     return msg.get("content", "")
 
 
@@ -1357,23 +1413,21 @@ def review(model: str, goal: str, output: str, files_text: str,
                         f"{c.get('criterion', '?')} ({c.get('note', 'not met')})"
                         for c in unmet)
                     feedback = (feedback + "\nUnmet: " + details).strip()
-                print(f"\nReviewer verdict: {verdict}"
-                      + (f" — {len(unmet)} unmet criteria" if unmet else ""))
-                if feedback:
-                    print(f"Reviewer feedback: {truncate_middle(feedback, 600)}")
+                ui.reviewer_verdict(verdict, len(unmet),
+                                    truncate_middle(feedback, 600) if feedback else "")
                 return {"passed": passed, "feedback": feedback,
                         "criteria": crits, "raw": raw}
             except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as e:
-                print(f"  [reviewer] could not parse structured verdict ({e}) — retrying")
+                ui.note(f"  [reviewer] could not parse structured verdict ({e}) — retrying")
                 prompt = (user + "\n\nREMINDER: respond with ONLY the JSON object "
                           "matching the schema. No prose, no code fences.")
         else:
-            print("  [reviewer] structured output failed twice — using legacy YES/NO")
+            ui.note("  [reviewer] structured output failed twice — using legacy YES/NO")
 
     # ── legacy path ──
     raw = chat(model, REVIEWER_SYSTEM_LEGACY, user, think=False,
                label="reviewer", stream=False, echo=False)
-    print(f"\nReviewer says: {truncate_middle(raw, 600)}")
+    ui.reviewer_says(truncate_middle(raw, 600))
     if YES_PAT.match(raw):
         return {"passed": True, "feedback": "", "criteria": None, "raw": raw}
     if not NO_PAT.match(raw):
@@ -1381,7 +1435,7 @@ def review(model: str, goal: str, output: str, files_text: str,
                   "YES or NO on the first line, then your reasoning.")
         raw = chat(model, REVIEWER_SYSTEM_LEGACY, strict, think=False,
                    label="reviewer", stream=False, echo=False)
-        print(f"Reviewer (re-asked) says: {truncate_middle(raw, 600)}")
+        ui.reviewer_says(truncate_middle(raw, 600), reasked=True)
         if YES_PAT.match(raw):
             return {"passed": True, "feedback": "", "criteria": None, "raw": raw}
     return {"passed": False, "feedback": raw.strip(), "criteria": None, "raw": raw}
@@ -1389,7 +1443,7 @@ def review(model: str, goal: str, output: str, files_text: str,
 
 def make_goal_task(model: str, prompt: str):
     """Turn a rough user prompt into (goal, task, criteria|None)."""
-    print("\nAsking the model to write a GOAL and TASK from your prompt...")
+    ui.goalsmith_start()
 
     if SUPPORTS_FORMAT:
         raw = chat(model, GOALSMITH_SYSTEM_JSON, prompt, think=False,
@@ -1400,23 +1454,19 @@ def make_goal_task(model: str, prompt: str):
                 goal = str(data["goal"]).strip()
                 task = str(data["task"]).strip()
                 criteria = [str(c).strip() for c in (data.get("criteria") or []) if str(c).strip()]
-                print(f"\nGOAL: {goal}\nTASK: {task}")
-                if criteria:
-                    print("CRITERIA:")
-                    for i, c in enumerate(criteria, 1):
-                        print(f"  {i}. {c}")
+                ui.goal_task(goal, task, criteria)
                 return goal, task, criteria or None
             except (json.JSONDecodeError, KeyError, TypeError) as e:
-                print(f"  [goalsmith] could not parse structured plan ({e}) — using legacy format")
+                ui.note(f"  [goalsmith] could not parse structured plan ({e}) — using legacy format")
 
     raw = chat(model, GOALSMITH_SYSTEM_LEGACY, prompt, think=False,
                label="goalsmith", stream=False, echo=False)
     m = GOAL_TASK_PAT.search(raw)
     if not m:
-        print("WARNING: could not parse GOAL/TASK — using your prompt as both.")
+        ui.warning("WARNING: could not parse GOAL/TASK — using your prompt as both.")
         return prompt, prompt, None
     goal, task = m.group("goal").strip(), m.group("task").strip()
-    print(f"\nGOAL: {goal}\nTASK: {task}")
+    ui.goal_task(goal, task)
     return goal, task, None
 
 
@@ -1425,27 +1475,32 @@ def make_goal_task(model: str, prompt: str):
 # ────────────────────────────────────────────────────────────────────────────
 
 def main(model: str, reviewer_model: str, goal: str, task: str,
-         criteria: Optional[list], max_attempts: int, max_tool_rounds: int) -> None:
+         criteria: Optional[list], max_attempts: int, max_tool_rounds: int,
+         attachments: Optional[list] = None, images: Optional[list] = None) -> None:
     global RUN_TEMPERATURE
 
     attempts: list[dict] = []
     feedback_history: list[str] = []
     prev_answer = ""
-    user_msg = task
+    attach_note = (ATTACHMENT_NOTE.format(
+        names="\n".join("- " + n for n in attachments)) if attachments else "")
+    user_msg = task + attach_note
     status = "max_attempts"
 
     log_event("run_start", goal=goal, task=_short(task), model=model,
-              reviewer=reviewer_model, max_attempts=max_attempts)
+              reviewer=reviewer_model, max_attempts=max_attempts,
+              attachments=attachments or [])
     transcript(f"# Agent run {_ts()}\n\n**Goal:** {goal}\n\n**Task:** {task}\n")
 
     try:
         for attempt in range(1, max_attempts + 1):
-            print(f"\n{'=' * 70}\nATTEMPT {attempt} of {max_attempts}\n{'=' * 70}")
+            ui.attempt_banner(attempt, max_attempts)
             attempt_written_files.clear()
 
             answer = chat(model, EXECUTOR_SYSTEM, user_msg,
                           tool_schemas=TOOL_SCHEMAS, think=THINK_DEFAULT,
-                          label="executor", max_tool_rounds=max_tool_rounds)
+                          label="executor", max_tool_rounds=max_tool_rounds,
+                          images=images)
 
             # ── stall detection: near-identical answer to last attempt ──
             stalled = False
@@ -1454,13 +1509,12 @@ def main(model: str, reviewer_model: str, goal: str, task: str,
                     None, prev_answer[:5_000], answer[:5_000]).ratio()
                 if ratio > 0.95:
                     stalled = True
-                    print(f"\nSTALL DETECTED (similarity {ratio:.2f}) — skipping review, "
-                          "demanding a different approach.")
+                    ui.stall(ratio)
             prev_answer = answer
 
             if stalled:
                 RUN_TEMPERATURE = min((RUN_TEMPERATURE or 0.7) + 0.3, 1.3)
-                print(f"  [stall] bumping temperature to {RUN_TEMPERATURE:.1f}")
+                ui.stall_bump(RUN_TEMPERATURE)
                 verdict = {"passed": False, "criteria": None, "raw": "(stall)",
                            "feedback": ("Your answer was nearly identical to the previous "
                                         "attempt. It was rejected. Take a DIFFERENT approach: "
@@ -1470,6 +1524,11 @@ def main(model: str, reviewer_model: str, goal: str, task: str,
                 files_text = ("WORKSPACE TREE:\n" + list_files(max_lines=60)
                               + "\n\nFILES THE AGENT WROTE THIS ATTEMPT:\n"
                               + snapshot_files(attempt_written_files))
+                text_attachments = [n for n in (attachments or [])
+                                    if os.path.splitext(n)[1].lower() not in IMAGE_EXTS]
+                if text_attachments:
+                    files_text += ("\n\nFILES THE USER ATTACHED (inputs, not agent work):\n"
+                                   + snapshot_files(text_attachments))
                 verdict = review(reviewer_model, goal, answer, files_text, criteria)
 
             attempts.append({"attempt": attempt, "passed": verdict["passed"],
@@ -1485,7 +1544,7 @@ def main(model: str, reviewer_model: str, goal: str, task: str,
                       feedback=_short(verdict["feedback"]))
 
             if verdict["passed"]:
-                print(f"\n{'=' * 70}\nWE DID IT — goal met on attempt {attempt}.\n{'=' * 70}")
+                ui.success(attempt)
                 write_text_file(answer, "final_output.txt")
                 status = "passed"
                 break
@@ -1493,7 +1552,7 @@ def main(model: str, reviewer_model: str, goal: str, task: str,
             write_text_file(answer, f"attempt_{attempt}_failed.txt")
             feedback_history.append(
                 f"[attempt {attempt}] {cap(verdict['feedback'] or verdict['raw'], 800)}")
-            user_msg = task + RETRY_NOTE.format(
+            user_msg = task + attach_note + RETRY_NOTE.format(
                 feedback="\n".join(feedback_history[-3:]),
                 workspace=list_files(max_lines=40),
                 previous=cap(answer, RETRY_PREV_MAX))
@@ -1501,13 +1560,12 @@ def main(model: str, reviewer_model: str, goal: str, task: str,
                 user_msg += ("\n\nIMPORTANT: your last two answers were nearly identical. "
                              "You MUST take a different approach this time.")
         else:
-            print(f"\n{'=' * 70}\nWARNING: goal NOT verified after {max_attempts} attempts.\n"
-                  f"Saving the last attempt anyway.\n{'=' * 70}")
+            ui.not_verified(max_attempts)
             write_text_file(prev_answer, "final_output_UNVERIFIED.txt")
 
     except KeyboardInterrupt:
         status = "interrupted"
-        print("\n\nInterrupted — saving progress before exiting.")
+        ui.interrupted()
     finally:
         try:
             with open(os.path.join(WORKSPACE, "attempt_history.json"), "w",
@@ -1516,12 +1574,11 @@ def main(model: str, reviewer_model: str, goal: str, task: str,
                            "status": status, "attempts": attempts}, f,
                           indent=2, ensure_ascii=False)
         except OSError as e:
-            print(f"WARNING: could not save attempt_history.json: {e}")
+            ui.warning(f"WARNING: could not save attempt_history.json: {e}")
         log_event("run_end", status=status, attempts=len(attempts))
         transcript(f"\n---\n**Run finished:** {status} after {len(attempts)} attempt(s)\n")
         print_run_summary()
-        print(f"\nRUN SUMMARY\n  status:    {status}\n  attempts:  {len(attempts)}\n"
-              f"  workspace: {WORKSPACE}")
+        ui.run_summary(status, len(attempts), WORKSPACE)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1535,7 +1592,7 @@ def check_model(model: str) -> None:
         resp.raise_for_status()
         names = [m.get("name", "") for m in resp.json().get("models", [])]
     except requests.RequestException as e:
-        print(f"NOTE: could not list models ({type(e).__name__}) — skipping model check.")
+        ui.note(f"NOTE: could not list models ({type(e).__name__}) — skipping model check.")
         return
     if model in names:
         return
@@ -1551,10 +1608,12 @@ def check_model(model: str) -> None:
 def parse_args():
     p = argparse.ArgumentParser(
         description="Agent harness for a local Ollama server: execute → review → retry.")
-    g = p.add_mutually_exclusive_group(required=True)
+    g = p.add_mutually_exclusive_group(required=False)
     g.add_argument("-g", "--goal", help="the goal; also used verbatim as the task")
     g.add_argument("-sg", "--smart-goal",
                    help="rough prompt — the model writes the GOAL, TASK, and criteria")
+    p.add_argument("--repl", action="store_true",
+                   help="start the interactive prompt (also the default when no goal is given)")
     p.add_argument("--model", default=DEFAULT_MODEL, help=f"executor model (default {DEFAULT_MODEL})")
     p.add_argument("--reviewer-model", default=None,
                    help="reviewer model (default: same as --model)")
@@ -1562,6 +1621,9 @@ def parse_args():
     p.add_argument("--url", default=None, help=f"Ollama base URL (default {URL})")
     p.add_argument("--workspace", default=None,
                    help="directory for all agent files (default ./runs/run_<timestamp>)")
+    p.add_argument("--files", nargs="+", default=None, metavar="PATH",
+                   help="files to copy into the workspace before the run "
+                        "(images also go to vision models)")
     p.add_argument("--num-ctx", type=int, default=NUM_CTX,
                    help=f"context window in tokens (default {NUM_CTX})")
     p.add_argument("--temperature", type=float, default=None, help="sampling temperature")
@@ -1597,18 +1659,9 @@ if __name__ == "__main__":
     MAX_TOKENS = args.max_tokens
     KEEP_ALIVE = args.keep_alive
 
-    WORKSPACE = init_workspace(args.workspace)
-
     reviewer_model = args.reviewer_model or args.model
-    print(f"agent.py v{__version__}")
-    print(f"  server:    {URL}")
-    print(f"  executor:  {args.model}")
-    print(f"  reviewer:  {reviewer_model}")
-    print(f"  workspace: {WORKSPACE}")
-    print(f"  num_ctx:   {NUM_CTX} · stream={'on' if STREAM else 'off'} · "
-          f"think={'on' if THINK_DEFAULT else 'off'}"
-          + (f" · temp={RUN_TEMPERATURE}" if RUN_TEMPERATURE is not None else "")
-          + (f" · seed={SEED}" if SEED is not None else ""))
+    # No goal on the command line → drop into the interactive prompt.
+    repl_mode = args.repl or (not args.goal and not args.smart_goal)
 
     try:
         check_model(args.model)
@@ -1625,22 +1678,38 @@ if __name__ == "__main__":
                 EXECUTOR_SYSTEM += ("\n\nYou also have these extra MCP tools available: "
                                     + ", ".join(extra))
 
-        if args.smart_goal:
-            goal, task, criteria = make_goal_task(args.model, args.smart_goal)
+        if repl_mode:
+            from repl import run_repl
+            run_repl(args, reviewer_model)
         else:
-            goal, task, criteria = args.goal, args.goal, None
+            WORKSPACE = init_workspace(args.workspace)
+            ui.run_header(version=__version__, server=URL, executor=args.model,
+                          reviewer=reviewer_model, workspace=WORKSPACE, num_ctx=NUM_CTX,
+                          stream=STREAM, think=THINK_DEFAULT,
+                          temp=RUN_TEMPERATURE, seed=SEED)
 
-        main(args.model, reviewer_model, goal, task, criteria,
-             args.attempts, args.max_tool_rounds)
+            # @path tokens in the goal text become attachments too.
+            goal_text = args.smart_goal or args.goal
+            goal_text, at_paths = extract_at_paths(goal_text)
+            copied, images = stage_attachments((args.files or []) + at_paths)
+
+            if args.smart_goal:
+                goal, task, criteria = make_goal_task(args.model, goal_text)
+            else:
+                goal, task, criteria = goal_text, goal_text, None
+
+            main(args.model, reviewer_model, goal, task, criteria,
+                 args.attempts, args.max_tool_rounds,
+                 attachments=copied, images=images)
 
     except requests.ConnectionError:
-        print(f"\nERROR: could not reach Ollama at {URL}.\n"
-              "Is the server running? Set --url or OLLAMA_URL/OLLAMA_HOST if it lives elsewhere.")
+        ui.error(f"\nERROR: could not reach Ollama at {URL}.\n"
+                 "Is the server running? Set --url or OLLAMA_URL/OLLAMA_HOST if it lives elsewhere.")
     except requests.Timeout:
-        print(f"\nERROR: request timed out after {REQUEST_TIMEOUT}s. The model may be "
-              "too large for this hardware, or the server is stuck.")
+        ui.error(f"\nERROR: request timed out after {REQUEST_TIMEOUT}s. The model may be "
+                 "too large for this hardware, or the server is stuck.")
     except requests.RequestException as e:
-        print(f"\nERROR: HTTP problem talking to Ollama: {e}")
+        ui.error(f"\nERROR: HTTP problem talking to Ollama: {e}")
     finally:
         if mcp_gateway is not None:
             mcp_gateway.close()
