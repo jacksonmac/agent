@@ -1,0 +1,9 @@
+# Core
+requests
+
+# Dev: the harness's own test suite (python3 -m pytest)
+pytest
+
+# Optional, only needed for the web research tools (web_search / fetch_page):
+#   ddgs
+#   trafilatura

@@ -1,121 +1,115 @@
-# Plan-Then-Execute Agent
+# Execute → Review → Retry Agent
 
-A lightweight autonomous agent that breaks a goal into a plan, executes it phase-by-phase, and self-reviews — all powered by a local [Ollama](https://ollama.com/) instance.
-   - main idea is to have it running on a differnt computer on your network
+A lightweight autonomous agent harness powered by a local [Ollama](https://ollama.com/) instance
+(designed to run against an Ollama server on another computer on your network).
 
-> **Status:** Early prototype. The core loop works, but several pieces (dynamic model selection, user input, the Python tool) are stubbed out. See the roadmap below. The main loop isnt done yet, in the regx if it complets a goal, noting happens. file saving not a thing yet, lots of problems
+An **executor** LLM does the work with real tools in an isolated per-run workspace, a
+**reviewer** LLM checks the actual files on disk against the goal, and failed attempts are
+retried with the reviewer's feedback — in the *same* conversation, so the model remembers
+what it already tried.
 
----
-## Current architecture
-![Plan-Then-Execute Agent](agent_main_loop_control_flow.svg)
-- image made with claude from current code
-- need to finsih up the main loop and add tool calling
+## How it works
 
+1. **(Optional) Goalsmith** — with `-sg`, an LLM rewrites your rough request into a GOAL,
+   a checklist of binary success CRITERIA, and a TASK briefing. With `-g`, your text is used
+   as both goal and task and the reviewer derives its own criteria.
+2. **Execute** — the executor gets the goal + task and a tool belt:
+   `list_files`, `read_file`, `write_file`, `edit_file` (targeted replace),
+   `run_python`, `run_script`, `run_shell` (allowlisted), `web_search`, `fetch_page`,
+   plus any Docker MCP Toolkit tools with `--mcp`. All file access is jailed to the
+   run's workspace.
+3. **Review** — the reviewer sees the workspace listing, the content of every file the
+   attempt created or modified (however it was written), and automated `pytest` output if
+   tests exist. It can also inspect the workspace with read-only tools. It replies with a
+   JSON verdict: pass/fail per criterion plus actionable feedback.
+4. **Retry** — on a failed verdict the same session continues with the unmet criteria and
+   feedback (earlier attempts are compacted to stubs to stay inside the context window).
+   If the history won't fit, the harness falls back to a fresh conversation and logs a
+   `context_reset` event. Attempts that make zero tool calls or repeat the previous
+   attempt are caught early without wasting a review call.
 
-## How It Works
+## Per-run isolation
 
-The agent follows a three-stage cycle:
+Every run gets its own directory — nothing is written to the repo root, and leftovers
+from one run can't confuse the next:
 
-1. **Plan** — A planner LLM receives the goal and situation, then produces a phased plan with milestones, a critical path, and risky assumptions.
-2. **Execute** — An executor LLM takes Phase 1 of the plan and produces real output (code, drafts, etc.) rather than describing what it *would* do.
-3. **Review** — A reviewer LLM checks the output against the original goal and returns a simple YES/NO verdict.
-   - **YES →** Done.
-   - **NO →** A worker prompt feeds the plan, prior output, and context back into the model and loops until the goal is met.
+```
+runs/run_20260703_154139/
+├── workspace/           # the ONLY directory the agent can see and touch
+├── transcript.md        # human-readable log of every attempt + verdict
+├── events.jsonl         # machine log: llm calls (real token counts), tool calls, attempts
+├── attempt_1.txt        # prose of each failed attempt
+├── attempt_history.json
+└── final_output.txt     # or final_output_UNVERIFIED.txt if attempts ran out
+runs/latest              # symlink to the most recent run
+```
 
-Each stage uses a separate system prompt so the model stays focused on one job at a time.
+Reuse a previous workspace (to continue earlier work) with
+`--workspace runs/run_.../workspace`.
 
 ## Requirements
 
 - **Python 3.10+**
 - **Ollama ≥ 0.9** (for the `think` parameter)
-- An Ollama-compatible model pulled locally (default: `qwen3:14b`)
-- `requests` library
-
-## Setup
-
-```bash
-# 1. Install Ollama and pull a model
-ollama pull qwen3:14b
-
-# 2. Install the Python dependency
-pip install requests
-
-# 3. Update the Ollama URL in agent.py if your server isn't at the default
-#    URL = "http://192.168.1.134:11434"
-```
-## sever computer
-
-1. Change the fire wall rules
-```bash
-New-NetFirewallRule -DisplayName "Ollama LAN Access" -Direction Inbound -LocalPort 11434 -Protocol TCP -Action Allow -Profile Private
-#this will allow anyone computer on your network work to access ollama
-```
-2. Find your ip address on the sever computer
-```bash
-ipconfig
-```
-3. Use the ip address from step 2
-4. Test that its working "http://192.168.1.74:11434" (your ip will be different based on step 2)
-
+- `pip install requests` (plus optional `ddgs` and `trafilatura` for the web tools,
+  and `pytest` to run the harness's own tests)
 
 ## Usage
 
 ```bash
-python agent.py
+python3 agent.py -g "Write fizzbuzz.py that prints FizzBuzz for 1-30, run it, and confirm the output"
+python3 agent.py -sg "I need a small flask api for notes"          # goalsmith mode
+python3 agent.py -g "..." --model qwen3.5:9b --attempts 3
+python3 agent.py -g "..." --reviewer-model qwen3.6:27b             # bigger model as judge
+python3 agent.py -g "..." --num-ctx 32768 --full-context           # no trimming at all
+python3 agent.py -g "..." --mcp                                    # + Docker MCP Toolkit tools
+python3 agent.py -g "..." --workspace runs/latest/workspace        # continue earlier work
+python3 agent.py -g "..." --no-reviewer-tools                      # faster, snapshot-only review
 ```
 
-On launch the agent will:
+## Project structure
 
-1. List available models from your Ollama instance.
-2. Run the planning stage and print the plan.
-3. Execute Phase 1 and print the deliverable.
-4. Self-review and, if the goal isn't met, loop with a worker prompt until it is.
+```
+agent.py              # entry-point shim (python3 agent.py -g ...)
+harness/
+├── cli.py            # argument parsing and wiring
+├── config.py         # all settings, incl. per-role temperature (reviewer runs at 0.1)
+├── prompts.py        # executor / reviewer / goalsmith system prompts
+├── llm.py            # Ollama chat, Session (persistent retry memory), context budgeting
+├── workspace.py      # per-run dirs, path jail, mtime-based change tracking
+├── runlog.py         # transcript.md + events.jsonl writers
+├── review.py         # JSON verdicts with fallback parsing, automated pytest checks
+├── goalsmith.py      # -sg: request → goal + criteria + task
+├── run.py            # the execute → review → retry loop
+└── tools/            # tool registry, file/exec/web tools, Docker MCP gateway client
+tests/                # pytest suite for the harness itself (python3 -m pytest)
+```
 
-The goal and situation are currently hardcoded near the top of `main()`.
+## Ollama server setup (separate computer)
+
+1. Allow LAN access to Ollama on the server (Windows PowerShell, admin):
+```powershell
+New-NetFirewallRule -DisplayName "Ollama LAN Access" -Direction Inbound -LocalPort 11434 -Protocol TCP -Action Allow -Profile Private
+# this allows any computer on your network to access ollama
+```
+2. Find the server's IP with `ipconfig`.
+3. Test it in a browser: `http://<server-ip>:11434` should answer "Ollama is running".
+4. Point the agent at it: `--url http://<server-ip>:11434` (or change the default in
+   `harness/config.py`).
 
 ## Configuration
 
-| Variable | Location | Purpose |
-|---|---|---|
-| `URL` | Module level | Ollama server address |
-| `model` | `main()` | Which Ollama model to use |
-| `goal` | `main()` | What the agent is trying to accomplish |
-| `situation` | `main()` | Context, constraints, and resources |
-
-## Project Structure
-
-```
-agent.py          # Everything lives here for now — prompts, HTTP helpers, main loop
-```
-
-## Known Limitations
-
-- **Hardcoded goal and model.** Both are set inside `main()` with TODO markers for making them dynamic.
-- **Single-phase execution.** Only Phase 1 of the plan is executed; later phases aren't wired up yet.
-- **Review loop bug.** The `while` loop re-checks the goal but doesn't update `string_list`, so the exit condition never triggers. The `counter` variable also references `count` (the `itertools` import) instead of `counter`.
-- **No tool use.** `python_tool()` is defined but not implemented — the agent can't yet run the code it generates.
-- **No conversation memory.** Each LLM call is a single user turn; the model doesn't see prior exchanges.
-- **No file output.** Generated artifacts are printed to the console but not written to disk (a `write_text_file` helper exists but isn't called).
+Defaults live in `harness/config.py` (`Settings` dataclass): server URL, default model,
+context window, truncation caps, and per-role sampling options. Everything relevant is
+also overridable per run via CLI flags (`--url`, `--model`, `--reviewer-model`,
+`--num-ctx`, `--attempts`, ...).
 
 ## Roadmap
 
-Rough priorities based on the TODOs in the code:
-
-1. **Accept goal and situation from user input** (CLI args or interactive prompt).
-2. **Fix the review loop** so it properly exits on YES and accumulates context across iterations.
-3. **Dynamic model selection** — pick a model from the available list or let the user choose.
-4. **Implement `python_tool()`** — sandbox-execute generated Python and feed the output back to the agent.
-5. **Multi-phase execution** — iterate through all phases of the plan, not just Phase 1.
-6. **Write output to files** — use `write_text_file()` to persist deliverables.
-
-Other things to deal with
-- update read me
-   - add the steps on how to connect to your own computer
-   - how to step how the networking steps
-   - Need to split the code up in more files to make it readable,
-       - tools are gonna end up being separated
-       - need to develop the main loop fully FRIST
-       - make pastmessages an sqklitdb so can use that for other things later
+- Multi-phase planning for big goals (plan → execute each phase → review each phase)
+- Streaming output so long generations show progress
+- Persist run history to sqlite for cross-run "what did I do last time" queries
+- Sandboxed execution (containers) instead of the command allowlist
 
 ## License
 
