@@ -26,6 +26,8 @@ class Settings:
     url: str = "http://192.168.1.134:11434"
     model: str = "gemma4:26b"
     reviewer_model: str | None = None   # None = same as model
+    executor_model: str | None = None   # None = same as model (covers plan/self-check too)
+    goalsmith_model: str | None = None  # None = same as model
 
     request_timeout: int = 600   # seconds per LLM call
     num_ctx: int = 30000         # requested context window (used to be 16500)
@@ -43,6 +45,10 @@ class Settings:
     reviewer: RoleOptions = field(default_factory=lambda: RoleOptions(temperature=0.1))
     goalsmith: RoleOptions = field(default_factory=lambda: RoleOptions(temperature=0.3))
     reviewer_tools: bool = True  # --no-reviewer-tools disables
+
+    # attempt-quality phases (see run.py); --no-plan / --no-self-check disable
+    plan_first: bool = True   # attempt 1 opens with a no-tool planning turn
+    self_check: bool = True   # verify-and-fix turn before each review
 
 
 settings = Settings()

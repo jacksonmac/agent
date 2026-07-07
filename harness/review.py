@@ -13,6 +13,7 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 
+from . import ui
 from .config import settings
 from .llm import _role_options, cap, chat_v2, truncate_middle
 from .prompts import REVIEW_USER, REVIEWER_SYSTEM
@@ -150,10 +151,10 @@ def review(model: str, goal: str, output: str, ws: Workspace,
         verdict = parse_verdict(raw)
         if verdict is not None:
             return verdict
-        print("  [review] reply wasn't valid verdict JSON, re-asking once")
+        ui.warn("review reply wasn't valid verdict JSON, re-asking once")
 
     # last-ditch: the old YES/NO reading, then a default NO — never abort the run
-    print("  [review] still malformed — falling back to YES/NO parsing")
+    ui.warn("review reply still malformed — falling back to YES/NO parsing")
     if YES_PAT.match(raw):
         return Verdict(passed=True, raw=raw)
     return Verdict(passed=False,

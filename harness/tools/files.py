@@ -66,6 +66,41 @@ def list_files(ws: Workspace, path: str = ".") -> str:
     return out[:4_000]
 
 
+def grep_files(ws: Workspace, pattern: str, path: str = ".",
+               max_results: int = 50) -> str:
+    """Search workspace files for a regex (or, if the regex is invalid, the
+    literal text) and return file:line matches — the targeted alternative to
+    reading whole files."""
+    import re
+    try:
+        root = ws.resolve(path)
+    except ValueError:
+        return f"[ERROR] refusing to search outside the workspace: {path}"
+    try:
+        rx = re.compile(pattern)
+    except re.error:
+        rx = re.compile(re.escape(pattern))  # plain-text fallback
+    max_results = max(1, int(max_results))
+    entries = [f for f in ws.list_all_files()
+               if root == ws.root or ws.resolve(f).startswith(root + os.sep)]
+    lines = []
+    for rel in entries:
+        try:
+            with open(ws.resolve(rel)) as f:
+                content = f.read()
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+        for lineno, line in enumerate(content.splitlines(), 1):
+            if rx.search(line):
+                lines.append(f"{rel}:{lineno}: {line.strip()[:200]}")
+                if len(lines) >= max_results:
+                    out = "\n".join(lines)
+                    return (out + f"\n[... stopped at {max_results} matches]")[:4_000]
+    if not lines:
+        return f"(no matches for {pattern!r})"
+    return "\n".join(lines)[:4_000]
+
+
 def edit_file(ws: Workspace, name: str, old_text: str, new_text: str) -> str:
     """Replace an exact snippet in an existing file — the targeted alternative
     to rewriting the whole file with write_file."""

@@ -7,3 +7,4 @@ pytest
 # Optional, only needed for the web research tools (web_search / fetch_page):
 #   ddgs
 #   trafilatura
+rich>=13

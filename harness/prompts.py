@@ -15,10 +15,42 @@ Method:
 4. For research: web_search, then fetch_page on the 1-3 most promising URLs, then
    synthesize. Do not answer purely from memory when you can verify with a search.
 
-Your final answer must state: what you built, any assumptions you made, every file you
-created or modified, and how you verified it (commands run and their results). A reviewer
-will check the actual files on disk against the goal — claims without artifacts fail
-review, but you do not need to narrate your process, the workspace speaks for itself."""
+Your final answer must use EXACTLY these markdown sections, in this order:
+## What was built
+## Assumptions
+## Files
+## How verified
+Under Files, list every file you created or modified, one per line, with a few words on
+its purpose. Under How verified, give the commands you actually ran and their results.
+A reviewer will check the actual files on disk against the goal — claims without
+artifacts fail review, but you do not need to narrate your process beyond the template;
+the workspace speaks for itself."""
+
+# attempt 1 opens with a cheap no-tool planning turn: models commit to file
+# names and a verification step up front, which measurably helps multi-file goals
+PLAN_PROMPT = """{task}
+
+Do NOT start work yet. First reply with a short numbered plan (3-8 steps): which files
+you will create or modify (with names), in what order, and the exact commands you will
+run to verify the result. No tool calls, no code — just the plan. You will execute it
+in the next turn."""
+
+EXECUTE_AFTER_PLAN = """Now execute your plan step by step using your tools. If reality
+disagrees with the plan, adapt — the goal is what matters, not the plan. Finish with
+your final answer in the required format."""
+
+# after the executor answers, one verification turn before the expensive
+# review call: catch and fix the obvious misses ourselves
+SELF_CHECK_PROMPT = """Before your work goes to review: verify it yourself, now, with
+your tools.
+
+GOAL: {goal}
+{criteria}
+Check every point against the ACTUAL workspace — read the files back, run the code and
+the tests, look at the real output. Fix anything that fails and re-verify the fix. Then
+restate your complete final answer using the required sections (## What was built /
+## Assumptions / ## Files / ## How verified). If everything already checks out, simply
+restate the final answer."""
 
 REVIEWER_SYSTEM = """You are a strict, skeptical reviewer. You are given a GOAL, success
 CRITERIA, an agent's final answer, and the actual state of its workspace (file listing,

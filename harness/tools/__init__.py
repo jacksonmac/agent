@@ -11,7 +11,7 @@ from functools import partial
 from .. import runlog
 from ..workspace import Workspace
 from .execute import run_python, run_script, run_shell
-from .files import edit_file, list_files, read_file, write_file
+from .files import edit_file, grep_files, list_files, read_file, write_file
 from .web import fetch_page, web_search
 
 tools: dict = {
@@ -24,6 +24,7 @@ _WORKSPACE_TOOLS = {
     "read_file": read_file,
     "list_files": list_files,
     "edit_file": edit_file,
+    "grep_files": grep_files,
     "run_python": run_python,
     "run_script": run_script,
     "run_shell": run_shell,
@@ -95,6 +96,22 @@ TOOL_SCHEMAS = [
                     "new_text": {"type": "string", "description": "Replacement text."},
                 },
                 "required": ["name", "old_text", "new_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep_files",
+            "description": "Search every workspace file for a regex or plain-text pattern. Returns file:line matches. Use this to find where something is defined or used instead of reading whole files.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Regex (or plain text) to search for."},
+                    "path": {"type": "string", "description": "Subdirectory to search (default: the whole workspace)."},
+                    "max_results": {"type": "integer", "description": "Stop after this many matches (default 50)."},
+                },
+                "required": ["pattern"],
             },
         },
     },
