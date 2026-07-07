@@ -209,3 +209,38 @@ def test_snapshot_files_reads_content(ws):
 def test_snapshot_files_missing_file(ws):
     out = ws.snapshot_files(["ghost.txt"])
     assert "unreadable" in out
+
+
+# ─── CLI: per-phase model flags + AGENT.md context ─────────────────
+
+def test_cli_per_phase_model_flags(monkeypatch):
+    import sys
+
+    from harness import cli
+    monkeypatch.setattr(sys, "argv",
+                        ["prog", "-g", "x", "-em", "a", "-rm", "b", "-gm", "c"])
+    args = cli.parse_args()
+    assert args.executor_model == "a"
+    assert args.reviewer_model == "b"
+    assert args.goalsmith_model == "c"
+
+
+def test_cli_model_flags_default_to_none(monkeypatch):
+    import sys
+
+    from harness import cli
+    monkeypatch.setattr(sys, "argv", ["prog", "-g", "x"])
+    args = cli.parse_args()
+    assert args.executor_model is None
+    assert args.reviewer_model is None
+    assert args.goalsmith_model is None
+
+
+def test_load_agent_md(tmp_path):
+    from harness.cli import _load_agent_md
+    assert _load_agent_md(str(tmp_path)) == ""
+    (tmp_path / "AGENT.md").write_text("Always use snake_case." + "x" * 10_000)
+    out = _load_agent_md(str(tmp_path))
+    assert "PROJECT CONTEXT" in out
+    assert "Always use snake_case." in out
+    assert len(out) < 4_200  # capped content plus the header

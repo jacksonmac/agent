@@ -108,3 +108,53 @@ def test_run_shell_allows_pytest(ws):
     # allowlist accepts it (a FileNotFoundError message is fine, a rejection is not)
     out = execute_tools.run_shell(ws, "pytest --version")
     assert "not allowed" not in out
+
+
+# ─── grep_files ─────────────────────────────────────────────────────
+
+def test_grep_files_matches_across_files(ws):
+    file_tools.write_file(ws, "def alpha():\n    pass\n", "a.py")
+    file_tools.write_file(ws, "from a import alpha\nalpha()\n", "sub/b.py")
+    out = file_tools.grep_files(ws, r"alpha")
+    assert "a.py:1: def alpha():" in out
+    assert "sub/b.py:1: from a import alpha" in out
+    assert "sub/b.py:2: alpha()" in out
+
+
+def test_grep_files_no_match(ws):
+    file_tools.write_file(ws, "nothing here", "a.txt")
+    assert file_tools.grep_files(ws, "zzz").startswith("(no matches")
+
+
+def test_grep_files_invalid_regex_falls_back_to_literal(ws):
+    file_tools.write_file(ws, "cost is $(price)\n", "a.txt")
+    out = file_tools.grep_files(ws, "$(price")  # invalid regex, valid literal
+    assert "a.txt:1:" in out
+
+
+def test_grep_files_escape(ws):
+    assert file_tools.grep_files(ws, "x", path="../..").startswith("[ERROR]")
+
+
+def test_grep_files_max_results(ws):
+    file_tools.write_file(ws, "hit\n" * 10, "a.txt")
+    out = file_tools.grep_files(ws, "hit", max_results=3)
+    assert out.count("a.txt:") == 3
+    assert "stopped at 3 matches" in out
+
+
+def test_grep_files_subdir_only(ws):
+    file_tools.write_file(ws, "needle", "a.txt")
+    file_tools.write_file(ws, "needle", "sub/b.txt")
+    out = file_tools.grep_files(ws, "needle", path="sub")
+    assert "sub/b.txt:1:" in out
+    assert "a.txt:1:" not in out.replace("sub/b.txt:1:", "")
+
+
+def test_grep_files_registered_as_tool(ws):
+    from harness.tools import TOOL_SCHEMAS, configure, execute_tool_call
+    assert any(s["function"]["name"] == "grep_files" for s in TOOL_SCHEMAS)
+    configure(ws)
+    file_tools.write_file(ws, "needle here", "a.txt")
+    out = execute_tool_call("grep_files", {"pattern": "needle"})
+    assert "a.txt:1:" in out
