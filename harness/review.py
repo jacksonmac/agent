@@ -13,6 +13,7 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 
+from . import todos as todos_mod
 from . import ui
 from .config import settings
 from .llm import _role_options, cap, chat_v2, truncate_middle
@@ -129,6 +130,7 @@ def review(model: str, goal: str, output: str, ws: Workspace,
         goal=goal,
         criteria=criteria_text,
         output=cap(output, settings.retry_prev_max),
+        todos=todos_mod.render(),
         listing=listing,
         files=files_text,
         checks=automated_checks(ws),

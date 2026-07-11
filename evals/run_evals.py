@@ -41,8 +41,13 @@ def run_goal(goal, attempts: int, timeout: int, model: str | None,
         with open(path, "w") as f:
             f.write(content)
 
+    # --yolo is mandatory here: eval subprocesses have non-TTY stdin, so the
+    # permission gate would auto-deny every run_shell/run_python call and the
+    # benchmark would measure "agent forbidden from running code" instead of
+    # agent quality
     cmd = [sys.executable, os.path.join(REPO, "agent.py"),
-           "-g", goal.prompt, "--workspace", ws_dir, "--attempts", str(attempts)]
+           "-g", goal.prompt, "--workspace", ws_dir, "--attempts", str(attempts),
+           "--yolo"]
     if model:
         cmd += ["--model", model]
     if url:

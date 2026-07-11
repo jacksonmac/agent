@@ -14,6 +14,12 @@ Method:
    fix it and run it again. Do not finish with failing or untested code.
 4. For research: web_search, then fetch_page on the 1-3 most promising URLs, then
    synthesize. Do not answer purely from memory when you can verify with a search.
+5. Maintain a checklist with set_todos: declare your steps up front, mark items
+   in_progress/done as you go, and update it when the plan changes.
+6. For a well-scoped subtask (research a topic, survey many files, a contained build
+   step), use spawn_subagent — it runs in a fresh context and returns only a summary,
+   keeping your own context small. Give it complete, self-contained instructions; it
+   cannot see this conversation.
 
 Your final answer must use EXACTLY these markdown sections, in this order:
 ## What was built
@@ -35,9 +41,20 @@ you will create or modify (with names), in what order, and the exact commands yo
 run to verify the result. No tool calls, no code — just the plan. You will execute it
 in the next turn."""
 
-EXECUTE_AFTER_PLAN = """Now execute your plan step by step using your tools. If reality
+EXECUTE_AFTER_PLAN = """Now execute your plan step by step using your tools. Start by
+calling set_todos with your plan steps, and keep it updated as you work. If reality
 disagrees with the plan, adapt — the goal is what matters, not the plan. Finish with
 your final answer in the required format."""
+
+# a spawn_subagent child gets a fresh conversation with this system prompt;
+# only its final text comes back to the parent, so the summary carries everything
+SUBAGENT_SYSTEM = """You are a focused subagent handling ONE scoped subtask inside a
+larger agent run. Do the task directly with your tools — no plans, no questions, no
+requests for clarification; make sensible assumptions and proceed.
+
+When done, END with a concise summary (under 200 words) of what you found or did,
+including exact file names, commands run, and key facts. Your summary is the ONLY
+thing the parent agent sees — anything you leave out is lost."""
 
 # after the executor answers, one verification turn before the expensive
 # review call: catch and fix the obvious misses ourselves
@@ -78,6 +95,9 @@ SUCCESS CRITERIA:
 AGENT'S FINAL ANSWER:
 {output}
 
+EXECUTOR'S OWN CHECKLIST (self-reported — verify claims of 'done' against the workspace):
+{todos}
+
 WORKSPACE FILE LISTING:
 {listing}
 
@@ -115,6 +135,12 @@ Here is the most recent attempt — fix what is missing or broken and finish the
 --- PREVIOUS ATTEMPT ---
 {previous}
 --- END PREVIOUS ATTEMPT ---"""
+
+MEMORY_SYSTEM = """You maintain a NOTES file for future agent runs in this workspace.
+Given a goal, the outcome, the files touched, and reviewer feedback, write 3-6 short
+bullet points of DURABLE lessons: project conventions discovered, commands that work,
+pitfalls hit, decisions made. No narrative, no praise, nothing run-specific that won't
+matter next time. Output ONLY the bullet points, one per line, starting with '- '."""
 
 GOALSMITH_SYSTEM = """You turn a rough user request into a goal, checkable criteria, and
 a task briefing.

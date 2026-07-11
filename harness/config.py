@@ -29,8 +29,8 @@ class Settings:
     executor_model: str | None = None   # None = same as model (covers plan/self-check too)
     goalsmith_model: str | None = None  # None = same as model
 
-    request_timeout: int = 600   # seconds per LLM call
-    num_ctx: int = 30000         # requested context window (used to be 16500)
+    request_timeout: int = 1600   # seconds per LLM call (used to be 1600 only doing this becuase of how big the model is)
+    num_ctx: int = 10000         # requested context window (used to be 16500)
     full_context: bool = False   # --full-context: disable ALL trimming
 
     # context budget knobs
@@ -45,6 +45,13 @@ class Settings:
     reviewer: RoleOptions = field(default_factory=lambda: RoleOptions(temperature=0.1))
     goalsmith: RoleOptions = field(default_factory=lambda: RoleOptions(temperature=0.3))
     reviewer_tools: bool = True  # --no-reviewer-tools disables
+
+    subagent_max_rounds: int = 8  # tool rounds a spawn_subagent child gets
+    memory: bool = True           # write an AGENT.md lessons note after each run
+    skills: bool = True           # advertise skills/ + honor load_skill (--no-skills)
+    skill_body_max: int = 8_000   # cap on a loaded SKILL.md body (AGENT.md-sized)
+    stream: bool = True           # stream tokens live from Ollama (--no-stream)
+    notify: bool = True           # bell/desktop notification at run end (--no-notify)
 
     # attempt-quality phases (see run.py); --no-plan / --no-self-check disable
     plan_first: bool = True   # attempt 1 opens with a no-tool planning turn

@@ -8,6 +8,8 @@ import os
 import shutil
 import time
 
+from . import hooks as hooks_mod
+from . import todos as todos_mod
 from . import ui
 from .config import settings
 from .llm import Session, _role_options, cap, print_timing_summary
@@ -93,6 +95,7 @@ def _run_candidates(model: str, goal: str, user_msg: str, ws: Workspace,
     best = None  # (score, -i, session, answer, changed, verdict, cand_ws)
 
     for i in range(1, best_of + 1):
+        todos_mod.reset()  # candidates must not inherit each other's checklists
         ui.phase(f"candidate {i}/{best_of}")
         ui.info(f"=== candidate {i}/{best_of} ===")
         cand_ws = Workspace(ws.run_dir,
@@ -129,7 +132,9 @@ def _run_candidates(model: str, goal: str, user_msg: str, ws: Workspace,
 def main(model: str, goal: str, task: str, ws: Workspace, log: RunLog,
          max_attempts: int = 5, executor_system: str = EXECUTOR_SYSTEM,
          criteria: list[str] | None = None, best_of: int = 1):
+    t0 = time.time()
     executor_model = settings.executor_model or model
+    todos_mod.reset()
     attempts = []            # keep EVERY attempt + verdict, nothing gets overwritten
     feedback_history = []    # ALL reviewer feedback, so retries fix everything at once
     prev_answer = None
@@ -201,6 +206,7 @@ def main(model: str, goal: str, task: str, ws: Workspace, log: RunLog,
                          "criteria": verdict.criteria})
         log.event("attempt", n=attempt, passed=passed, stalled=stalled,
                   no_tools=no_tools, files=changed_files, feedback=verdict.summary())
+        hooks_mod.fire("attempt_end", attempt=attempt, passed=passed)
         log.transcript(f"\n## Attempt {attempt} — {'PASSED' if passed else 'FAILED'}\n\n"
                        f"{answer}\n\n"
                        + (f"**Files changed:** {', '.join(changed_files)}\n\n"
@@ -252,7 +258,29 @@ def main(model: str, goal: str, task: str, ws: Workspace, log: RunLog,
     ws.save_artifact("attempt_history.json", json.dumps(attempts, indent=2))
     from .report import write_report  # late import: report is optional plumbing
     report_path = write_report(ws.run_dir)
+
+    run_passed = bool(attempts and attempts[-1]["passed"])
+    try:
+        from . import history  # late import, same pattern as report
+        history.record(history.db_path(), ts=time.strftime("%Y-%m-%dT%H:%M:%S"),
+                       goal=goal, model=model,
+                       executor_model=settings.executor_model,
+                       reviewer_model=settings.reviewer_model,
+                       passed=run_passed, attempts=len(attempts),
+                       duration_secs=round(time.time() - t0, 1),
+                       run_dir=ws.run_dir)
+        log.event("history_recorded", passed=run_passed)
+    except Exception as e:
+        ui.warn(f"could not record run history: {e}")
+    hooks_mod.fire("run_end", passed=run_passed)
+
+    if settings.memory:
+        from .memory import update_agent_md  # late import, matches report pattern
+        ui.phase("writing memory note")
+        update_agent_md(ws, goal, run_passed, files=ws.list_all_files(),
+                        feedback_history=feedback_history)
     ui.stop()  # leave the terminal clean before the closing summary
     print_timing_summary()
     print(f"\nRun artifacts: {ws.run_dir}\nWorkspace files: {ws.root}"
           + (f"\nReport: {report_path}" if report_path else ""))
+    return run_passed

@@ -219,7 +219,7 @@ def test_cli_per_phase_model_flags(monkeypatch):
     from harness import cli
     monkeypatch.setattr(sys, "argv",
                         ["prog", "-g", "x", "-em", "a", "-rm", "b", "-gm", "c"])
-    args = cli.parse_args()
+    args, _ = cli.parse_args()
     assert args.executor_model == "a"
     assert args.reviewer_model == "b"
     assert args.goalsmith_model == "c"
@@ -230,7 +230,7 @@ def test_cli_model_flags_default_to_none(monkeypatch):
 
     from harness import cli
     monkeypatch.setattr(sys, "argv", ["prog", "-g", "x"])
-    args = cli.parse_args()
+    args, _ = cli.parse_args()
     assert args.executor_model is None
     assert args.reviewer_model is None
     assert args.goalsmith_model is None
@@ -243,4 +243,4 @@ def test_load_agent_md(tmp_path):
     out = _load_agent_md(str(tmp_path))
     assert "PROJECT CONTEXT" in out
     assert "Always use snake_case." in out
-    assert len(out) < 4_200  # capped content plus the header
+    assert len(out) < 8_200  # capped content plus the header

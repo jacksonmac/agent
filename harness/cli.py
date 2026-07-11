@@ -2,11 +2,16 @@
 
 import argparse
 import os
+import sys
 
 import requests
 
+from . import hooks as hooks_mod
+from . import llm as llm_mod
+from . import permissions
 from . import run as run_mod
 from . import runlog
+from . import skills as skills_mod
 from . import tools as tools_mod
 from . import ui
 from .config import HERE, settings
@@ -24,6 +29,9 @@ def parse_args():
     g.add_argument("-g", "--goal", help="use this text as the goal (and the task)")
     g.add_argument("-sg", "--smart-goal",
                    help="LM rewrites your input into a proper GOAL + TASK, then runs")
+    g.add_argument("-c", "--command", nargs="+", metavar="NAME",
+                   help="run a saved command from commands/<NAME>.md; extra words "
+                        "are substituted for {args} in its body")
     p.add_argument("--model", default=settings.model,
                    help=f"ollama model (default: {settings.model})")
     p.add_argument("-rm", "--reviewer-model", default=None,
@@ -44,6 +52,17 @@ def parse_args():
                    help="skip the no-tool planning turn at the start of attempt 1")
     p.add_argument("--no-self-check", action="store_true",
                    help="skip the verify-and-fix turn that runs before each review")
+    p.add_argument("--no-memory", action="store_true",
+                   help="don't write a lessons note to the workspace AGENT.md at run end")
+    p.add_argument("--no-skills", action="store_true",
+                   help="don't advertise skills/ or the load_skill tool to the model")
+    p.add_argument("--yolo", action="store_true",
+                   help="skip permission prompts for code-executing tools "
+                        "(run_shell/run_python/run_script)")
+    p.add_argument("--no-stream", action="store_true",
+                   help="wait for complete responses instead of streaming tokens live")
+    p.add_argument("--no-notify", action="store_true",
+                   help="skip the terminal bell / desktop notification at run end")
     p.add_argument("--url", default=None, help=f"ollama server URL (default: {settings.url})")
     p.add_argument("--full-context", action="store_true",
                    help="send everything: no compaction or truncation of tool results, "
@@ -59,7 +78,32 @@ def parse_args():
     p.add_argument("--workspace", default=None,
                    help="reuse an existing workspace directory instead of a fresh one "
                         "(e.g. runs/latest/workspace to continue earlier work)")
-    return p.parse_args()
+    return p.parse_args(), p
+
+
+# frontmatter key → argparse dest, for command-file defaults
+_FRONTMATTER_DESTS = {"em": "executor_model", "rm": "reviewer_model",
+                      "gm": "goalsmith_model", "model": "model",
+                      "attempts": "attempts", "best_of": "best_of",
+                      "url": "url", "num_ctx": "num_ctx"}
+
+
+def _apply_command(args, parser) -> None:
+    """-c NAME [extra args]: load commands/NAME.md, set args.goal from its body,
+    and apply frontmatter defaults for flags the user didn't pass explicitly."""
+    from . import commands
+    cmd = commands.load_command(args.command[0])
+    args.goal = commands.render_goal(cmd, args.command[1:])
+    for key, val in cmd.defaults.items():
+        dest = _FRONTMATTER_DESTS.get(key, key)
+        if not hasattr(args, dest):
+            print(f"[WARNING] command '{cmd.name}': unknown default '{key}' ignored")
+            continue
+        default = parser.get_default(dest)
+        if getattr(args, dest) == default:  # explicit CLI flags win
+            setattr(args, dest, type(default)(val) if default is not None else val)
+    desc = f": {cmd.description}" if cmd.description else ""
+    print(f"[command] {cmd.name}{desc}")
 
 
 def _load_agent_md(ws_root: str) -> str:
@@ -69,13 +113,89 @@ def _load_agent_md(ws_root: str) -> str:
     if not os.path.isfile(path):
         return ""
     with open(path) as f:
-        context = f.read()[:4_000]
+        context = f.read()[:8_000]  # room for user preamble + memory sections
     return ("\n\nPROJECT CONTEXT (from AGENT.md in the workspace — follow these "
             "instructions):\n" + context)
 
 
+def _load_resume_context(workspace_dir: str, files: list[str],
+                         max_chars: int = 3_000) -> str:
+    """If the reused workspace sits inside a previous run dir (sibling
+    events.jsonl / attempt_history.json / final_output*.txt), build a
+    mechanical summary of that run — no LLM call. Empty string otherwise."""
+    import json as _json
+
+    from .llm import truncate_middle
+    prev_run_dir = os.path.dirname(os.path.abspath(workspace_dir))
+    artifacts = ["events.jsonl", "attempt_history.json",
+                 "final_output.txt", "final_output_UNVERIFIED.txt"]
+    if not any(os.path.isfile(os.path.join(prev_run_dir, a)) for a in artifacts):
+        return ""
+
+    prev_goal = outcome = feedback = ""
+    try:
+        with open(os.path.join(prev_run_dir, "events.jsonl")) as f:
+            for line in f:
+                try:
+                    e = _json.loads(line)
+                except _json.JSONDecodeError:
+                    continue
+                if e.get("event") == "run_start" and not prev_goal:
+                    prev_goal = e.get("goal", "")
+    except OSError:
+        pass
+    try:
+        with open(os.path.join(prev_run_dir, "attempt_history.json")) as f:
+            history = _json.load(f)
+        if history:
+            last = history[-1]
+            n = len(history)
+            outcome = (f"PASSED on attempt {n}" if last.get("passed")
+                       else f"FAILED after {n} attempt(s) (unverified output saved)")
+            if not last.get("passed"):
+                feedback = last.get("verdict", "")
+    except (OSError, _json.JSONDecodeError, KeyError):
+        pass
+
+    parts = ["PREVIOUS SESSION IN THIS WORKSPACE (mechanical summary — verify "
+             "with your tools):"]
+    if prev_goal:
+        parts.append(f"- previous goal: {prev_goal}")
+    if outcome:
+        parts.append(f"- outcome: {outcome}")
+    if feedback:
+        parts.append(f"- last reviewer feedback: {' '.join(feedback.split())}")
+    if files:
+        shown = files[:30]
+        more = f" ({len(shown)} shown of {len(files)})" if len(files) > 30 else ""
+        parts.append(f"- files present: {', '.join(shown)}{more}")
+    parts.append("Build on this work; do not blindly redo it.")
+    return truncate_middle("\n".join(parts), max_chars)
+
+
+def _history_command(argv: list[str]) -> None:
+    """`agent.py history [--stats] [--limit N]` — dispatched before the main
+    parser, whose -g/-sg group is required."""
+    from . import history
+    hp = argparse.ArgumentParser(prog="agent.py history",
+                                 description="show past runs from runs/history.db")
+    hp.add_argument("--stats", action="store_true",
+                    help="pass-rate per executor model instead of a run listing")
+    hp.add_argument("--limit", type=int, default=20, help="rows to show (default: 20)")
+    hargs = hp.parse_args(argv)
+    if hargs.stats:
+        history.print_stats(history.db_path())
+    else:
+        history.print_history(history.db_path(), limit=hargs.limit)
+
+
 def main():
-    args = parse_args()
+    if len(sys.argv) > 1 and sys.argv[1] == "history":
+        _history_command(sys.argv[2:])
+        return
+    args, parser = parse_args()
+    if args.command:
+        _apply_command(args, parser)
     if args.url:
         settings.url = args.url
     settings.model = args.model
@@ -87,6 +207,11 @@ def main():
     settings.full_context = args.full_context
     settings.plan_first = not args.no_plan
     settings.self_check = not args.no_self_check
+    settings.memory = not args.no_memory
+    settings.skills = not args.no_skills
+    permissions.configure(yolo=args.yolo)
+    settings.stream = not args.no_stream
+    settings.notify = not args.no_notify
     if args.best_of < 1:
         raise SystemExit("[ERROR] --best-of must be >= 1")
     if settings.full_context:
@@ -96,6 +221,8 @@ def main():
     log = RunLog(ws.run_dir)
     runlog.current = log
     tools_mod.configure(ws)
+    hooks_mod.configure(os.path.join(HERE, "hooks.json"),
+                        run_dir=ws.run_dir, workspace=ws.root)
     print(f"[run] {ws.run_dir}")
 
     executor_system = EXECUTOR_SYSTEM
@@ -104,6 +231,18 @@ def main():
         executor_system += agent_md
         print("[context] loaded AGENT.md from the workspace")
         log.event("agent_md", chars=len(agent_md))
+    if args.workspace:
+        resume = _load_resume_context(args.workspace, ws.list_all_files())
+        if resume:
+            executor_system += "\n\n" + resume
+            print("[context] resuming: found previous run artifacts next to the workspace")
+            log.event("resume_context", chars=len(resume))
+    skills_block = skills_mod.system_prompt_block()
+    if skills_block:
+        executor_system += skills_block
+        n_skills = skills_block.count("\n- ")
+        print(f"[context] {n_skills} skill(s) available via load_skill")
+        log.event("skills", count=n_skills, chars=len(skills_block))
     if args.mcp:
         try:
             mcp_tool_names = mcp_mod.setup_mcp_tools(tools, TOOL_SCHEMAS,
@@ -126,12 +265,26 @@ def main():
             goal, task, criteria = args.goal, args.goal, []
         ui.start(goal, settings.executor_model or args.model, settings.reviewer_model,
                  max_attempts=args.attempts, num_ctx=settings.num_ctx)
-        run_mod.main(args.model, goal, task, ws, log, max_attempts=args.attempts,
-                     executor_system=executor_system, criteria=criteria,
-                     best_of=args.best_of)
-    except requests.ConnectionError:
-        print(f"[ERROR] could not reach the ollama server at {settings.url} — "
-              f"is it running? (override with --url)")
+        run_passed = run_mod.main(args.model, goal, task, ws, log,
+                                  max_attempts=args.attempts,
+                                  executor_system=executor_system,
+                                  criteria=criteria, best_of=args.best_of)
+        if settings.notify:
+            ui.notify("agent run " + ("passed" if run_passed else "failed"),
+                      " ".join(goal.split())[:120], success=run_passed)
+    except (requests.ConnectionError,
+            requests.exceptions.ChunkedEncodingError) as e:
+        if llm_mod.had_successful_call:
+            # the server answered earlier this run, then dropped the
+            # connection mid-call and retries were exhausted — that's a
+            # server-side crash/restart, not "not running"
+            print(f"[ERROR] the ollama server at {settings.url} dropped the "
+                  f"connection mid-run ({type(e).__name__}: {e}). Its runner "
+                  f"likely crashed under load — check the server logs (OOM?), "
+                  f"lower --num-ctx, or use a smaller model.")
+        else:
+            print(f"[ERROR] could not reach the ollama server at {settings.url} — "
+                  f"is it running? (override with --url) ({e})")
     except requests.Timeout:
         print(f"[ERROR] the model took longer than {settings.request_timeout}s to respond")
     finally:
