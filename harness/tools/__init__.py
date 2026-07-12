@@ -8,15 +8,21 @@ the filesystem and are registered as-is.
 import json
 from functools import partial
 
-from .. import runlog
+from .. import hooks, permissions, runlog, ui
+from ..skills import load_skill
+from ..todos import set_todos
 from ..workspace import Workspace
 from .execute import run_python, run_script, run_shell
 from .files import edit_file, grep_files, list_files, read_file, write_file
+from .subagent import spawn_subagent
 from .web import fetch_page, web_search
 
 tools: dict = {
     "web_search": web_search,
     "fetch_page": fetch_page,
+    "set_todos": set_todos,
+    "spawn_subagent": spawn_subagent,
+    "load_skill": load_skill,
 }
 
 _WORKSPACE_TOOLS = {
@@ -33,6 +39,7 @@ _WORKSPACE_TOOLS = {
 
 def configure(ws: Workspace) -> None:
     """Bind the workspace into every tool that touches disk."""
+    permissions.set_workspace(ws.root)  # shown on the permission card
     for name, func in _WORKSPACE_TOOLS.items():
         tools[name] = partial(func, ws)
 
@@ -162,6 +169,45 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "set_todos",
+            "description": "Declare or update your task checklist. Send the FULL list every time (it replaces the previous one). Keep it to 3-8 items; mark exactly one item in_progress at a time and update statuses as you complete work.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "text": {"type": "string", "description": "The step, a short imperative phrase."},
+                                "status": {"type": "string", "enum": ["pending", "in_progress", "done"]},
+                            },
+                            "required": ["text"],
+                        },
+                    },
+                },
+                "required": ["todos"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "spawn_subagent",
+            "description": "Delegate a well-scoped subtask (exploration, research, a contained build step) to a focused subagent with its own fresh context. You receive ONLY its final summary, keeping your own context small. Give it complete, self-contained instructions — it cannot see this conversation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "Complete, self-contained instructions for the subagent."},
+                    "kind": {"type": "string", "description": "Optional label, e.g. 'research' or 'general'."},
+                },
+                "required": ["task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "web_search",
             "description": "Search the web (DuckDuckGo). Returns numbered results with title, URL and snippet. Use short keyword queries (2-6 words). Follow up with fetch_page on the most promising URLs to actually read them.",
             "parameters": {
@@ -188,6 +234,20 @@ TOOL_SCHEMAS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "load_skill",
+            "description": "Load the full instructions for a skill listed under SKILLS in your system prompt. The one-line description there is only a teaser — call this BEFORE starting work the skill covers, then follow the loaded instructions. Read-only and cheap.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Skill name exactly as it appears in the SKILLS list."},
+                },
+                "required": ["name"],
+            },
+        },
+    },
 ]
 
 
@@ -200,12 +260,25 @@ def execute_tool_call(name: str, arguments) -> str:
             arguments = json.loads(arguments)
         except json.JSONDecodeError as e:
             return f"[ERROR] Could not parse arguments for {name}: {e}"
+    denial = permissions.check(name, arguments)
+    if denial:
+        runlog.log_event("tool", name=name, args=json.dumps(arguments)[:500],
+                         ok=False, result_chars=len(denial))
+        return denial
+    file_arg = (arguments.get("name") or arguments.get("file") or "") \
+        if isinstance(arguments, dict) else ""
+    hooks.fire("pre_tool", tool=name, file=file_arg)
     try:
         result = str(func(**arguments))
+    except ui.QuitRequested:
+        # [q] pressed while a subagent (or any tool) polled controls — a
+        # user abort, not a tool failure; it must reach run.py's handler
+        raise
     except TypeError as e:
         result = f"[ERROR] Bad arguments for {name}: {e}"
     except Exception as e:
         result = f"[ERROR] {name} raised {type(e).__name__}: {e}"
+    hooks.fire("post_tool", tool=name, file=file_arg)
     runlog.log_event("tool", name=name, args=json.dumps(arguments)[:500],
                      ok=not result.startswith("[ERROR]"),
                      result_chars=len(result))

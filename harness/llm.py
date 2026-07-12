@@ -110,32 +110,115 @@ def _role_options(role) -> dict:
 # models that rejected the think parameter this run — don't send it again
 _no_think_models: set = set()
 
+# transient connection-drop retries: the LAN ollama runner can crash and
+# respawn mid-generation (e.g. OOM under a big model + num_ctx); one dropped
+# connection shouldn't kill a whole run
+RETRY_ATTEMPTS = 3
+RETRY_BACKOFF = (2, 5)  # seconds to wait before attempt 2, 3
 
-def _post_chat(payload: dict, label: str = "llm") -> dict:
-    from . import runlog
-    payload.setdefault("options", {})["num_ctx"] = settings.num_ctx
-    start = time.perf_counter()
-    resp = requests.post(settings.url + "/api/chat", json=payload,
-                         timeout=settings.request_timeout)
+# whether any call completed this run — lets the CLI tell "server was never
+# reachable" apart from "server dropped the connection mid-run"
+had_successful_call = False
+
+# exceptions worth retrying: requests wraps a reset either as its
+# ConnectionError (during connect/send) or ChunkedEncodingError (mid-stream)
+TRANSIENT_ERRORS = (requests.ConnectionError,
+                    requests.exceptions.ChunkedEncodingError)
+
+
+def _request(payload: dict, stream: bool) -> requests.Response:
+    # with stream=True, request_timeout becomes connect + between-chunk read
+    # timeout: a generating model keeps the connection warm chunk by chunk,
+    # while a hung server still trips requests.Timeout
+    return requests.post(settings.url + "/api/chat", json=payload,
+                         stream=stream, timeout=settings.request_timeout)
+
+
+def _consume_single(resp) -> tuple[dict, dict]:
+    data = resp.json()
+    return data["message"], data
+
+
+def _consume_stream(resp) -> tuple[dict, dict]:
+    """Aggregate Ollama's streamed line-JSON deltas into one message dict of
+    the exact non-streaming shape, feeding the UI as text arrives."""
+    content_parts: list = []
+    thinking_parts: list = []
+    tool_calls: list = []
+    meta: dict = {}
+    try:
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            obj = json.loads(line)
+            delta = obj.get("message") or {}
+            if delta.get("thinking"):
+                thinking_parts.append(delta["thinking"])
+                ui.stream_delta(delta["thinking"], thinking=True)
+            if delta.get("content"):
+                content_parts.append(delta["content"])
+                ui.stream_delta(delta["content"])
+            if delta.get("tool_calls"):
+                tool_calls.extend(delta["tool_calls"])
+            if obj.get("done"):
+                meta = obj  # prompt_eval_count / eval_count live here
+    finally:
+        ui.stream_end()  # never leave the terminal mid-stream
+    msg: dict = {"role": "assistant", "content": "".join(content_parts)}
+    if thinking_parts:
+        msg["thinking"] = "".join(thinking_parts)
+    if tool_calls:
+        msg["tool_calls"] = tool_calls
+    return msg, meta
+
+
+def _attempt(payload: dict, stream: bool) -> tuple[dict, dict]:
+    """One full request + response consumption (safe to re-run: same payload)."""
+    resp = _request(payload, stream)
     if resp.status_code == 400 and payload.get("think") \
             and "does not support thinking" in resp.text:
         # non-thinking model (e.g. qwen2.5-coder) — remember and retry without
+        # (.text on the error body is safe: we never iter_lines an error)
         _no_think_models.add(payload["model"])
         ui.warn(f"{payload['model']} does not support thinking — disabling it")
         payload.pop("think")
-        resp = requests.post(settings.url + "/api/chat", json=payload,
-                             timeout=settings.request_timeout)
+        resp = _request(payload, stream)
     resp.raise_for_status()
-    data = resp.json()
-    prompt_tokens = data.get("prompt_eval_count")
-    runlog.log_event("llm", label=label,
-                     secs=round(time.perf_counter() - start, 2),
+    return _consume_stream(resp) if stream else _consume_single(resp)
+
+
+def _post_chat(payload: dict, label: str = "llm") -> dict:
+    from . import runlog
+    global had_successful_call
+    payload.setdefault("options", {})["num_ctx"] = settings.num_ctx
+    stream = settings.stream
+    payload["stream"] = stream
+    start = time.perf_counter()
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            msg, meta = _attempt(payload, stream)
+            break
+        except TRANSIENT_ERRORS as e:
+            if attempt == RETRY_ATTEMPTS:
+                raise
+            wait = RETRY_BACKOFF[attempt - 1]
+            ui.warn(f"connection to ollama dropped mid-call "
+                    f"({type(e).__name__}) — retrying in {wait}s "
+                    f"({attempt + 1}/{RETRY_ATTEMPTS})")
+            runlog.log_event("llm_retry", label=label, attempt=attempt,
+                             error=type(e).__name__)
+            time.sleep(wait)
+    had_successful_call = True
+    prompt_tokens = meta.get("prompt_eval_count")
+    secs = round(time.perf_counter() - start, 2)
+    runlog.log_event("llm", label=label, secs=secs,
                      prompt_tokens=prompt_tokens,
-                     eval_tokens=data.get("eval_count"))
+                     eval_tokens=meta.get("eval_count"))
+    ui.llm_stats(label, secs, prompt_tokens, meta.get("eval_count"))
     if prompt_tokens and prompt_tokens > 0.85 * settings.num_ctx:
         ui.warn(f"prompt used {prompt_tokens} of {settings.num_ctx} "
                 f"num_ctx tokens — raise --num-ctx before things get dropped")
-    return data["message"]
+    return msg
 
 
 class Session:
@@ -147,18 +230,30 @@ class Session:
 
     def __init__(self, model: str, system: str, tool_schemas: Optional[list],
                  think: bool = True, max_tool_rounds: int = 15,
-                 label: str = "llm", options: Optional[dict] = None):
+                 label: str = "llm", options: Optional[dict] = None,
+                 accept_user_messages: bool = False):
         self.model = model
         self.tool_schemas = tool_schemas
         self.think = think
         self.max_tool_rounds = max_tool_rounds
         self.label = label
         self.options = options
+        # only the executor opts in — reviewer/subagent sessions must not
+        # consume [m] messages meant for the main run
+        self.accept_user_messages = accept_user_messages
         self.messages: list = [{"role": "system", "content": system}]
         # only tools we actually advertised may run (the reviewer, for example,
         # gets a read-only subset — it must not be able to write files)
         self._allowed = {s["function"]["name"] for s in tool_schemas} if tool_schemas else set()
         self.last_tool_calls = 0  # how many tool calls the latest send() made
+
+    def inject_user_message(self, text: str) -> None:
+        """Mid-run [m] guidance from the user, delivered between tool rounds."""
+        self.messages.append({
+            "role": "user",
+            "content": "USER INTERJECTION (mid-run guidance — incorporate "
+                       "and continue): " + text,
+        })
 
     def _payload(self, with_tools: bool = True) -> dict:
         payload = {"model": self.model, "messages": self.messages,
@@ -182,8 +277,15 @@ class Session:
         self.last_tool_calls = 0
 
         for round_num in range(self.max_tool_rounds):
+            # safe point: the previous round's tools have fully executed and
+            # nothing is in flight — handle [p]/[m]/[o]/[q] keys here
+            ui.poll_controls()
+            if self.accept_user_messages:
+                for m in ui.drain_messages():
+                    self.inject_user_message(m)
             compact_messages(self.messages)
-            ui.context_tokens(estimate_tokens(self.messages), settings.num_ctx)
+            ui.context_tokens(estimate_tokens(self.messages), settings.num_ctx,
+                              label=self.label)
 
             msg = _post_chat(self._payload(with_tools=with_tools), label=self.label)
 
@@ -213,15 +315,20 @@ class Session:
                 else:
                     result = execute_tool_call(tool_name, tool_args)
                 ui.tool_result(result)
+                # load_skill returns instructions the model must actually read —
+                # it gets its own larger cap (skills.py already trims the body)
+                max_chars = (settings.skill_body_max if tool_name == "load_skill"
+                             else settings.tool_result_max)
                 self.messages.append({
                     "role": "tool",
                     "tool_name": tool_name,  # ollama matches the result to the call by this
                     # cap what enters history — a huge stdout or web page stays
                     # useful (head + tail) without eating the whole window
-                    "content": cap(result, settings.tool_result_max),
+                    "content": cap(result, max_chars),
                 })
 
         # Exhausted all rounds: one final call with no tools so it must answer in text
+        ui.poll_controls()
         ui.warn("hit max tool rounds, forcing final response")
         compact_messages(self.messages)
         msg = _post_chat(self._payload(with_tools=False), label=self.label)

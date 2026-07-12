@@ -35,39 +35,57 @@ flowchart TB
     end
 
     subgraph toolslayer ["Tools (jailed to workspace/)"]
-        TOOLS["tools/__init__.py<br/><i>registry + Ollama schemas</i>"]
+        TOOLS["tools/__init__.py<br/><i>registry + Ollama schemas<br/>+ permission/hook choke point</i>"]
         FILES["tools/files.py<br/><i>read/write/edit/list/grep</i>"]
         EXEC["tools/execute.py<br/><i>run_python/script/shell</i>"]
         WEB["tools/web.py<br/><i>web_search, fetch_page</i>"]
         MCP["tools/mcp.py<br/><i>Docker MCP gateway</i>"]
+        SUB["tools/subagent.py<br/><i>scoped child Session</i>"]
+    end
+
+    subgraph gates ["Gates & observers"]
+        PERM["permissions.py<br/><i>y/n/a gate for run_* tools</i>"]
+        HOOKS["hooks.py<br/><i>hooks.json shell observers</i>"]
+    end
+
+    subgraph endofrun ["End of run"]
+        MEM["memory.py<br/><i>LLM lessons → AGENT.md</i>"]
+        HIST["history.py<br/><i>sqlite run index</i>"]
+        REPORT["report.py<br/><i>self-contained report.html</i>"]
     end
 
     subgraph state ["Shared state & output"]
         CONFIG["config.py<br/><i>Settings singleton</i>"]
+        CMDS["commands.py<br/><i>-c goal templates</i>"]
+        TODOS["todos.py<br/><i>set_todos checklist</i>"]
         WS["workspace.py<br/><i>path jail, change tracking</i>"]
         RUNLOG["runlog.py<br/><i>events.jsonl + transcript.md</i>"]
-        UI["ui.py<br/><i>rich dashboard / plain fallback</i>"]
-        REPORT["report.py<br/><i>self-contained report.html</i>"]
+        UI["ui.py<br/><i>dashboard, streaming panel,<br/>confirm prompts</i>"]
     end
 
-    OLLAMA[("Ollama server<br/>POST /api/chat")]
+    OLLAMA[("Ollama server<br/>POST /api/chat<br/>(streamed)")]
 
     AGENT --> CLI
     CLI -->|"mutates settings once"| CONFIG
+    CLI -->|"-c: goal from template"| CMDS
     CLI -->|"goal, task, criteria"| GOALSMITH
+    CLI -->|"configure(hooks.json)"| HOOKS
+    CLI -->|"configure(--yolo)"| PERM
     CLI -->|"model, goal, task, ws, log"| RUN
     RUN -->|"Session.send()"| LLM
     RUN -->|"review(model, goal, answer, ws)"| REVIEW
-    REVIEW -->|"chat_v2()"| LLM
-    GOALSMITH -->|"chat_v2()"| LLM
-    LLM -->|"HTTP JSON"| OLLAMA
+    RUN -->|"at run end"| MEM & HIST & REPORT
+    REVIEW & GOALSMITH & MEM -->|"chat_v2()"| LLM
+    LLM -->|"HTTP JSON / stream deltas"| OLLAMA
     LLM -->|"execute_tool_call(name, args)"| TOOLS
-    TOOLS --> FILES & EXEC & WEB & MCP
+    TOOLS -->|"check() before dispatch"| PERM
+    TOOLS -->|"fire(pre/post_tool)"| HOOKS
+    TOOLS --> FILES & EXEC & WEB & MCP & SUB & TODOS
+    SUB -->|"child Session"| LLM
     FILES & EXEC -->|"ws.resolve() jail"| WS
-    RUN & REVIEW & GOALSMITH --> PROMPTS
-    RUN & LLM & TOOLS -->|"log_event()"| RUNLOG
-    RUN & LLM & REVIEW -->|"phase/tool/verdict"| UI
-    RUN -->|"write_report(run_dir)"| REPORT
+    RUN & REVIEW & GOALSMITH & MEM --> PROMPTS
+    RUN & LLM & TOOLS & HOOKS & PERM -->|"log_event()"| RUNLOG
+    RUN & LLM & REVIEW & TODOS & PERM -->|"phase/stream/todos/confirm"| UI
     RUN & REVIEW & LLM & CLI -.->|"read"| CONFIG
 ```
 
@@ -86,9 +104,13 @@ sequenceDiagram
     participant V as review.py
     participant O as Ollama
 
-    U->>C: agent.py -sg "..." [-em coder] [-rm judge]
+    U->>C: agent.py -sg "..." [-em coder] [-rm judge] [--yolo]
+    opt -c saved command
+        C->>C: load commands/<name>.md,<br/>goal from template, frontmatter defaults
+    end
     C->>C: settings.model / executor_model /<br/>reviewer_model / goalsmith_model
-    C->>C: create Workspace + RunLog,<br/>load AGENT.md into executor system prompt
+    C->>C: create Workspace + RunLog, configure<br/>hooks.json + permission gate
+    C->>C: system prompt += AGENT.md<br/>+= previous-run summary (--workspace)
     opt -sg (smart goal)
         C->>G: make_goal_task(goalsmith_model or model, prompt)
         G->>O: chat (GOALSMITH_SYSTEM)
@@ -106,9 +128,10 @@ sequenceDiagram
         end
         R->>S: send(task) — full TOOL_SCHEMAS
         loop tool rounds (max 15)
-            S->>O: chat (model=executor_model)
-            O-->>S: tool_calls or final text
+            S->>O: chat (model=executor_model, stream:true)
+            O-->>S: content/thinking deltas → live UI,<br/>then tool_calls or final text
             S->>T: execute_tool_call(name, args)
+            Note over T: permission gate (run_* tools:<br/>y/n/a prompt, non-TTY denies)<br/>then pre/post_tool hooks
             T-->>S: result string (capped, appended as role:tool)
         end
         S-->>R: answer text
@@ -128,12 +151,16 @@ sequenceDiagram
         end
 
         alt verdict passed
-            R-->>U: final_output.txt + report.html — done
+            R->>R: save final_output.txt — done
         else failed
             R->>S: compact old attempts to stubs,<br/>send RETRY_CONTINUE (same conversation)
             Note over R,S: if history still over budget:<br/>fresh Session + feedback digest (context_reset)
         end
     end
+
+    R->>R: report.html, history.db row, run_end hooks
+    R->>O: memory note (goalsmith model)<br/>→ appended to workspace AGENT.md
+    R-->>U: artifacts in runs/<timestamp>/
 ```
 
 ## Which model runs where
@@ -153,10 +180,12 @@ flowchart LR
     GM -->|overrides| GS
     M -->|fallback| EX["Executor session<br/>plan + execute + self-check + retries<br/>temp 0.7, full tool belt"]
     M -->|fallback| RV["Reviewer<br/>one call per attempt<br/>temp 0.1, read-only tools"]
-    M -->|fallback| GS["Goalsmith (-sg only)<br/>temp 0.3, no tools"]
+    M -->|fallback| GS["Goalsmith (-sg only)<br/>+ end-of-run memory note<br/>temp 0.3, no tools"]
 ```
 
-- The plan and self-check turns live **inside the executor session**, so `-em` covers them too.
+- The plan and self-check turns live **inside the executor session**, so `-em` covers them too,
+  and **subagents** spawned with `spawn_subagent` use the executor model as well.
+- The end-of-run **memory note** (AGENT.md lessons) rides the goalsmith model — cheap and small is fine.
 - The resolved models are logged in the `run_start` event of `events.jsonl` and shown in the
   dashboard header.
 - Models that don't support Ollama's `think` parameter (e.g. `qwen2.5-coder`) are detected on
@@ -174,15 +203,23 @@ Who produces what, and who consumes it:
 | Data | Produced by | Consumed by | Shape |
 |---|---|---|---|
 | `Settings` | `config.py` (defaults) + `cli.py` (one mutation at startup) | every module, read-only | dataclass singleton `settings` |
-| `(goal, task, criteria)` | `goalsmith.py` (`-sg`) or verbatim from `-g` | `run.py` (executor msg), `review.py` (checklist) | `tuple[str, str, list[str]]` |
-| Executor system prompt | `prompts.EXECUTOR_SYSTEM` + `cli.py` appends AGENT.md and MCP tool notes | `llm.Session` (message 0) | string |
+| `(goal, task, criteria)` | `goalsmith.py` (`-sg`), `commands.py` (`-c` template), or verbatim from `-g` | `run.py` (executor msg), `review.py` (checklist) | `tuple[str, str, list[str]]` |
+| Executor system prompt | `prompts.EXECUTOR_SYSTEM` + `cli.py` appends AGENT.md, the previous-run resume summary, and MCP tool notes | `llm.Session` (message 0) | string |
 | Conversation history | `llm.Session.messages` — grows with every turn, compacted between attempts | Ollama `/api/chat` payload | `list[{role, content, tool_calls?}]` |
-| Tool calls | Ollama reply `tool_calls` | `tools.execute_tool_call` → result appended back as a `role: tool` message | name + JSON args → capped string |
+| Stream deltas | Ollama line-JSON chunks, aggregated in `llm._consume_stream` | `ui.stream_delta` (live panel / progressive print); Session sees only the final message | text fragments |
+| Tool calls | Ollama reply `tool_calls` | `tools.execute_tool_call` → permission check → hooks → dispatch → result appended back as a `role: tool` message | name + JSON args → capped string |
+| Permission decision | `permissions.check()` (y/n/a prompt, `_always` grants, non-TTY auto-deny) | `execute_tool_call` (denial returned to the model as `[ERROR]`), `permission` events | `None` (allow) or error string |
+| Todo checklist | `set_todos` tool → `todos.current` | dashboard panel, `REVIEW_USER` ("self-reported — verify") | `[{text, status}]` |
+| Subagent summary | child `Session` in `tools/subagent.py` (fresh context, executor model) | parent's tool result, capped like any other | string |
 | Changed files | `workspace.files_changed_this_attempt()` (mtime scan — catches files written by *any* tool) | `review.py` snapshots, `run.py` stall gate, logs | `list[str]` relative paths |
 | Review evidence | `workspace.snapshot_files()` + `review.automated_checks()` (pytest) | `REVIEW_USER` prompt | capped text blocks |
 | `Verdict` | `review.parse_verdict()` (JSON → re-ask → YES/NO → default NO) | `run.py` pass/retry decision, retry feedback | `{passed, criteria[], feedback}` |
 | Retry message | `run.py` from `Verdict.unmet()` + feedback history | same executor `Session` (preferred) or a fresh one | `RETRY_CONTINUE` / `RETRY_NOTE` template |
-| `events.jsonl` | `runlog.log_event()` called from `run.py`, `llm.py`, `tools/` | `report.py`, `evals/run_evals.py`, you | one JSON object per line |
+| `events.jsonl` | `runlog.log_event()` called from `run.py`, `llm.py`, `tools/`, `hooks.py`, `permissions.py` | `report.py`, `evals/run_evals.py`, the resume summary, you | one JSON object per line |
+| Memory note | `memory.update_agent_md()` — goalsmith-model call at run end, bullets appended as a dated section | `<workspace>/AGENT.md` → next run's system prompt | markdown section, trimmed to budget |
+| Resume summary | `cli._load_resume_context()` — mechanical, from the previous run's `events.jsonl` / `attempt_history.json` | executor system prompt on `--workspace` reuse | capped text block |
+| Hook commands | user-authored `hooks.json` at the repo root | `hooks.fire()` on pre/post_tool, attempt_end, run_end (observe-only) | shell commands with `{placeholders}` |
+| `runs/history.db` | `history.record()` at run end | `agent.py history` / `history --stats` | sqlite row per run |
 | `report.html` | `report.py` at the end of every run | your browser | self-contained HTML |
 
 Two deliberately global handles keep the deep call sites simple: `config.settings`
@@ -199,7 +236,7 @@ from one run can't confuse the next:
 ```
 runs/run_20260703_154139/
 ├── workspace/           # the ONLY directory the agent can see and touch
-│   └── AGENT.md         # optional: auto-loaded into the executor system prompt
+│   └── AGENT.md         # project context: auto-loaded at start, memory notes appended at end
 ├── transcript.md        # human-readable log of every attempt + verdict
 ├── events.jsonl         # machine log: llm calls (real token counts), tool calls, attempts
 ├── attempt_1.txt        # prose of each failed attempt
@@ -207,12 +244,19 @@ runs/run_20260703_154139/
 ├── report.html          # self-contained visual report
 └── final_output.txt     # or final_output_UNVERIFIED.txt if attempts ran out
 runs/latest              # symlink to the most recent run
+runs/history.db          # sqlite index over ALL runs (agent.py history)
 ```
 
 The jail is `workspace.resolve()`: every file tool resolves its path against
 `workspace/` and refuses anything that escapes it (`../`, absolute paths). Change
 tracking is mtime-based, so the reviewer judges files however they were produced —
 `write_file`, `run_python`, a shell command, anything.
+
+The workspace is also a **git repo** (`--no-git` disables): the harness commits the
+starting state, then one commit per attempt, and the reviewer receives the attempt's
+`git diff` instead of truncated file snapshots — every change fits the evidence budget,
+and a bad attempt can be rolled back with plain git. Snapshots remain the fallback when
+git is unavailable or the diff is empty.
 
 Reuse a previous workspace (to continue earlier work) with
 `--workspace runs/run_.../workspace`.
@@ -238,9 +282,51 @@ flowchart LR
     subgraph mcpt ["mcp.py (--mcp)"]
         MT["Docker MCP<br/>Toolkit tools"]
     end
-    REG --> filet & exect & webt & mcpt
+    subgraph agentt ["agent-level tools"]
+        ST["set_todos<br/>(checklist → dashboard + reviewer)"]
+        SA["spawn_subagent<br/>(scoped child session,<br/>returns only a summary)"]
+        LS["load_skill<br/>(pull skills/&lt;name&gt;/SKILL.md<br/>instructions on demand)"]
+    end
+    REG --> filet & exect & webt & mcpt & agentt
     filet & exect --> JAIL["workspace/ path jail"]
 ```
+
+Three tools work on the agent itself rather than the workspace, all borrowed from
+Claude Code:
+
+- **`set_todos`** — the executor declares and updates its checklist (`pending` /
+  `in_progress` / `done`). It shows live in the dashboard, is logged as `todos` events,
+  and the final state is handed to the reviewer labeled *self-reported — verify against
+  the workspace*, so claimed-done vs actually-done is visible.
+- **`spawn_subagent`** — delegates a self-contained subtask (exploration, research, a
+  contained build step) to a fresh child session with its own context and a smaller
+  tool-round budget (`subagent_max_rounds`, default 8). Only the child's final summary
+  returns to the parent, capped like any tool result — the parent's context stays small.
+  Subagents can't spawn subagents, and the child doesn't get `set_todos` (the checklist
+  belongs to the parent). There's no CLI flag: the **executor decides** to call it when a
+  goal has a delegate-able chunk, so smaller local models may need the goal to name the
+  delegation explicitly. The child runs under `SUBAGENT_SYSTEM` (act directly, end with a
+  <200-word summary of files/commands/facts) on the executor model, and each spawn is
+  bracketed by `subagent_start` / `subagent_end` events in `events.jsonl`.
+- **`load_skill`** — loads the full instructions of a skill from
+  `skills/<name>/SKILL.md`. A compact index (name + one-line description per skill)
+  is injected into the executor and subagent system prompts; the model calls
+  `load_skill(name)` when a description matches the work at hand and the body
+  (capped at `skill_body_max`, default 8,000 chars) arrives as a tool result —
+  progressive disclosure, so unused skills cost almost nothing. Read-only, never
+  permission-prompts; each load is a `skill` event. The reviewer never sees skills.
+  `--no-skills` disables the index and the tool.
+
+Guardrails on the risky tools: `run_shell` only accepts one plain allowlisted command
+(`pip`, `pip3`, `python3`, `pytest`, `ls`, `mkdir`, `cat`, `echo` — no pipes, chaining, or
+redirection, enforced with `shell=False`), and `fetch_page` refuses local/private-network
+addresses. `run_python`/`run_script` execute with the workspace as cwd and per-call timeouts.
+
+With **`--sandbox`** the execute tools run inside a per-run Docker container instead
+(`--sandbox-image`, default `python:3.12-slim`, workspace mounted at `/ws`). The container
+is the guardrail there, so the shell allowlist is lifted: any command, pipes, chaining,
+and `pip install`s that persist for the rest of the run (one long-lived container per
+workspace, removed at exit).
 
 The reviewer gets a **read-only subset** (`read_file`, `list_files`, `run_script`,
 `run_shell`) so it can gather evidence but never fix the work itself. `--no-reviewer-tools`
@@ -257,10 +343,21 @@ python3 agent.py -g "..." -em qwen2.5-coder:7b                     # coding mode
 python3 agent.py -sg "..." -gm gemma4:26b -em codestral            # separate goalsmith model (--goalsmith-model)
 python3 agent.py -g "..." --num-ctx 32768 --full-context           # no trimming at all
 python3 agent.py -g "..." --mcp                                    # + Docker MCP Toolkit tools
+python3 agent.py -g "..." --mcp --mcp-profile work                 # specific MCP Toolkit profile
+python3 agent.py -g "Delegate the file survey to a subagent, then write a report"  # invites spawn_subagent
 python3 agent.py -g "..." --workspace runs/latest/workspace        # continue earlier work
+python3 agent.py -g "..." -i                                       # steer failed attempts by hand (--interactive)
+python3 agent.py -g "..." --sandbox                                # execute tools inside a Docker container
+python3 agent.py -g "..." --no-git                                 # snapshot evidence instead of git diffs
 python3 agent.py -g "..." --no-reviewer-tools                      # faster, snapshot-only review
 python3 agent.py -g "..." --best-of 3                              # 3 independent first attempts, keep the best
 python3 agent.py -g "..." --no-plan --no-self-check                # skip the quality turns (faster)
+python3 agent.py -c fix-tests "focus on test_api"                  # saved command from commands/fix-tests.md
+python3 agent.py -g "..." --yolo                                   # skip permission prompts (needed for cron/pipes)
+python3 agent.py -g "..." --no-stream --no-memory                  # disable streaming / AGENT.md notes
+python3 agent.py history                                           # past runs from runs/history.db
+python3 agent.py history --stats                                   # pass-rate per executor model
+python3 agent.py history --limit 50                                # more rows (default: 20)
 ```
 
 Every attempt runs three phases by default: a **planning turn** (attempt 1 only — the
@@ -269,9 +366,10 @@ model commits to filenames and a verification step before touching tools), the
 fix failures before the reviewer sees it). `--best-of N` additionally runs N independent
 first attempts in separate `candidate_*` workspaces, reviews each, and continues the loop
 from the winner. On a real terminal you get a live rich dashboard (attempt/phase/token
-budget/tool log); piped output falls back to plain lines. Every run ends by writing a
-self-contained **`report.html`** into the run dir (regenerate with
-`python3 -m harness.report runs/latest`).
+budget/tool log/todos/streaming panel); piped output falls back to plain lines with
+progressive streaming. Every run ends by writing a self-contained **`report.html`**
+into the run dir (regenerate with `python3 -m harness.report runs/latest`), recording
+a row in `runs/history.db`, and appending a memory note to the workspace AGENT.md.
 
 ## Context management
 
@@ -301,6 +399,13 @@ harness/
 ├── runlog.py         # transcript.md + events.jsonl writers
 ├── review.py         # JSON verdicts with fallback parsing, automated pytest checks
 ├── goalsmith.py      # -sg: request → goal + criteria + task
+├── todos.py          # the executor's self-maintained checklist (set_todos)
+├── memory.py         # end-of-run AGENT.md lessons notes
+├── history.py        # sqlite run index (agent.py history)
+├── commands.py       # commands/*.md loader (-c)
+├── skills.py         # skills/<name>/SKILL.md index + load_skill tool
+├── hooks.py          # observe-only hooks.json event hooks
+├── permissions.py    # y/n/a gate for code-executing tools (--yolo)
 ├── run.py            # the execute → review → retry loop (+ plan/self-check/best-of)
 ├── ui.py             # rich live dashboard, plain-print fallback
 ├── report.py         # self-contained report.html per run
@@ -308,8 +413,10 @@ harness/
     ├── __init__.py   # registry, Ollama schemas, execute_tool_call dispatch
     ├── files.py      # read/write/edit/list/grep, all jailed
     ├── execute.py    # run_python / run_script / run_shell (allowlisted)
+    ├── subagent.py   # spawn_subagent: scoped child sessions
     ├── web.py        # web_search (ddgs), fetch_page (trafilatura)
     └── mcp.py        # Docker MCP Toolkit gateway client
+skills/               # model-loadable skills, one SKILL.md per subdirectory
 tests/                # pytest suite for the harness itself (venv/bin/python -m pytest)
 evals/                # benchmark goals + runner for measuring harness changes
 ```
@@ -375,17 +482,62 @@ New-NetFirewallRule -DisplayName "Ollama LAN Access" -Direction Inbound -LocalPo
 
 Defaults live in `harness/config.py` (`Settings` dataclass): server URL, per-role models
 (`model`, `executor_model`, `reviewer_model`, `goalsmith_model`), context window,
-truncation caps, and per-role sampling options (executor 0.7, reviewer 0.1,
-goalsmith 0.3). Everything relevant is also overridable per run via CLI flags
-(`--url`, `--model`, `-em`, `-rm`, `-gm`, `--num-ctx`, `--attempts`, ...).
+truncation caps, the per-call request timeout (`request_timeout`), per-role sampling
+options (executor 0.7, reviewer 0.1, goalsmith 0.3), and feature toggles (`stream`,
+`memory`, `skills`, `skill_body_max`, `plan_first`, `self_check`,
+`subagent_max_rounds`, `workspace_git`, `interactive`, `sandbox`/`sandbox_image`).
+Everything relevant is also overridable per run via CLI
+flags (`--url`, `--model`, `-em`, `-rm`, `-gm`, `--num-ctx`, `--attempts`,
+`--no-stream`, `--no-memory`, `--no-skills`, `--no-git`, `-i`, `--sandbox`,
+`--yolo`, ...).
+
+## Claude-Code-style extras
+
+- **Streaming** — tokens render live (a rolling panel in the dashboard, progressive
+  print in plain mode); `--no-stream` waits for complete responses.
+- **Permission prompts** — `run_shell`/`run_python`/`run_script` pause for y/n/a
+  approval before executing. Non-interactive sessions auto-deny with an error the
+  model can react to; `--yolo` disables the gate (evals pass it automatically).
+- **Interactive steering** — `-i`/`--interactive` pauses after each failed verdict:
+  Enter retries as usual, typed text is injected into the retry message as user
+  guidance (logged as a `user_steer` event), and `q` ends the run with the normal
+  finalization. Non-TTY stdin never blocks, so pipes and evals are unaffected.
+- **Plan-seeded todos** — the numbered steps from the attempt-1 planning turn are
+  parsed straight into the todo checklist (a `todos_seeded` event), so the executor
+  starts from concrete phases and the reviewer sees which were claimed done.
+- **Persistent memory** — after each run the goalsmith model distills 3-6 durable
+  lessons into the workspace `AGENT.md` (dated sections, oldest trimmed, user
+  preamble untouched); the file is injected back into the executor's system prompt
+  on the next run. `--no-memory` skips it.
+- **Session resume** — reusing a workspace with `--workspace runs/<run>/workspace`
+  auto-injects a mechanical summary of that run (goal, verdict, feedback, files)
+  so the next session builds on the work instead of redoing it.
+- **Custom commands** — `commands/<name>.md` files: a goal template with `{args}`
+  plus optional frontmatter defaults (`description`, `em`, `rm`, `gm`, `model`,
+  `attempts`, `best_of`, `url`, `num_ctx` — explicit CLI flags still win). Run via
+  `agent.py -c <name> extra words`; see `commands/fix-tests.md` for a working example.
+- **Skills** — `skills/<name>/SKILL.md` files: reusable expert instructions the
+  **model** discovers and loads itself (commands are user-invoked; skills are
+  model-invoked). Frontmatter `name` + `description` feed a compact index in the
+  executor/subagent system prompts; when a description matches the task, the model
+  calls `load_skill(name)` for the full body. Frontmatter `always: true` marks a
+  standing preference: its body is injected directly into the system prompt instead
+  (small local models won't reliably load meta-instructions themselves — see
+  `skills/hi-jackson`). Ships with `pytest-debugging`, `python-packaging`, and
+  `hi-jackson`; `--no-skills` disables. The reviewer never sees skills, so verdicts
+  stay grounded in the workspace.
+- **Hooks** — repo-root `hooks.json` maps events (`pre_tool`, `post_tool`,
+  `attempt_end`, `run_end`) to shell commands with `{tool}/{file}/{run_dir}/...`
+  placeholders; tool events take an optional `"match"` glob (e.g. `"write_*"`).
+  Observe-only: failures warn, never block.
+- **Run history** — every run appends to `runs/history.db`; `agent.py history`
+  lists past runs (`--limit N`, default 20), `history --stats` shows pass-rate
+  per executor model.
 
 ## Roadmap
 
-- Multi-phase planning for big goals (plan → execute each phase → review each phase)
-- Streaming output so long generations show progress
-- Subagents: scoped executor sessions whose summaries return to the parent context
-- Persist run history to sqlite for cross-run "what did I do last time" queries
-- Sandboxed execution (containers) instead of the command allowlist
+- Multi-phase planning for big goals (plan → execute each phase → review each phase);
+  plan-seeded todos are the first slice of this
 
 ## License
 

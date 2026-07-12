@@ -5,6 +5,31 @@ server."""
 import pytest
 
 from harness import llm
+from harness.config import settings
+
+
+@pytest.fixture(autouse=True)
+def _no_memory_notes(monkeypatch):
+    """Keep the 100+ scripted full-run tests free of the end-of-run memory
+    LLM call; memory tests flip it back on explicitly."""
+    monkeypatch.setattr(settings, "memory", False)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_history(monkeypatch, tmp_path):
+    """Full-run loop tests record history — keep it out of the real runs/history.db."""
+    from harness import history
+    monkeypatch.setattr(history, "db_path", lambda: str(tmp_path / "history.db"))
+
+
+@pytest.fixture(autouse=True)
+def _yolo_permissions():
+    """pytest stdin is non-TTY, so the permission gate would auto-deny every
+    run_python/run_shell in the tool tests; permission tests opt out locally."""
+    from harness import permissions
+    permissions.configure(yolo=True)
+    yield
+    permissions.configure(yolo=True)
 
 
 class ScriptedLLM:

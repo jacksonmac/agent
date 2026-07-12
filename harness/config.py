@@ -23,14 +23,16 @@ class RoleOptions:
 
 @dataclass
 class Settings:
-    url: str = "http://192.168.1.134:11434"
-    model: str = "gemma4:26b"
+    url: str = "http://192.168.1.134:11434" #ip for sever, when vm is running
+    #url: str = "http://localhost:11434" #FOR WHEN THE SEVER IS OFF LINE
+    #model: str = "gemma4:26b"
+    model: str = "qwen3.5:9b"
     reviewer_model: str | None = None   # None = same as model
     executor_model: str | None = None   # None = same as model (covers plan/self-check too)
     goalsmith_model: str | None = None  # None = same as model
 
-    request_timeout: int = 600   # seconds per LLM call
-    num_ctx: int = 30000         # requested context window (used to be 16500)
+    request_timeout: int = 1600   # seconds per LLM call (used to be 1600 only doing this becuase of how big the model is)
+    num_ctx: int = 10000         # requested context window (used to be 16500)
     full_context: bool = False   # --full-context: disable ALL trimming
 
     # context budget knobs
@@ -46,9 +48,24 @@ class Settings:
     goalsmith: RoleOptions = field(default_factory=lambda: RoleOptions(temperature=0.3))
     reviewer_tools: bool = True  # --no-reviewer-tools disables
 
+    subagent_max_rounds: int = 20  # tool rounds a spawn_subagent child gets
+    memory: bool = True           # write an AGENT.md lessons note after each run
+    skills: bool = True           # advertise skills/ + honor load_skill (--no-skills)
+    skill_body_max: int = 8_000   # cap on a loaded SKILL.md body (AGENT.md-sized)
+    stream: bool = True           # stream tokens live from Ollama (--no-stream)
+    notify: bool = True           # bell/desktop notification at run end (--no-notify)
+
     # attempt-quality phases (see run.py); --no-plan / --no-self-check disable
     plan_first: bool = True   # attempt 1 opens with a no-tool planning turn
     self_check: bool = True   # verify-and-fix turn before each review
+
+    workspace_git: bool = True  # commit per attempt, reviewer judges git diffs (--no-git)
+    interactive: bool = False   # -i: pause after a failed verdict for user steering
+
+    # --sandbox: run execute tools in a per-run Docker container (workspace
+    # mounted at /ws); the shell allowlist is waived inside it
+    sandbox: bool = False
+    sandbox_image: str = "python:3.12-slim"
 
 
 settings = Settings()

@@ -13,6 +13,7 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 
+from . import todos as todos_mod
 from . import ui
 from .config import settings
 from .llm import _role_options, cap, chat_v2, truncate_middle
@@ -124,11 +125,15 @@ def review(model: str, goal: str, output: str, ws: Workspace,
                      if criteria else
                      "(none provided — derive 3-6 binary-checkable criteria from the goal)")
     listing = "\n".join(ws.list_all_files()) or "(the workspace is empty)"
-    files_text = ws.snapshot_files(changed_files or [])
+    # a unified diff shows every change within the same budget snapshots
+    # spend on two truncated files; snapshots remain the no-git fallback
+    files_text = (ws.attempt_diff() if changed_files else "") \
+        or ws.snapshot_files(changed_files or [])
     user = REVIEW_USER.format(
         goal=goal,
         criteria=criteria_text,
         output=cap(output, settings.retry_prev_max),
+        todos=todos_mod.render(),
         listing=listing,
         files=files_text,
         checks=automated_checks(ws),

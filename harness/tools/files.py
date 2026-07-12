@@ -1,8 +1,19 @@
 """File tools, jailed to the run's Workspace."""
 
+import difflib
 import os
 
+from .. import ui
 from ..workspace import Workspace
+
+
+def _show_diff(name: str, old: str, new: str) -> None:
+    """Display-only unified diff (the tool's return value stays compact)."""
+    diff_text = "\n".join(difflib.unified_diff(
+        old.splitlines(), new.splitlines(),
+        fromfile=f"a/{name}", tofile=f"b/{name}", lineterm=""))
+    if diff_text:
+        ui.diff(name, diff_text)
 
 
 def write_file(ws: Workspace, text: str, name: str) -> str:
@@ -12,9 +23,21 @@ def write_file(ws: Workspace, text: str, name: str) -> str:
     except ValueError:
         return f"[ERROR] refusing to write outside the workspace: {name}"
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    old = None
+    if os.path.isfile(path):
+        try:
+            with open(path) as f:
+                old = f.read()
+        except OSError:
+            old = None
     with open(path, "w") as f:
         f.write(text)
-    print("WROTE:", path)
+    if old is not None:
+        _show_diff(name, old, text)
+    else:
+        lines = len(text.splitlines())
+        ui.info(f"new file {name} ({lines} lines)")
+        ui.file_created(name, lines)  # keep the files panel's totals honest
     return f"WROTE {len(text)} chars to {name}"
 
 
@@ -104,7 +127,6 @@ def grep_files(ws: Workspace, pattern: str, path: str = ".",
 def edit_file(ws: Workspace, name: str, old_text: str, new_text: str) -> str:
     """Replace an exact snippet in an existing file — the targeted alternative
     to rewriting the whole file with write_file."""
-    import difflib
     try:
         path = ws.resolve(name)
     except ValueError:
@@ -122,8 +144,10 @@ def edit_file(ws: Workspace, name: str, old_text: str, new_text: str) -> str:
     if count > 1:
         return (f"[ERROR] old_text found {count} times in {name} — include more "
                 f"surrounding context so it matches exactly once.")
+    before = content
     content = content.replace(old_text, new_text, 1)
     with open(path, "w") as f:
         f.write(content)
+    _show_diff(name, before, content)
     print("EDITED:", path)
     return f"REPLACED 1 occurrence in {name} (file now {len(content)} chars)"

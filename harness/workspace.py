@@ -9,6 +9,7 @@ so leftovers from one run can never confuse the next.
 from __future__ import annotations
 
 import os
+import subprocess
 import time
 
 from .llm import truncate_middle
@@ -30,13 +31,26 @@ class Workspace:
         os.makedirs(self.run_dir, exist_ok=True)
         os.makedirs(self.root, exist_ok=True)
         self._attempt_t0 = 0.0
+        self._git = False  # init_git() flips this when git is usable
 
     @classmethod
     def create(cls, runs_root: str, workspace_dir: str | None = None) -> "Workspace":
         """Make runs/run_TIMESTAMP/ (+ a 'latest' symlink) and return the
         Workspace. workspace_dir overrides where the agent-visible files live
         (--workspace, for continuing earlier work)."""
-        run_dir = os.path.join(runs_root, time.strftime("run_%Y%m%d_%H%M%S"))
+        os.makedirs(runs_root, exist_ok=True)
+        # timestamps are second-granular: two runs started in the same second
+        # must not share (and clobber) one run dir, so reserve the name
+        # atomically and suffix -2, -3, ... on collision
+        base = os.path.join(runs_root, time.strftime("run_%Y%m%d_%H%M%S"))
+        run_dir, n = base, 1
+        while True:
+            try:
+                os.makedirs(run_dir)
+                break
+            except FileExistsError:
+                n += 1
+                run_dir = f"{base}-{n}"
         ws = cls(run_dir, workspace_dir)
         latest = os.path.join(runs_root, "latest")
         try:
@@ -91,6 +105,62 @@ class Workspace:
                     continue
                 found.append(os.path.relpath(os.path.join(dirpath, fn), self.root))
         return sorted(found)
+
+    # ─── git evidence (per-attempt commits → reviewer diffs) ────────
+
+    def _git_run(self, *args: str) -> subprocess.CompletedProcess | None:
+        try:
+            return subprocess.run(["git", "-C", self.root, *args],
+                                  capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    def init_git(self) -> bool:
+        """git-init the workspace (idempotent — a reused workspace keeps its
+        history) and commit whatever is already there, so attempt 1 has a
+        base to diff against. False = git unusable, evidence stays
+        snapshot-only."""
+        if self._git:
+            return True
+        proc = self._git_run("init", "-q")
+        if proc is None or proc.returncode != 0:
+            return False
+        # commits need an identity; scope it to this repo only
+        self._git_run("config", "user.email", "agent@harness.local")
+        self._git_run("config", "user.name", "agent harness")
+        # keep bytecode/venv noise out of the diffs without an agent-visible
+        # .gitignore in the workspace
+        try:
+            with open(os.path.join(self.root, ".git", "info", "exclude"), "a") as f:
+                f.write("__pycache__/\n*.pyc\n*.pyo\n.pytest_cache/\nvenv/\n.venv/\n")
+        except OSError:
+            pass
+        self._git = self._commit("workspace before the run")
+        return self._git
+
+    def _commit(self, message: str) -> bool:
+        add = self._git_run("add", "-A")
+        if add is None or add.returncode != 0:
+            return False
+        proc = self._git_run("commit", "-q", "--allow-empty", "-m", message)
+        return proc is not None and proc.returncode == 0
+
+    def commit_attempt(self, n: int) -> bool:
+        """Snapshot the workspace as one commit per attempt (no-op without
+        init_git). --allow-empty keeps HEAD~1 meaningful even for
+        do-nothing attempts."""
+        return self._git and self._commit(f"attempt {n}")
+
+    def attempt_diff(self, max_chars: int = 8_000) -> str:
+        """Unified diff of the last attempt commit — denser reviewer evidence
+        than file snapshots. Empty string when git is off, the diff fails,
+        or nothing changed (callers fall back to snapshot_files)."""
+        if not self._git:
+            return ""
+        proc = self._git_run("diff", "HEAD~1", "HEAD")
+        if proc is None or proc.returncode != 0:
+            return ""
+        return truncate_middle(proc.stdout.strip(), max_chars)
 
     # ─── reviewer snapshot ──────────────────────────────────────────
 
