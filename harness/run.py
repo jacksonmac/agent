@@ -45,7 +45,8 @@ def _criteria_text(criteria: list[str] | None) -> str:
 def _new_session(model: str, executor_system: str) -> Session:
     return Session(model, executor_system, TOOL_SCHEMAS,
                    think=settings.executor.think, label="executor",
-                   options=_role_options(settings.executor))
+                   options=_role_options(settings.executor),
+                   accept_user_messages=True)
 
 
 def _run_attempt(session: Session, ws: Workspace, log: RunLog, user_msg: str,
@@ -108,6 +109,8 @@ def _run_candidates(model: str, goal: str, user_msg: str, ws: Workspace,
                                           plan_first=settings.plan_first)
         verdict = review(reviewer_model, goal, answer, cand_ws,
                          criteria=criteria, changed_files=changed)
+        if verdict.criteria:
+            ui.criteria(verdict.criteria, source=f"candidate {i}")
         met = sum(1 for c in verdict.criteria if c.get("met"))
         score = (int(verdict.passed), met)
         ui.info(f"candidate {i}: passed={verdict.passed}, criteria met={met}")
@@ -151,109 +154,130 @@ def main(model: str, goal: str, task: str, ws: Workspace, log: RunLog,
               plan_first=settings.plan_first, self_check=settings.self_check)
     log.transcript(f"# Agent run {time.strftime('%Y-%m-%dT%H:%M:%S')}\n\n"
                    f"**Goal:** {goal}\n\n**Task:** {task}\n\n")
+    if criteria:
+        ui.criteria(criteria)  # all pending until the first review
 
-    # attempt 1 either comes from the candidate round (--best-of) or runs inline
-    pending: tuple[str, list[str], Verdict] | None = None
-    if best_of > 1:
-        session, answer, changed, verdict = _run_candidates(
-            executor_model, goal, user_msg, ws, log, executor_system, criteria, best_of)
-        pending = (answer, changed, verdict)
-    else:
-        session = _new_session(executor_model, executor_system)
-
-    for attempt in range(1, max_attempts + 1):
-        no_tools = stalled = False
-        if pending is not None:
-            answer, changed_files, verdict = pending
-            pending = None
+    # attempt 1 either comes from the candidate round (--best-of) or runs inline.
+    # The whole loop sits in a try: [q] raises ui.QuitRequested from any safe
+    # point (including inside review or a subagent) and we still fall through
+    # to the finalization below — artifacts, report, and history all get written.
+    attempt = 0
+    try:
+        pending: tuple[str, list[str], Verdict] | None = None
+        if best_of > 1:
+            session, answer, changed, verdict = _run_candidates(
+                executor_model, goal, user_msg, ws, log, executor_system, criteria, best_of)
+            pending = (answer, changed, verdict)
         else:
-            ui.attempt(attempt, max_attempts)
-            ui.phase("executing")
-            plan_first = settings.plan_first and attempt == 1
-            answer, changed_files, tool_calls = _run_attempt(
-                session, ws, log, user_msg, goal, criteria, attempt, plan_first)
-
-            # Stall detection: reviewing a do-nothing or repeat attempt wastes an
-            # expensive LLM call — skip straight to a retry that redirects it.
-            no_tools = (tool_calls == 0 and not changed_files)
-            stalled = (prev_answer is not None and
-                       difflib.SequenceMatcher(None, _normalized(answer),
-                                               _normalized(prev_answer)).ratio() > 0.95)
-            if no_tools:
-                ui.warn(f"attempt {attempt} made zero tool calls — skipping review, "
-                        f"telling it to actually do the work")
-                verdict = Verdict(passed=False, feedback=(
-                    "skipped review: you made no tool calls, so nothing was actually done. "
-                    "You MUST use your tools — start with list_files to see the workspace, "
-                    "then do the work. Never ask for clarification; make a sensible "
-                    "assumption and proceed."))
-            elif stalled:
-                ui.warn(f"attempt {attempt} is nearly identical to the previous one — "
-                        f"skipping review, demanding a new approach")
-                verdict = Verdict(passed=False, feedback=(
-                    "skipped review: output nearly identical to the previous failed attempt"))
-            else:
-                ui.phase("reviewing")
-                reviewer_model = settings.reviewer_model or settings.model
-                verdict = review(reviewer_model, goal, answer, ws,
-                                 criteria=criteria, changed_files=changed_files)
-
-        passed = verdict.passed
-        ui.verdict(passed, verdict.summary())
-        attempts.append({"attempt": attempt, "output": answer,
-                         "files": changed_files, "passed": passed,
-                         "verdict": verdict.summary(),
-                         "criteria": verdict.criteria})
-        log.event("attempt", n=attempt, passed=passed, stalled=stalled,
-                  no_tools=no_tools, files=changed_files, feedback=verdict.summary())
-        hooks_mod.fire("attempt_end", attempt=attempt, passed=passed)
-        log.transcript(f"\n## Attempt {attempt} — {'PASSED' if passed else 'FAILED'}\n\n"
-                       f"{answer}\n\n"
-                       + (f"**Files changed:** {', '.join(changed_files)}\n\n"
-                          if changed_files else "")
-                       + (f"**Reviewer:** {verdict.summary()}\n" if not passed else ""))
-
-        if passed:
-            ui.success(f"WE DID IT on attempt {attempt}")
-            ws.save_artifact("final_output.txt", answer)
-            break
-
-        # everything else (NO or malformed-treated-as-NO) → retry
-        ui.info(f"goal not met on attempt {attempt}, saving output and retrying")
-        ws.save_artifact(f"attempt_{attempt}.txt", answer)
-        feedback_history.append(f"[attempt {attempt}] {cap(verdict.summary(), 800)}")
-
-        # Preferred path: continue the SAME session — the model keeps its own
-        # memory of what it read, wrote, and saw fail. Compact the finished
-        # attempt down to stubs first so the history stays under budget.
-        session.compact_completed_attempts()
-        if session.over_budget():
-            # bounded worst case: fall back to the old fresh-conversation retry
-            ui.warn("history over budget even after compaction — "
-                    "starting a fresh session for the next attempt")
-            log.event("context_reset", after_attempt=attempt)
             session = _new_session(executor_model, executor_system)
-            user_msg = (f"GOAL: {goal}\n\nTASK: {task}" if goal != task else task) \
-                + RETRY_NOTE.format(
-                    feedback=_feedback_digest(feedback_history),
-                    previous=cap(answer, settings.retry_prev_max),
-                )
+
+        for attempt in range(1, max_attempts + 1):
+            ui.poll_controls()
+            no_tools = stalled = False
+            if pending is not None:
+                answer, changed_files, verdict = pending
+                pending = None
+            else:
+                ui.attempt(attempt, max_attempts)
+                ui.phase("executing")
+                plan_first = settings.plan_first and attempt == 1
+                answer, changed_files, tool_calls = _run_attempt(
+                    session, ws, log, user_msg, goal, criteria, attempt, plan_first)
+
+                # Stall detection: reviewing a do-nothing or repeat attempt wastes an
+                # expensive LLM call — skip straight to a retry that redirects it.
+                no_tools = (tool_calls == 0 and not changed_files)
+                stalled = (prev_answer is not None and
+                           difflib.SequenceMatcher(None, _normalized(answer),
+                                                   _normalized(prev_answer)).ratio() > 0.95)
+                if no_tools:
+                    ui.warn(f"attempt {attempt} made zero tool calls — skipping review, "
+                            f"telling it to actually do the work")
+                    verdict = Verdict(passed=False, feedback=(
+                        "skipped review: you made no tool calls, so nothing was actually done. "
+                        "You MUST use your tools — start with list_files to see the workspace, "
+                        "then do the work. Never ask for clarification; make a sensible "
+                        "assumption and proceed."))
+                elif stalled:
+                    ui.warn(f"attempt {attempt} is nearly identical to the previous one — "
+                            f"skipping review, demanding a new approach")
+                    verdict = Verdict(passed=False, feedback=(
+                        "skipped review: output nearly identical to the previous failed attempt"))
+                else:
+                    ui.poll_controls()
+                    ui.phase("reviewing")
+                    reviewer_model = settings.reviewer_model or settings.model
+                    verdict = review(reviewer_model, goal, answer, ws,
+                                     criteria=criteria, changed_files=changed_files)
+
+            passed = verdict.passed
+            ui.verdict(passed, verdict.summary())
+            if verdict.criteria:
+                ui.criteria(verdict.criteria,
+                            source=f"reviewer, attempt {attempt}")
+            attempts.append({"attempt": attempt, "output": answer,
+                             "files": changed_files, "passed": passed,
+                             "verdict": verdict.summary(),
+                             "criteria": verdict.criteria})
+            log.event("attempt", n=attempt, passed=passed, stalled=stalled,
+                      no_tools=no_tools, files=changed_files, feedback=verdict.summary())
+            hooks_mod.fire("attempt_end", attempt=attempt, passed=passed)
+            log.transcript(f"\n## Attempt {attempt} — {'PASSED' if passed else 'FAILED'}\n\n"
+                           f"{answer}\n\n"
+                           + (f"**Files changed:** {', '.join(changed_files)}\n\n"
+                              if changed_files else "")
+                           + (f"**Reviewer:** {verdict.summary()}\n" if not passed else ""))
+
+            if passed:
+                ui.success(f"WE DID IT on attempt {attempt}")
+                ws.save_artifact("final_output.txt", answer)
+                break
+
+            # everything else (NO or malformed-treated-as-NO) → retry
+            ui.info(f"goal not met on attempt {attempt}, saving output and retrying")
+            ws.save_artifact(f"attempt_{attempt}.txt", answer)
+            feedback_history.append(f"[attempt {attempt}] {cap(verdict.summary(), 800)}")
+
+            # Preferred path: continue the SAME session — the model keeps its own
+            # memory of what it read, wrote, and saw fail. Compact the finished
+            # attempt down to stubs first so the history stays under budget.
+            session.compact_completed_attempts()
+            if session.over_budget():
+                # bounded worst case: fall back to the old fresh-conversation retry
+                ui.warn("history over budget even after compaction — "
+                        "starting a fresh session for the next attempt")
+                log.event("context_reset", after_attempt=attempt)
+                session = _new_session(executor_model, executor_system)
+                user_msg = (f"GOAL: {goal}\n\nTASK: {task}" if goal != task else task) \
+                    + RETRY_NOTE.format(
+                        feedback=_feedback_digest(feedback_history),
+                        previous=cap(answer, settings.retry_prev_max),
+                    )
+            else:
+                unmet = verdict.unmet()
+                unmet_text = ("Unmet criteria:\n" + "\n".join(f"- {u}" for u in unmet)
+                              if unmet else "")
+                user_msg = RETRY_CONTINUE.format(goal=goal, unmet=unmet_text,
+                                                 feedback=verdict.feedback or verdict.summary())
+            if stalled:
+                user_msg += ("\n\nIMPORTANT: your last two attempts were nearly "
+                             "identical. Take a DIFFERENT approach this time.")
+            prev_answer = answer
         else:
-            unmet = verdict.unmet()
-            unmet_text = ("Unmet criteria:\n" + "\n".join(f"- {u}" for u in unmet)
-                          if unmet else "")
-            user_msg = RETRY_CONTINUE.format(goal=goal, unmet=unmet_text,
-                                             feedback=verdict.feedback or verdict.summary())
-        if stalled:
-            user_msg += ("\n\nIMPORTANT: your last two attempts were nearly "
-                         "identical. Take a DIFFERENT approach this time.")
-        prev_answer = answer
-    else:
-        ui.warn(f"hit max attempts ({max_attempts}) without meeting the goal")
-        if answer is not None:
-            # don't leave the user empty-handed — the last attempt is still
-            # the best artifact we have, just unverified
-            ws.save_artifact("final_output_UNVERIFIED.txt", answer)
+            ui.warn(f"hit max attempts ({max_attempts}) without meeting the goal")
+            if answer is not None:
+                # don't leave the user empty-handed — the last attempt is still
+                # the best artifact we have, just unverified
+                ws.save_artifact("final_output_UNVERIFIED.txt", answer)
+    except ui.QuitRequested:
+        attempt = max(attempt, 1)
+        ui.warn(f"quit requested — ending run during attempt {attempt}")
+        log.event("user_quit", attempt=attempt)
+        attempts.append({"attempt": attempt, "output": answer or "",
+                         "files": [], "passed": False,
+                         "verdict": "aborted by user (q)", "criteria": []})
+        if answer:
+            ws.save_artifact(f"attempt_{attempt}_ABORTED.txt", answer)
 
     ws.save_artifact("attempt_history.json", json.dumps(attempts, indent=2))
     from .report import write_report  # late import: report is optional plumbing

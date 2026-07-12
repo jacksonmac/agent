@@ -230,18 +230,30 @@ class Session:
 
     def __init__(self, model: str, system: str, tool_schemas: Optional[list],
                  think: bool = True, max_tool_rounds: int = 15,
-                 label: str = "llm", options: Optional[dict] = None):
+                 label: str = "llm", options: Optional[dict] = None,
+                 accept_user_messages: bool = False):
         self.model = model
         self.tool_schemas = tool_schemas
         self.think = think
         self.max_tool_rounds = max_tool_rounds
         self.label = label
         self.options = options
+        # only the executor opts in — reviewer/subagent sessions must not
+        # consume [m] messages meant for the main run
+        self.accept_user_messages = accept_user_messages
         self.messages: list = [{"role": "system", "content": system}]
         # only tools we actually advertised may run (the reviewer, for example,
         # gets a read-only subset — it must not be able to write files)
         self._allowed = {s["function"]["name"] for s in tool_schemas} if tool_schemas else set()
         self.last_tool_calls = 0  # how many tool calls the latest send() made
+
+    def inject_user_message(self, text: str) -> None:
+        """Mid-run [m] guidance from the user, delivered between tool rounds."""
+        self.messages.append({
+            "role": "user",
+            "content": "USER INTERJECTION (mid-run guidance — incorporate "
+                       "and continue): " + text,
+        })
 
     def _payload(self, with_tools: bool = True) -> dict:
         payload = {"model": self.model, "messages": self.messages,
@@ -265,8 +277,15 @@ class Session:
         self.last_tool_calls = 0
 
         for round_num in range(self.max_tool_rounds):
+            # safe point: the previous round's tools have fully executed and
+            # nothing is in flight — handle [p]/[m]/[o]/[q] keys here
+            ui.poll_controls()
+            if self.accept_user_messages:
+                for m in ui.drain_messages():
+                    self.inject_user_message(m)
             compact_messages(self.messages)
-            ui.context_tokens(estimate_tokens(self.messages), settings.num_ctx)
+            ui.context_tokens(estimate_tokens(self.messages), settings.num_ctx,
+                              label=self.label)
 
             msg = _post_chat(self._payload(with_tools=with_tools), label=self.label)
 
@@ -309,6 +328,7 @@ class Session:
                 })
 
         # Exhausted all rounds: one final call with no tools so it must answer in text
+        ui.poll_controls()
         ui.warn("hit max tool rounds, forcing final response")
         compact_messages(self.messages)
         msg = _post_chat(self._payload(with_tools=False), label=self.label)

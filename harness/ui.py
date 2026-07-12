@@ -12,25 +12,107 @@ region so they survive; the dashboard itself only shows current state.
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import json
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
+
+from .keys import KeyReader
 
 try:
     from rich.console import Console, Group
     from rich.live import Live
     from rich.markdown import Markdown
+    from rich.markup import escape as rich_escape
     from rich.panel import Panel
-    from rich.progress_bar import ProgressBar
-    from rich.spinner import Spinner
     from rich.syntax import Syntax
     from rich.table import Table
     from rich.text import Text
     HAVE_RICH = True
 except ImportError:  # rich is optional — the harness must still run without it
     HAVE_RICH = False
+
+
+@dataclasses.dataclass
+class ToolRow:
+    """One entry in the dashboard's tool timeline."""
+    name: str
+    args_short: str
+    status: str = "running"          # "running" | "done" | "error"
+    started: float = dataclasses.field(default_factory=time.monotonic)
+    duration: float | None = None    # set when the result arrives
+    diff_stat: str | None = None     # e.g. "+14 −2" for file writes/edits
+    depth: int = 0                   # 1 while running under a subagent
+    is_subagent_header: bool = False  # the "▸ subagent kind: task" row
+
+
+# which single argument best identifies a call in one timeline cell
+_ARG_KEYS = {"write_file": "name", "read_file": "name", "edit_file": "name",
+             "run_script": "name", "load_skill": "name", "run_shell": "command",
+             "grep_files": "pattern", "list_files": "path",
+             "spawn_subagent": "task", "web_search": "query", "fetch_page": "url"}
+
+
+def _short_args(name: str, arguments) -> str:
+    """The one argument a human wants to see for this tool (path, command,
+    query, …), falling back to compact JSON."""
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except ValueError:
+            pass
+    s = ""
+    if isinstance(arguments, dict):
+        if name == "run_python":
+            code_lines = str(arguments.get("code", "")).strip().splitlines()
+            s = code_lines[0] if code_lines else ""
+        else:
+            key = _ARG_KEYS.get(name)
+            s = str(arguments.get(key, "")) if key else ""
+    if not s:
+        s = arguments if isinstance(arguments, str) else _fmt_args(arguments)
+    return " ".join(s.split())[:80]
+
+
+def _context_bar(tokens: int, num_ctx: int, width: int = 40):
+    """Explicit block bar — rich's ProgressBar draws its empty track with the
+    same ━ glyph as the filled part, so an empty bar looked full."""
+    pct = (tokens / num_ctx) if num_ctx else 0
+    pct = max(0.0, min(pct, 1.0))
+    style = "red" if pct > 0.85 else ("yellow" if pct > 0.7 else "green")
+    filled = round(pct * width)
+    t = Text()
+    t.append("█" * filled, style=style)
+    t.append("░" * (width - filled), style="dim")
+    return t
+
+
+def _fmt_tok(n: int) -> str:
+    return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+
+_SPARK_GLYPHS = "▁▂▃▄▅▆▇█"
+
+
+def _spark(values, width: int = 8) -> str:
+    """Tiny block-glyph sparkline of the last `width` values; empty until
+    there are at least 2 points, flat midline when they're all equal."""
+    vals = list(values)[-width:]
+    if len(vals) < 2:
+        return ""
+    lo, hi = min(vals), max(vals)
+    if hi == lo:
+        return "▄" * len(vals)
+    return "".join(_SPARK_GLYPHS[round((v - lo) / (hi - lo) * 7)]
+                   for v in vals)
+
+
+# which phase() labels collapse to which run-rail name
+_RAIL_NAMES = {"planning": "plan", "executing": "exec", "reviewing": "review"}
 
 
 class _Dashboard:
@@ -45,12 +127,43 @@ class _Dashboard:
         self.phase_text = "starting"
         self.phase_started = time.monotonic()
         self.last_llm = ""
-        self.tokens = 0
-        self.tools: deque = deque(maxlen=8)
+        self.tokens = 0          # executor context (pinned bar)
+        self.other_label = ""    # reviewer/subagent/… while it's making calls
+        self.other_tokens = 0
+        self.tool_rows: deque[ToolRow] = deque(maxlen=10)
+        self.tool_history: list[ToolRow] = []  # full run, capped at 500
+        self.last_diff: tuple[str, str] | None = None  # (path, diff_text)
+        self.tool_count = 0
+        # path -> {"add", "rm", "edits"}: cumulative diff totals per file
+        self.files_touched: dict[str, dict] = {}
+        self.llm_calls = 0
+        self.llm_secs = 0.0
+        self.criteria_items: list = []   # {criterion, met, note} or bare str
+        self.criteria_source = ""
         self.todo_items: list = []
         self.stream_buf = ""
         self.stream_thinking = ""
         self.last_verdict: str | None = None
+        self.verdict_passed: bool | None = None
+        self.tint = "cyan"  # header accent: cyan running, red failed, green done
+        self.rail: list[list] = []       # [label, status] phase trail
+        self.burn: deque = deque(maxlen=6)  # (monotonic, tokens) samples
+        self.subagent: tuple | None = None  # (kind, task, started) while active
+        self.quiet = False               # [z]: collapse to a 2-line strip
+        self.run_started = time.monotonic()
+        self.llm_durs: deque = deque(maxlen=16)   # per-call secs → sparkline
+        self.pulse: deque = deque(maxlen=12)      # (monotonic, chars) stream chunks
+        self.trend: list = []                     # (met, total) per review
+        self.ctx_hist: deque = deque(maxlen=24)   # executor tokens → sawtooth
+        self.paused = False
+        self._transcript: deque[str] = deque()
+        self._transcript_len = 0
+        self._transcript_dropped = 0
+        # guards containers mutated on the main thread and iterated on the
+        # reader / Live-refresh threads (deques raise RuntimeError if they
+        # mutate mid-iteration, and neither rich's refresh thread nor our
+        # reader thread would survive that)
+        self._lock = threading.Lock()
         self.console = Console()
         # get_renderable (not a static renderable) so the 4 Hz background
         # refresh re-renders — that's what makes the phase clock tick
@@ -59,62 +172,366 @@ class _Dashboard:
         self.live.start()
 
     # ── rendering ────────────────────────────────────────────────────
+    @staticmethod
+    def _pair(a, b):
+        row = Table.grid(padding=(0, 1), expand=True)
+        row.add_column(ratio=1)
+        row.add_column(ratio=1)
+        row.add_row(a, b)
+        return row
+
     def _render(self):
-        header = Table.grid(padding=(0, 1))
-        header.add_column(style="bold", width=9)
-        header.add_column()
-        header.add_row("goal", Text(self.goal[:200], overflow="ellipsis"))
-        models = self.model if self.reviewer_model == self.model \
-            else f"{self.model}  (reviewer: {self.reviewer_model})"
-        header.add_row("model", models)
-        attempt = f"{self.attempt_n}/{self.max_attempts}" if self.attempt_n else "-"
-        header.add_row("attempt", attempt)
-        elapsed = int(time.monotonic() - self.phase_started)
-        header.add_row("phase", Spinner("dots", text=Text(
-            f" {self.phase_text} · {elapsed // 60}:{elapsed % 60:02d}")))
-        if self.last_llm:
-            header.add_row("last call", Text(self.last_llm, style="dim"))
-
-        bar = Table.grid(padding=(0, 1))
-        bar.add_column(width=9)
-        bar.add_column(ratio=1)
-        bar.add_column(justify="right")
-        pct = self.tokens / self.num_ctx if self.num_ctx else 0
-        style = "red" if pct > 0.85 else ("yellow" if pct > 0.7 else "green")
-        bar.add_row("context",
-                    ProgressBar(total=self.num_ctx, completed=self.tokens,
-                                complete_style=style),
-                    f"~{self.tokens} / {self.num_ctx} tok")
-
-        parts = [Panel(header, border_style="dim"), bar]
-        if self.tools:
-            tool_text = Text("\n".join(self.tools), no_wrap=True, overflow="ellipsis")
-            parts.append(Panel(tool_text, title="recent tools",
-                               title_align="left", border_style="dim"))
-        if self.stream_buf or self.stream_thinking:
-            stream_text = Text()
-            if self.stream_thinking:
-                stream_text.append(self.stream_thinking, style="dim italic")
-                if self.stream_buf:
-                    stream_text.append("\n")
-            stream_text.append(self.stream_buf)
-            parts.append(Panel(stream_text, title="streaming", title_align="left",
-                               border_style="dim"))
-        if self.todo_items:
-            todo_text = Text()
-            for i, t in enumerate(self.todo_items):
-                mark = {"pending": "[ ]", "in_progress": "[>]", "done": "[x]"}[t["status"]]
-                style = "dim" if t["status"] == "done" else \
-                    ("bold" if t["status"] == "in_progress" else "")
-                todo_text.append(f"{mark} {t['text']}", style=style)
-                if i < len(self.todo_items) - 1:
-                    todo_text.append("\n")
-            parts.append(Panel(todo_text, title="todos", title_align="left",
-                               border_style="dim"))
-        if self.last_verdict:
-            parts.append(Panel(Text(self.last_verdict[:500]), title="last verdict",
-                               title_align="left", border_style="dim"))
+        input_line = self._render_input_line()
+        if self.quiet:  # [z]: just the status strip and the input line
+            parts = [self._render_status_line()]
+            if input_line is not None:
+                parts.append(input_line)
+            return Group(*parts)
+        parts = [self._render_header()]  # context bars live inside the header
+        wide = self.console.width >= 110
+        timeline = self._render_timeline()
+        stream = self._render_stream()
+        if wide and timeline is not None and stream is not None:
+            parts.append(self._pair(timeline, stream))
+        else:
+            parts.extend(p for p in (timeline, stream) if p is not None)
+        lane = self._render_subagent()
+        if lane is not None:
+            parts.append(lane)
+        files = self._render_files()
+        plan = self._render_plan(wide and files is None)
+        if wide and plan is not None and files is not None:
+            parts.append(self._pair(plan, files))
+        else:
+            parts.extend(p for p in (plan, files) if p is not None)
+        if input_line is not None:
+            parts.append(input_line)
         return Group(*parts)
+
+    def _render_subagent(self):
+        """Mini-panel for a running subagent: task, clock, and its context."""
+        if self.subagent is None:
+            return None
+        kind, task, started = self.subagent
+        el = int(time.monotonic() - started)
+        frame = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.monotonic() * 10) % 10]
+        body = Text(no_wrap=True, overflow="ellipsis")
+        body.append(f"{frame} ", style="cyan")
+        body.append(" ".join(task.split())[:100])
+        body.append(f"  {el // 60}:{el % 60:02d}", style="dim")
+        if self.other_label:  # its session is mid-call: show its context
+            body.append(" · ctx ", style="dim")
+            body.append_text(_context_bar(self.other_tokens, self.num_ctx,
+                                          width=6))
+            pct = round(100 * self.other_tokens / self.num_ctx) \
+                if self.num_ctx else 0
+            body.append(f" {pct}%", style="dim")
+        return Panel(body, title=f"subagent · {kind}", title_align="left",
+                     border_style="cyan")
+
+    def _render_files(self):
+        """Cumulative per-file diff totals, fed by ui.diff()."""
+        with self._lock:  # diff()/tool() mutate this on the main thread
+            items = list(self.files_touched.items())
+        if not items:
+            return None
+        grid = Table.grid(padding=(0, 1))
+        grid.add_column(ratio=1, no_wrap=True)  # path
+        grid.add_column(justify="right")        # +n −m
+        grid.add_column(justify="right")        # per-edit churn sparkline
+        grid.add_column(justify="right")        # edit count
+        for path, st in items[-8:]:
+            stat = Text()
+            stat.append(f"+{st['add']}", style="green")
+            stat.append(f" −{st['rm']}", style="red")
+            n = st["edits"]
+            grid.add_row(Text(path, overflow="ellipsis"), stat,
+                         Text(_spark(st.get("hist", [])), style="cyan"),
+                         Text(f"{n} edit{'s' if n != 1 else ''}", style="dim"))
+        return Panel(grid, title="files", title_align="left",
+                     border_style="dim")
+
+    def _render_input_line(self):
+        st = _state
+        if st is None:
+            return None
+        if not st.focused:
+            if self.quiet:
+                return Text("› message the agent · [m] type · [z] expand",
+                            style="blue")  # blue ≠ the cyan accents
+            return Text(
+                "› message the agent — [m] to type · [p]ause [o]transcript "
+                "[t]ools [d]iff [q]uit [z]quiet", style="blue")
+        # focused: a bordered composer box — the buffer wraps instead of
+        # truncating, so longer instructions stay readable while typing
+        body = Text(st.buffer)  # single reference read: safe without the lock
+        body.append("█", style="cyan")
+        return Panel(body, title="message", title_align="left",
+                     subtitle=Text("Enter send · Esc cancel", style="dim"),
+                     subtitle_align="right", border_style="cyan")
+
+    def _render_header(self):
+        grid = Table.grid(padding=(0, 1))
+        grid.add_column(ratio=1)
+        grid.add_row(Text(self.goal[:200], overflow="ellipsis"))
+        grid.add_row(self._render_status_line())
+        title = Text(f"agent · {self.model}", style="bold")
+        if self.reviewer_model != self.model:
+            title.append(f"  (reviewer: {self.reviewer_model})",
+                         style="dim not bold")
+        return Panel(grid, title=title, title_align="left",
+                     border_style="yellow" if self.paused else self.tint)
+
+    def _render_status_line(self):
+        """One dense line: run rail (the actual plan→exec→review trail) ·
+        context · run stats. Per-call llm timing lives behind [t]."""
+        line = Text(no_wrap=True, overflow="ellipsis")
+        elapsed = int(time.monotonic() - self.phase_started)
+        if self.paused:
+            line.append("PAUSED", style="bold yellow")
+            line.append(" — any key resumes · [m] message · [q] quit",
+                        style="yellow")
+            return line
+        frame = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.monotonic() * 10) % 10]
+        line.append(f"{frame} ", style="cyan")
+        if self.rail:
+            shown = self.rail[-5:]
+            if len(self.rail) > 5:
+                line.append("… ", style="dim")
+            for i, (label, status) in enumerate(shown):
+                if i:
+                    line.append(" · ", style="dim")
+                if status == "running":
+                    line.append(f"{label} ")
+                    line.append(f"{elapsed // 60}:{elapsed % 60:02d}",
+                                style="cyan")
+                else:
+                    line.append(f"{label} ", style="dim")
+                    if status == "fail":
+                        line.append("✗", style="red")
+                    else:  # done / pass
+                        line.append("✓", style="green")
+        else:  # before the first phase() lands
+            line.append(f"{self.phase_text} {elapsed // 60}:{elapsed % 60:02d}")
+        if self.attempt_n:
+            line.append(f"  attempt {self.attempt_n}/{self.max_attempts}",
+                        style="dim")
+        line.append(" · ", style="dim")
+        line.append_text(self._render_context_bar())
+        if len(self.llm_durs) >= 2:
+            line.append(" · llm ", style="dim")
+            line.append(_spark(self.llm_durs), style="cyan")
+        if self.tool_count or self.llm_calls:
+            line.append(
+                f" · tools {self.tool_count} · files {len(self.files_touched)}",
+                style="dim")
+        return line
+
+    def _render_context_bar(self):
+        """Inline context fragment for the status line: pinned executor bar
+        as a percentage, plus a transient reviewer/subagent bar. Exact token
+        counts moved behind [t]."""
+        def pct(tokens):
+            return round(100 * tokens / self.num_ctx) if self.num_ctx else 0
+        bar = Text(no_wrap=True, overflow="ellipsis")
+        label = "executor" if self.other_label else "ctx"
+        bar.append(f"{label} ", style="dim")
+        bar.append_text(_context_bar(self.tokens, self.num_ctx, width=10))
+        bar.append(f" {pct(self.tokens)}%", style="dim")
+        sawtooth = _spark(self.ctx_hist, width=6)
+        if sawtooth:  # whole-run shape: compaction dips become visible
+            bar.append(f" {sawtooth}", style="cyan")
+        if len(self.burn) >= 2:  # trend + time-to-full from recent samples
+            (t0, k0), (t1, k1) = self.burn[0], self.burn[-1]
+            if t1 - t0 > 1 and k1 > k0:
+                rate = (k1 - k0) / (t1 - t0) * 60  # tokens/min
+                bar.append(f" ↗ {_fmt_tok(round(rate))}/min", style="yellow")
+                if self.num_ctx > k1:
+                    eta = (self.num_ctx - k1) / rate
+                    bar.append(f" · full ~{max(1, round(eta))}m", style="dim")
+        if self.other_label:  # while reviewer/subagent/… is making calls
+            bar.append(f" · {self.other_label} ", style="cyan")
+            bar.append_text(_context_bar(self.other_tokens, self.num_ctx,
+                                         width=6))
+            bar.append(f" {pct(self.other_tokens)}%", style="dim")
+        return bar
+
+    def _render_timeline(self):
+        with self._lock:  # snapshot: ui.tool() appends on the main thread
+            rows = list(self.tool_rows)
+            earlier = len(self.tool_history) - len(rows)
+            recent = self.tool_history[-24:]
+        if not rows:
+            return None
+        # cadence ticker: one tick per recent finished call — error clusters
+        # and bursts read as texture without taking a row
+        title = Text("tools")
+        ticks = [r.status for r in recent if r.status != "running"]
+        if len(ticks) >= 2:
+            title.append(" · ", style="dim")
+            for s in ticks:
+                if s == "error":
+                    title.append("✗", style="red")
+                else:
+                    title.append("·", style="dim")
+        grid = Table.grid(padding=(0, 1))
+        grid.add_column(width=1)                # status glyph
+        grid.add_column(ratio=1, no_wrap=True)  # name + args
+        grid.add_column(justify="right")        # duration
+        grid.add_column()                       # diff stat
+        # the 4 Hz get_renderable refresh animates this frame for free
+        frame = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.monotonic() * 10) % 10]
+        for row in rows:
+            if row.status == "done":
+                glyph = Text("✓", style="green")
+            elif row.status == "error":
+                glyph = Text("✗", style="bold red")
+            else:
+                glyph = Text(frame, style="yellow")
+            body = Text(no_wrap=True, overflow="ellipsis")
+            if row.is_subagent_header:
+                glyph = glyph if row.status != "running" else Text("▸", style="magenta")
+                body.append(f"subagent {row.args_short}", style="bold")
+            else:
+                if row.depth:
+                    body.append("└ ", style="dim")
+                body.append(row.name)
+                if row.args_short:
+                    body.append(f" {row.args_short}", style="dim")
+            if row.duration is not None:
+                dur = Text(f"{row.duration:.1f}s", style="dim")
+            else:
+                dur = Text(f"{time.monotonic() - row.started:.0f}s",
+                           style="dim yellow")
+            diff_cell = Text()
+            if row.diff_stat:
+                added, _, removed = row.diff_stat.partition(" ")
+                diff_cell.append(added, style="green")
+                if removed:
+                    diff_cell.append(f" {removed}", style="red")
+            grid.add_row(glyph, body, dur, diff_cell)
+        if earlier > 0:
+            grid.add_row(Text(""),
+                         Text(f"{earlier} earlier calls · [t] expand",
+                              style="blue"), Text(""), Text(""))
+        return Panel(grid, title=title, title_align="left", border_style="dim")
+
+    def _render_stream(self):
+        """Fixed-height tail: one collapsed thinking line, a rule, and the
+        last few wrapped lines of output — the panel stops changing height
+        as chunks arrive."""
+        if not (self.stream_buf or self.stream_thinking):
+            return None
+        # in the wide layout this panel shares a row with the timeline, so
+        # wrap to the column it actually gets, not the full console
+        half = self.console.width >= 110 and bool(self.tool_rows)
+        width = max(20, (self.console.width // 2 if half
+                         else self.console.width) - 8)
+        stream_text = Text(no_wrap=True, overflow="ellipsis")
+        if self.stream_thinking:
+            squashed = " ".join(self.stream_thinking.split())
+            tail = squashed[-(width - 12):]
+            if len(squashed) > width - 12:
+                tail = "…" + tail[1:]
+            stream_text.append(f"⋯ thinking: {tail}\n", style="dim italic")
+            stream_text.append("─" * width + "\n", style="dim")
+        rows: list[str] = []
+        for ln in self.stream_buf.splitlines():
+            rows.extend([ln[i:i + width] for i in range(0, len(ln), width)]
+                        or [""])
+        stream_text.append("\n".join(rows[-4:]))
+        # pulse: chunk arrival rate in the title; a flatlining generation
+        # (the LAN box about to drop the connection) reads as "stalled"
+        title = Text("streaming")
+        with self._lock:
+            samples = list(self.pulse)
+        if len(samples) >= 2:
+            age = time.monotonic() - samples[-1][0]
+            shape = _spark([c for _, c in samples], width=6)
+            if age > 2:
+                title.append(f" · {shape} · stalled {int(age)}s",
+                             style="yellow")
+            else:
+                dt = samples[-1][0] - samples[0][0]
+                title.append(" · ", style="dim")
+                title.append(shape, style="cyan")
+                if dt > 1:  # need a real window or the rate is noise
+                    rate = sum(c for _, c in samples) / dt / 4  # chars→tok
+                    title.append(f" · ~{rate:.0f} tok/s", style="dim")
+        # a Text, not a str — "[o]" would otherwise be parsed as rich markup
+        subtitle = Text("[o] full transcript", style="not dim blue") \
+            if _state is not None else None
+        return Panel(stream_text, title=title, title_align="left",
+                     subtitle=subtitle, subtitle_align="right",
+                     border_style="dim")
+
+    def _render_criteria(self):
+        if not self.criteria_items:
+            return None
+        text = Text()
+        for i, c in enumerate(self.criteria_items):
+            if isinstance(c, dict):
+                if c.get("met"):
+                    text.append("✓ ", style="green")
+                    text.append(str(c.get("criterion", "?")))
+                else:
+                    text.append("✗ ", style="red")
+                    text.append(str(c.get("criterion", "?")))
+                    note = c.get("note", "")
+                    src = self.criteria_source
+                    annot = " · ".join(s for s in (note, src) if s)
+                    if annot:
+                        text.append(f"  ← {annot[:80]}", style="dim")
+            else:  # bare string: not yet reviewed
+                text.append("○ ", style="dim")
+                text.append(str(c), style="dim")
+            if i < len(self.criteria_items) - 1:
+                text.append("\n")
+        return text
+
+    def _render_todos(self):
+        if not self.todo_items:
+            return None
+        todo_text = Text()
+        for i, t in enumerate(self.todo_items):
+            mark = {"pending": "[ ]", "in_progress": "[>]", "done": "[x]"}[t["status"]]
+            style = "dim" if t["status"] == "done" else \
+                ("bold" if t["status"] == "in_progress" else "")
+            todo_text.append(f"{mark} {t['text']}", style=style)
+            if i < len(self.todo_items) - 1:
+                todo_text.append("\n")
+        return todo_text
+
+    def _render_plan(self, wide: bool = False):
+        """One panel for criteria + todos (side by side when wide) with the
+        last verdict folded in as a single line — it already prints to
+        scrollback when it happens, so it doesn't need its own panel."""
+        crit = self._render_criteria()
+        todo = self._render_todos()
+        if crit is None and todo is None and not self.last_verdict:
+            return None
+        if wide and crit is not None and todo is not None:
+            body = self._pair(crit, todo)
+        else:
+            body = Group(*(p for p in (crit, todo) if p is not None))
+        parts = [body]
+        if self.last_verdict:
+            tag = "PASSED" if self.verdict_passed else "FAILED"
+            summary = " ".join(self.last_verdict[:200].split())
+            parts.append(Text(f"review: {tag} — {summary}",
+                              style="green" if self.verdict_passed else "red",
+                              no_wrap=True, overflow="ellipsis"))
+        title = Text("plan")
+        if len(self.trend) >= 2:  # is the retry loop converging or stuck?
+            stuck = self.trend[-1][0] == self.trend[-2][0]
+            title.append(" · ", style="dim")
+            title.append(_spark([m for m, _ in self.trend]),
+                         style="yellow" if stuck else "cyan")
+            title.append(" " + " → ".join(f"{m}/{t}"
+                                          for m, t in self.trend[-3:]),
+                         style="dim")
+        return Panel(Group(*parts), title=title, title_align="left",
+                     border_style="dim")
 
     def stream_add(self, text: str, thinking: bool) -> None:
         # a live tail, not a transcript — keep only the newest chunk
@@ -122,11 +539,38 @@ class _Dashboard:
             self.stream_thinking = (self.stream_thinking + text)[-600:]
         else:
             self.stream_buf = (self.stream_buf + text)[-1200:]
+        # ...but ALSO keep the full stream for [o], capped so a runaway
+        # generation can't eat memory (thinking included — it's often the
+        # part the user wants to scroll back through)
+        with self._lock:
+            self.pulse.append((time.monotonic(), len(text)))
+            self._transcript.append(text)
+            self._transcript_len += len(text)
+            while self._transcript_len > 200_000 and self._transcript:
+                dropped = self._transcript.popleft()
+                self._transcript_len -= len(dropped)
+                self._transcript_dropped += len(dropped)
         self.refresh()
+
+    def transcript_text(self) -> str:
+        with self._lock:  # [o] runs on the reader thread mid-stream
+            body = "".join(self._transcript)
+            dropped = self._transcript_dropped
+        if dropped:
+            return f"[… {dropped} chars dropped …]\n{body}"
+        return body
+
+    def transcript_reset(self) -> None:
+        with self._lock:
+            self._transcript.clear()
+            self._transcript_len = 0
+            self._transcript_dropped = 0
 
     def stream_clear(self) -> None:
         self.stream_buf = ""
         self.stream_thinking = ""
+        with self._lock:  # stale samples would read as "stalled" next stream
+            self.pulse.clear()
         self.refresh()
 
     def refresh(self):
@@ -144,7 +588,163 @@ class _Dashboard:
 
 _dash: _Dashboard | None = None
 tool_prefix = ""  # set to "  └ " while a subagent runs, so its tools read nested
+_subagent_depth = 0  # dashboard timeline nesting for the same situation
 _streamed_recently = False  # plain mode: answer()/thinking() skip the re-print
+
+_keys: KeyReader | None = None  # live only alongside _dash, and only when stdin is a TTY
+
+
+class QuitRequested(Exception):
+    """User pressed [q] — run.py catches this and finalizes the run."""
+
+
+class ControlState:
+    """All cross-thread interactive state, guarded by one Condition. The
+    reader thread mutates it; safe points (poll_controls/drain_messages)
+    and the 4 Hz render read it."""
+
+    def __init__(self):
+        self.cond = threading.Condition()
+        self.focused = False        # [m] pressed: keys go to the input line
+        self.buffer = ""            # the docked input line's contents
+        self.paused = False
+        self.quit_requested = False
+        self.pending_msgs: list[str] = []
+
+
+_state: ControlState | None = None
+_input_thread: "_InputThread | None" = None
+
+
+def _feed_key(state: ControlState, ch: str, dash=None) -> None:
+    """Per-key state machine — the reader thread calls this in production;
+    tests call it directly. Never raises, never blocks; o/t/d printing
+    happens outside the lock."""
+    action = None
+    with state.cond:
+        if state.focused:
+            if ch in ("\r", "\n"):
+                text = state.buffer.strip()
+                if text:
+                    state.pending_msgs.append(text)
+                    action = "queued"
+                    if state.paused:
+                        # delivery happens before the next model call, and
+                        # pause blocks exactly there — a queued message that
+                        # stayed paused would never arrive
+                        state.paused = False
+                        if dash is not None:
+                            dash.paused = False
+                state.focused = False
+                state.buffer = ""
+            elif ch in ("\x7f", "\x08"):
+                state.buffer = state.buffer[:-1]
+            elif ch == "\x1b":  # lone Esc: cancel
+                state.focused = False
+                state.buffer = ""
+            elif ch.isprintable():
+                state.buffer += ch  # case preserved
+        else:
+            c = ch.lower()
+            if c == "m":
+                state.focused = True
+                state.buffer = ""
+            elif c == "q":
+                state.quit_requested = True
+            elif c == "p":
+                state.paused = not state.paused
+                if dash is not None:
+                    dash.paused = state.paused
+            elif c == "o":
+                action = "transcript"
+            elif c == "t":
+                action = "tools"
+            elif c == "d":
+                action = "diff"
+            elif c == "z":
+                if dash is not None:
+                    dash.quiet = not dash.quiet
+            elif state.paused and ch.isprintable():
+                state.paused = False  # any other key resumes
+                if dash is not None:
+                    dash.paused = False
+        state.cond.notify_all()
+    if dash is not None:
+        if action == "queued":
+            dash.print(Text("message queued — delivered before the next "
+                            "model call", style="dim"))
+        elif action == "transcript":
+            _show_transcript()
+        elif action == "tools":
+            _show_tool_history()
+        elif action == "diff":
+            _show_last_diff()
+        dash.refresh()
+
+
+class _InputThread(threading.Thread):
+    """Owns all stdin consumption while the dashboard is live. park() hands
+    stdin to a cooked-mode input() (permission prompts) and blocks until the
+    thread is provably idle; unpark() resumes reading."""
+
+    def __init__(self, source, state: ControlState):
+        super().__init__(daemon=True, name="ui-input")
+        self._source = source  # anything with read_token(timeout) -> str|None
+        self._state = state
+        self._running = True
+        self._park_req = threading.Event()
+        self._parked = threading.Event()
+
+    def run(self):
+        warned = False
+        while self._running:
+            if self._park_req.is_set():
+                self._parked.set()
+                time.sleep(0.05)
+                continue
+            try:
+                tok = self._source.read_token(timeout=0.1)
+                if tok is not None:
+                    _feed_key(self._state, tok, _dash)
+            except Exception as e:
+                # the thread must outlive any single bad keystroke — a dead
+                # reader means [q]/[p] silently stop working for the run
+                if not warned and _dash is not None:
+                    warned = True
+                    with contextlib.suppress(Exception):
+                        _dash.print(Text(f"[WARNING] input thread error: {e}",
+                                         style="bold yellow"))
+                time.sleep(0.1)
+
+    def park(self):
+        self._park_req.set()
+        self._parked.wait(timeout=2.0)
+
+    def unpark(self):
+        self._park_req.clear()
+        self._parked.clear()
+
+    def stop(self):
+        self._running = False
+        self._park_req.clear()
+        if self.is_alive():
+            self.join(timeout=1.0)
+
+
+@contextlib.contextmanager
+def _stdin_handoff():
+    """Exclusive cooked-mode stdin for console.input: park the reader
+    thread, then cook the tty; reverse on exit. Keys pressed before the
+    prompt were already consumed live, so nothing leaks into the answer."""
+    if _input_thread is None or _keys is None:
+        yield
+        return
+    _input_thread.park()
+    try:
+        with _keys.suspend():
+            yield
+    finally:
+        _input_thread.unpark()
 
 
 def _fmt_args(arguments) -> str:
@@ -166,19 +766,142 @@ def start(goal: str, model: str, reviewer_model: str | None,
     if not Console().is_terminal:
         return  # piped/captured output (evals, pytest): stay line-oriented
     _dash = _Dashboard(goal, model, reviewer_model or model, max_attempts, num_ctx)
+    _set_title(f"agent · {model}")
+    global _keys, _state, _input_thread
+    if sys.stdin.isatty():  # stdout being a TTY doesn't guarantee stdin is
+        _keys = KeyReader()
+        _keys.start()
+        _state = ControlState()
+        _input_thread = _InputThread(_keys, _state)
+        _input_thread.start()
 
 
 def stop() -> None:
-    global _dash
+    global _dash, _keys, _state, _input_thread, _subagent_depth
+    _subagent_depth = 0
+    # order matters: reader thread first, so nothing touches stdin while
+    # termios is being restored
+    if _input_thread is not None:
+        _input_thread.stop()
+        _input_thread = None
+    if _keys is not None:
+        _keys.stop()
+        _keys = None
+    _state = None
     if _dash is not None:
+        _set_title("")  # hand the tab title back to the shell
         _dash.stop()
         _dash = None
+
+
+# ── interactive controls ([m] focus / [p]ause / [o][t][d] / [q]uit) ──
+#
+# The reader thread consumes keys continuously (live echo in the docked
+# input line); quit/pause/messages still take effect only at safe points
+# (between tool rounds, between phases). In plain mode _state is None and
+# everything here is a no-op, so pytest/evals/pipes behave as before.
+
+def poll_controls() -> None:
+    """Safe-point check — no stdin I/O. May raise QuitRequested; blocks
+    while paused (the PAUSED banner keeps rendering meanwhile)."""
+    if _state is None:
+        return
+    with _state.cond:
+        while True:
+            if _state.quit_requested:
+                _state.quit_requested = False
+                if _dash:
+                    _dash.paused = False
+                raise QuitRequested()
+            if not _state.paused:
+                break
+            if _dash:
+                _dash.paused = True
+            _state.cond.wait(timeout=0.25)
+    if _dash:
+        _dash.paused = False
+
+
+def drain_messages() -> list[str]:
+    """Queued messages, cleared on read. Empty in plain mode."""
+    if _state is None:
+        return []
+    with _state.cond:
+        msgs, _state.pending_msgs = _state.pending_msgs, []
+        return msgs
+
+
+def _show_tool_history() -> None:
+    if _dash is None:
+        return
+    with _dash._lock:  # runs on the reader thread while tools execute
+        rows = list(_dash.tool_history)
+    if not rows:
+        _dash.print(Text("no tool calls yet", style="dim"))
+        return
+    text = Text()
+    for i, r in enumerate(rows):
+        glyph = {"done": "✓", "error": "✗"}.get(r.status, "…")
+        prefix = "▸ subagent " if r.is_subagent_header else \
+            ("└ " if r.depth else "")
+        dur = f" {r.duration:.1f}s" if r.duration is not None else ""
+        stat = f" {r.diff_stat}" if r.diff_stat else ""
+        text.append(f"{glyph} {prefix}{r.name} {r.args_short}{dur}{stat}")
+        if i < len(rows) - 1:
+            text.append("\n")
+    # llm stats live here now instead of a pinned header row
+    text.append(f"\ncontext {_fmt_tok(_dash.tokens)}/{_fmt_tok(_dash.num_ctx)}"
+                f" · llm {_dash.llm_calls} calls · {_dash.llm_secs:.0f}s",
+                style="dim")
+    if len(_dash.llm_durs) >= 2:
+        text.append(" · ", style="dim")
+        text.append(_spark(_dash.llm_durs), style="cyan")
+    if _dash.last_llm:
+        text.append(f" · last {_dash.last_llm}", style="dim")
+    wall = time.monotonic() - _dash.run_started
+    if wall > 1:  # where the run's life went: generating, tools, or other
+        tool_secs = sum(r.duration for r in rows if r.duration)
+        lp = min(100, round(100 * _dash.llm_secs / wall))
+        tp = min(100 - lp, round(100 * tool_secs / wall))
+        text.append(f"\nspent llm {lp}% · tools {tp}% · other {100 - lp - tp}%",
+                    style="dim")
+    _dash.print(Panel(text, title=f"tool history — {len(rows)} calls",
+                      title_align="left", border_style="dim"))
+
+
+def _show_last_diff() -> None:
+    if _dash is None:
+        return
+    if _dash.last_diff is None:
+        _dash.print(Text("no diff yet", style="dim"))
+        return
+    path, diff_text = _dash.last_diff
+    lines = diff_text.splitlines()
+    shown = "\n".join(lines[:80])
+    if len(lines) > 80:
+        shown += f"\n… {len(lines) - 80} more lines"
+    _dash.print(Panel(Syntax(shown, "diff", background_color="default"),
+                      title=path, title_align="left", border_style="dim"))
+
+
+def _show_transcript() -> None:
+    if _dash is None:
+        return
+    body = _dash.transcript_text()
+    if not body:
+        _dash.print(Text("transcript is empty (nothing streamed yet)", style="dim"))
+        return
+    # printed above the Live region, so the terminal's own scrollback keeps it
+    _dash.print(Panel(Text(body), title=f"transcript — attempt {_dash.attempt_n}",
+                      title_align="left", border_style="dim"))
 
 
 # ── state updates (dashboard region) ────────────────────────────────
 
 def attempt(n: int, total: int) -> None:
     if _dash:
+        if n != _dash.attempt_n:
+            _dash.transcript_reset()
         _dash.attempt_n = n
         _dash.max_attempts = total
         _dash.refresh()
@@ -186,10 +909,30 @@ def attempt(n: int, total: int) -> None:
         print(f"\n=== EXECUTING (attempt {n}/{total}) ===")
 
 
+def _set_title(text: str) -> None:
+    """Mirror run state into the terminal tab title. Best effort."""
+    if _dash is not None:
+        with contextlib.suppress(Exception):
+            _dash.console.set_window_title(text)
+
+
 def phase(label: str) -> None:
     if _dash:
         _dash.phase_text = label
         _dash.phase_started = time.monotonic()
+        # a new phase means the run is actively working again — the red/green
+        # verdict tint is scoped to the window between verdict and next phase
+        _dash.tint = "cyan"
+        # extend the run rail: previous phase is finished, this one runs
+        word = label.split()[0].rstrip(":").lower() if label.split() else label
+        if _dash.rail and _dash.rail[-1][1] == "running":
+            _dash.rail[-1][1] = "done"
+        _dash.rail.append([_RAIL_NAMES.get(word, word), "running"])
+        del _dash.rail[:-30]  # bound memory on very long runs
+        title = f"{label} · agent"
+        if _dash.attempt_n:
+            title = f"{label} {_dash.attempt_n}/{_dash.max_attempts} · agent"
+        _set_title(title)
         _dash.refresh()
     else:
         print(f"--- {label} ---")
@@ -201,33 +944,69 @@ def llm_stats(label: str, secs: float, prompt_tokens, eval_tokens) -> None:
     line = f"[{label}] {secs:.1f}s · {tok}"
     if _dash:
         _dash.last_llm = line
+        _dash.llm_calls += 1
+        _dash.llm_secs += secs
+        _dash.llm_durs.append(secs)
         _dash.refresh()
     else:
         print(f"  {line}")
 
 
-def context_tokens(estimate: int, num_ctx: int) -> None:
+def context_tokens(estimate: int, num_ctx: int, label: str = "executor") -> None:
     if _dash:
-        _dash.tokens = estimate
         _dash.num_ctx = num_ctx
+        if label == "executor":
+            # the pinned bar; an executor call also means any reviewer/
+            # subagent session finished, so its transient row goes away
+            _dash.tokens = estimate
+            _dash.burn.append((time.monotonic(), estimate))
+            _dash.ctx_hist.append(estimate)
+            _dash.other_label = ""
+        else:
+            _dash.other_label = label
+            _dash.other_tokens = estimate
         _dash.refresh()
     else:
         print(f"  [context ~{estimate} tokens / {num_ctx}]")
 
 
 def tool(name: str, arguments) -> None:
-    args_s = _fmt_args(arguments)
     if _dash:
-        _dash.tools.append(f"{tool_prefix}{name}({args_s[:120]})")
+        row = ToolRow(name, _short_args(name, arguments),
+                      depth=_subagent_depth)
+        with _dash._lock:
+            _dash.tool_rows.append(row)
+            _dash.tool_history.append(row)
+            if len(_dash.tool_history) > 500:
+                del _dash.tool_history[0]
+            _dash.tool_count += 1
+        # files_touched is populated by diff()/file_created() using the real
+        # path — not seeded here, which would key it by the truncated
+        # args_short and leave a phantom "+0 −0" row when no diff follows
+        # (new-file writes, no-op edits)
         _dash.refresh()
     else:
+        args_s = _fmt_args(arguments)
         print(f"  {tool_prefix}[tool call] {name}({args_s[:200]})")
+
+
+def _last_running_row() -> ToolRow | None:
+    """Rightmost still-running row. Caller must hold _dash._lock. Searches
+    the full history, not just the visible deque — a subagent header that
+    scrolled off the 10-row window must still be completable."""
+    for row in reversed(_dash.tool_history):
+        if row.status == "running":
+            return row
+    return None
 
 
 def tool_result(text: str) -> None:
     if _dash:
-        if _dash.tools:
-            _dash.tools[-1] += f" -> {' '.join(text[:80].split())}"
+        with _dash._lock:
+            row = _last_running_row()
+            if row is not None:
+                row.duration = time.monotonic() - row.started
+                row.status = "error" if text.startswith("[ERROR]") else "done"
         _dash.refresh()
     else:
         print(f"  [tool result] {text[:300]}")
@@ -253,6 +1032,26 @@ def stream_end() -> None:
         sys.stdout.flush()
 
 
+def criteria(items: list, source: str = "") -> None:
+    """Success-criteria checklist. Items are reviewer dicts
+    {criterion, met, note} or bare strings (not yet reviewed → pending)."""
+    if _dash:
+        _dash.criteria_items = list(items)
+        _dash.criteria_source = source
+        if any(isinstance(c, dict) for c in items):  # a review happened
+            met = sum(1 for c in items if isinstance(c, dict) and c.get("met"))
+            _dash.trend.append((met, len(items)))
+            del _dash.trend[:-8]
+        _dash.refresh()
+    else:
+        for c in items:
+            if isinstance(c, dict):
+                mark = "met" if c.get("met") else "unmet"
+                print(f"  [criterion] {c.get('criterion', '?')}: {mark}")
+            else:
+                print(f"  [criterion] {c}: pending")
+
+
 def todos(items: list) -> None:
     if _dash:
         _dash.todo_items = list(items)
@@ -270,10 +1069,14 @@ def confirm(prompt: str) -> str:
     try:
         if _dash:
             # pause the live region: input during its background refresh
-            # garbles the prompt line
+            # garbles the prompt line. _stdin_handoff parks the reader
+            # thread so console.input owns stdin exclusively.
             _dash.live.stop()
             try:
-                ans = _dash.console.input(f"[bold yellow]{full}[/bold yellow]")
+                with _stdin_handoff():
+                    # escape: "[y]es" would otherwise be eaten as markup tags
+                    ans = _dash.console.input(
+                        f"[bold yellow]{rich_escape(full)}[/bold yellow]")
             finally:
                 _dash.live.start()
                 _dash.refresh()
@@ -285,21 +1088,87 @@ def confirm(prompt: str) -> str:
     return ans if ans in ("y", "n", "a") else "n"
 
 
+def confirm_tool(tool_name: str, detail: str, context: str = "",
+                 command_scope: str | None = None) -> str:
+    """Permission card for a gated tool call. Shows the full detail (command/
+    code) untruncated in a panel, plus a dim context line. Returns 'y', 'n',
+    'a' or — only when command_scope is given — 'c' (always allow this base
+    command for the rest of the run). Anything else is a deny."""
+    opts = "[y]es · [n]o · [a]lways this run"
+    if command_scope:
+        opts += f" · [c] always for '{command_scope}'"
+    try:
+        if _dash:
+            _dash.live.stop()
+            try:
+                body = Text(detail[:2000])
+                if command_scope:  # the part that earned the prompt, in red
+                    body.highlight_words([command_scope], style="bold red")
+                if context:
+                    body.append(f"\n{context}", style="dim")
+                body.append("\n\n  ")
+                body.append("[y]", style="bold green")
+                body.append(" allow once        ")
+                body.append("[a]", style="bold cyan")
+                body.append(" always this run\n  ")
+                body.append("[n]", style="bold red")
+                body.append(" deny")
+                if command_scope:
+                    body.append("              ")
+                    body.append("[c]", style="bold cyan")
+                    body.append(f" always for '{command_scope}'")
+                _dash.print(Panel(body, title=f"permission · {tool_name}",
+                                  title_align="left", border_style="yellow"))
+                with _stdin_handoff():
+                    ans = _dash.console.input(
+                        "[bold yellow]› choose: [/bold yellow]")
+            finally:
+                _dash.live.start()
+                _dash.refresh()
+        else:
+            print(f"permission · {tool_name}\n{detail[:2000]}")
+            if context:
+                print(context)
+            ans = input(f"{opts}: ")
+    except (EOFError, KeyboardInterrupt):
+        return "n"
+    ans = ans.strip().lower()[:1]
+    valid = ("y", "n", "a", "c") if command_scope else ("y", "n", "a")
+    return ans if ans in valid else "n"
+
+
 def subagent_start(kind: str, task: str) -> None:
-    global tool_prefix
+    global tool_prefix, _subagent_depth
     tool_prefix = "  └ "
-    text = f"[subagent:{kind}] {' '.join(task[:120].split())}"
     if _dash:
-        _dash.print(Text(text, style="dim"))
+        # the subagent lives IN the timeline: its spawn row becomes a header
+        # and its own tool calls render nested under it
+        _dash.subagent = (kind, task, time.monotonic())  # + its own lane panel
+        _subagent_depth = 1
+        label = f"{kind}: {' '.join(task[:60].split())}"
+        with _dash._lock:
+            row = _last_running_row()
+            if row is not None and row.name == "spawn_subagent":
+                row.is_subagent_header = True
+                row.args_short = label
+            else:  # defensive: never lose the event even if the row is missing
+                row = ToolRow("subagent", label, is_subagent_header=True)
+                _dash.tool_rows.append(row)
+                _dash.tool_history.append(row)
+        _dash.refresh()
     else:
-        print(f"  {text}")
+        print(f"  [subagent:{kind}] {' '.join(task[:120].split())}")
 
 
 def subagent_end() -> None:
-    global tool_prefix
+    global tool_prefix, _subagent_depth
     tool_prefix = ""
+    _subagent_depth = 0
     if _dash:
-        _dash.print(Text("[subagent done]", style="dim"))
+        # the header row stays in the timeline; the parent's tool_result
+        # completes it with a duration — nothing to print
+        _dash.subagent = None
+        _dash.refresh()
     else:
         print("  [subagent done]")
 
@@ -348,6 +1217,14 @@ def answer(text: str, forced: bool = False) -> None:
 def verdict(passed: bool, summary: str) -> None:
     if _dash:
         _dash.last_verdict = summary
+        _dash.verdict_passed = passed
+        _dash.tint = "green" if passed else "red"
+        for entry in reversed(_dash.rail):  # mark the review that just ended
+            if entry[0] == "review":
+                entry[1] = "pass" if passed else "fail"
+                break
+        _set_title(("✓ review passed" if passed else "✗ review failed")
+                   + " · agent")
         style = "bold green" if passed else "bold red"
         _dash.print(Text(f"review: {'PASSED' if passed else 'FAILED'} — "
                          f"{' '.join(summary[:300].split())}", style=style))
@@ -358,6 +1235,8 @@ def verdict(passed: bool, summary: str) -> None:
 
 def success(text: str) -> None:
     if _dash:
+        _dash.tint = "green"
+        _set_title("✓ done · agent")
         _dash.print(Text(text, style="bold green"))
     else:
         print(text)
@@ -371,10 +1250,45 @@ def diff(path: str, diff_text: str, max_lines: int = 80) -> None:
     if len(lines) > max_lines:
         shown += f"\n… {len(lines) - max_lines} more lines"
     if _dash:
+        # this fires DURING write_file/edit_file, so the matching timeline
+        # row is still running — hang the +n −m stat on it
+        added = sum(1 for l in lines
+                    if l.startswith("+") and not l.startswith("+++"))
+        removed = sum(1 for l in lines
+                      if l.startswith("-") and not l.startswith("---"))
+        with _dash._lock:
+            row = _last_running_row()
+            if row is not None:
+                row.diff_stat = f"+{added} −{removed}"
+            _dash.last_diff = (path, diff_text)  # [d] reprints it on demand
+        _record_file_stats(path, added, removed)
         _dash.print(Panel(Syntax(shown, "diff", background_color="default"),
                           title=path, title_align="left", border_style="dim"))
     else:
         print(shown)
+
+
+def _record_file_stats(path: str, added: int, removed: int) -> None:
+    """Accumulate one file mutation into the files panel. Takes the lock
+    itself, so callers must not already hold it."""
+    with _dash._lock:
+        stats = _dash.files_touched.setdefault(
+            path, {"add": 0, "rm": 0, "edits": 0, "hist": []})
+        stats["add"] += added
+        stats["rm"] += removed
+        stats["edits"] += 1
+        stats["hist"].append(added + removed)  # per-edit churn → sparkline
+        del stats["hist"][:-8]
+
+
+def file_created(name: str, added: int) -> None:
+    """Record a brand-new file for the files panel. write_file routes new
+    files to a concise info line instead of a full diff, so the per-file
+    accounting has to be told about the additions separately — without this
+    the panel would show a new file as '+0 −0 · 0 edits'."""
+    if _dash and added:
+        _record_file_stats(name, added, 0)
+        _dash.refresh()
 
 
 def notify(title: str, message: str, success: bool = True) -> None:

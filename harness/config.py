@@ -23,8 +23,10 @@ class RoleOptions:
 
 @dataclass
 class Settings:
-    url: str = "http://192.168.1.134:11434"
-    model: str = "gemma4:26b"
+    url: str = "http://192.168.1.134:11434" #ip for sever, when vm is running
+    #url: str = "http://localhost:11434" #FOR WHEN THE SEVER IS OFF LINE
+    #model: str = "gemma4:26b"
+    model: str = "qwen3.5:9b"
     reviewer_model: str | None = None   # None = same as model
     executor_model: str | None = None   # None = same as model (covers plan/self-check too)
     goalsmith_model: str | None = None  # None = same as model

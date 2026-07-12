@@ -8,7 +8,7 @@ the filesystem and are registered as-is.
 import json
 from functools import partial
 
-from .. import hooks, permissions, runlog
+from .. import hooks, permissions, runlog, ui
 from ..skills import load_skill
 from ..todos import set_todos
 from ..workspace import Workspace
@@ -39,6 +39,7 @@ _WORKSPACE_TOOLS = {
 
 def configure(ws: Workspace) -> None:
     """Bind the workspace into every tool that touches disk."""
+    permissions.set_workspace(ws.root)  # shown on the permission card
     for name, func in _WORKSPACE_TOOLS.items():
         tools[name] = partial(func, ws)
 
@@ -269,6 +270,10 @@ def execute_tool_call(name: str, arguments) -> str:
     hooks.fire("pre_tool", tool=name, file=file_arg)
     try:
         result = str(func(**arguments))
+    except ui.QuitRequested:
+        # [q] pressed while a subagent (or any tool) polled controls — a
+        # user abort, not a tool failure; it must reach run.py's handler
+        raise
     except TypeError as e:
         result = f"[ERROR] Bad arguments for {name}: {e}"
     except Exception as e:

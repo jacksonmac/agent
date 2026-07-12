@@ -13,6 +13,7 @@ subagents all share it — nothing executes code without approval, and an
 
 from __future__ import annotations
 
+import shlex
 import sys
 
 from . import ui
@@ -22,6 +23,8 @@ GATED = frozenset({"run_shell", "run_python", "run_script"})
 
 _yolo = False
 _always: set = set()        # tools granted "always" this run
+_always_cmd: set[tuple[str, str]] = set()  # (tool, base command) via [c]
+_workspace_root = ""        # shown as context on the permission card
 _warned_non_tty = False
 
 
@@ -31,10 +34,47 @@ def _interactive() -> bool:  # wrapped for testability
 
 def configure(yolo: bool) -> None:
     """Set the gate for this run. Resets per-run grants."""
-    global _yolo, _always, _warned_non_tty
+    global _yolo, _always, _always_cmd, _warned_non_tty
     _yolo = yolo
     _always = set()
+    _always_cmd = set()
     _warned_non_tty = False
+
+
+def set_workspace(root: str) -> None:
+    global _workspace_root
+    _workspace_root = root
+
+
+def _base_command(name: str, arguments) -> str | None:
+    """The natural 'always allow' scope for a call: the executable for
+    run_shell, the script path for run_script. run_python is free-form code —
+    a [c] grant there would just duplicate [a], so it gets none."""
+    if not isinstance(arguments, dict):
+        return None
+    if name == "run_shell":
+        cmd = str(arguments.get("command", ""))
+        try:
+            parts = shlex.split(cmd)
+        except ValueError:  # unbalanced quotes etc.
+            parts = cmd.split()
+        return parts[0] if parts else None
+    if name == "run_script":
+        return str(arguments.get("name", "")) or None
+    return None
+
+
+def _detail(name: str, arguments) -> str:
+    """What the user is actually approving — full command/code, untruncated."""
+    if isinstance(arguments, dict):
+        if name == "run_shell":
+            return f"$ {arguments.get('command', '')}"
+        if name == "run_python":
+            return str(arguments.get("code", ""))
+        if name == "run_script":
+            args = arguments.get("args", "")
+            return f"{arguments.get('name', '')} {args}".strip()
+    return str(arguments)
 
 
 def check(name: str, arguments) -> str | None:
@@ -55,8 +95,18 @@ def check(name: str, arguments) -> str | None:
                 f"--yolo to allow execution tools, or accomplish the task "
                 f"without running code.")
 
-    args_s = str(arguments)[:120]
-    ans = ui.confirm(f"allow {name}? {args_s}")
+    base = _base_command(name, arguments)
+    if base and (name, base) in _always_cmd:
+        return None
+
+    ans = ui.confirm_tool(
+        name, _detail(name, arguments),
+        context=f"cwd: {_workspace_root}" if _workspace_root else "",
+        command_scope=base)
+    if ans == "c" and base:
+        _always_cmd.add((name, base))
+        log_event("permission", tool=name, decision=f"always-cmd:{base}")
+        return None
     if ans == "a":
         _always.add(name)
         log_event("permission", tool=name, decision="always")

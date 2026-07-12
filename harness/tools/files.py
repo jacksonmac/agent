@@ -35,8 +35,9 @@ def write_file(ws: Workspace, text: str, name: str) -> str:
     if old is not None:
         _show_diff(name, old, text)
     else:
-        ui.info(f"new file {name} ({len(text.splitlines())} lines)")
-    print("WROTE:", path)
+        lines = len(text.splitlines())
+        ui.info(f"new file {name} ({lines} lines)")
+        ui.file_created(name, lines)  # keep the files panel's totals honest
     return f"WROTE {len(text)} chars to {name}"
 
 
