@@ -38,7 +38,19 @@ class Workspace:
         """Make runs/run_TIMESTAMP/ (+ a 'latest' symlink) and return the
         Workspace. workspace_dir overrides where the agent-visible files live
         (--workspace, for continuing earlier work)."""
-        run_dir = os.path.join(runs_root, time.strftime("run_%Y%m%d_%H%M%S"))
+        os.makedirs(runs_root, exist_ok=True)
+        # timestamps are second-granular: two runs started in the same second
+        # must not share (and clobber) one run dir, so reserve the name
+        # atomically and suffix -2, -3, ... on collision
+        base = os.path.join(runs_root, time.strftime("run_%Y%m%d_%H%M%S"))
+        run_dir, n = base, 1
+        while True:
+            try:
+                os.makedirs(run_dir)
+                break
+            except FileExistsError:
+                n += 1
+                run_dir = f"{base}-{n}"
         ws = cls(run_dir, workspace_dir)
         latest = os.path.join(runs_root, "latest")
         try:

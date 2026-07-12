@@ -538,7 +538,6 @@ flags (`--url`, `--model`, `-em`, `-rm`, `-gm`, `--num-ctx`, `--attempts`,
 
 - Multi-phase planning for big goals (plan → execute each phase → review each phase);
   plan-seeded todos are the first slice of this
-- Unique run-dir names for runs started within the same second
 
 ## License
 

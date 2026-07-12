@@ -17,6 +17,31 @@ def ws(tmp_path):
     return Workspace(str(tmp_path / "run"))
 
 
+# ─── Workspace.create: unique run dirs ──────────────────────────────
+
+def test_same_second_runs_get_distinct_dirs(tmp_path, monkeypatch):
+    from harness import workspace as ws_mod
+    monkeypatch.setattr(ws_mod.time, "strftime",
+                        lambda fmt: "run_20260712_120000")
+    dirs = [Workspace.create(str(tmp_path)).run_dir for _ in range(3)]
+    assert len(set(dirs)) == 3
+    assert dirs[0].endswith("run_20260712_120000")
+    assert dirs[1].endswith("run_20260712_120000-2")
+    assert dirs[2].endswith("run_20260712_120000-3")
+
+
+def test_latest_symlink_tracks_the_newest_run(tmp_path, monkeypatch):
+    import os
+
+    from harness import workspace as ws_mod
+    monkeypatch.setattr(ws_mod.time, "strftime",
+                        lambda fmt: "run_20260712_120000")
+    Workspace.create(str(tmp_path))
+    ws2 = Workspace.create(str(tmp_path))
+    latest = os.path.join(str(tmp_path), "latest")
+    assert os.readlink(latest) == os.path.basename(ws2.run_dir)
+
+
 # ─── truncate_middle / cap ──────────────────────────────────────────
 
 def test_truncate_middle_short_text_untouched():
