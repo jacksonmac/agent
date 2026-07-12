@@ -25,13 +25,19 @@ from .workspace import Workspace
 
 def parse_args():
     p = argparse.ArgumentParser(description="execute -> review -> retry agent harness")
-    g = p.add_mutually_exclusive_group(required=True)
+    g = p.add_mutually_exclusive_group()  # not required: --resume can supply the goal
     g.add_argument("-g", "--goal", help="use this text as the goal (and the task)")
     g.add_argument("-sg", "--smart-goal",
                    help="LM rewrites your input into a proper GOAL + TASK, then runs")
     g.add_argument("-c", "--command", nargs="+", metavar="NAME",
                    help="run a saved command from commands/<NAME>.md; extra words "
                         "are substituted for {args} in its body")
+    p.add_argument("-r", "--resume", nargs="?", const="latest", default=None,
+                   metavar="ID|DIR",
+                   help="continue a previous session: reuse its workspace (and, if "
+                        "no goal is given, its goal). Bare --resume = the latest "
+                        "run; an id from `agent.py history`; or a run/workspace "
+                        "directory path")
     p.add_argument("--model", default=settings.model,
                    help=f"ollama model (default: {settings.model})")
     p.add_argument("-rm", "--reviewer-model", default=None,
@@ -118,6 +124,51 @@ def _load_agent_md(ws_root: str) -> str:
             "instructions):\n" + context)
 
 
+def _previous_goal(workspace_dir: str) -> str:
+    """The run_start goal from the events.jsonl next to a reused workspace.
+    Empty string when there is none (fresh dir, missing/corrupt log)."""
+    import json as _json
+    prev_run_dir = os.path.dirname(os.path.abspath(workspace_dir))
+    try:
+        with open(os.path.join(prev_run_dir, "events.jsonl")) as f:
+            for line in f:
+                try:
+                    e = _json.loads(line)
+                except _json.JSONDecodeError:
+                    continue
+                if e.get("event") == "run_start":
+                    return e.get("goal", "")
+    except OSError:
+        pass
+    return ""
+
+
+def _resolve_resume(value: str) -> str:
+    """--resume → the workspace directory to reuse. 'latest' and numeric ids
+    resolve through runs/history.db; anything else is a path — either a run
+    directory (its workspace/ is used) or a workspace directory itself."""
+    from . import history
+    if value == "latest":
+        run_dir = history.latest_run_dir(history.db_path())
+        if not run_dir:
+            raise SystemExit("[ERROR] --resume: no previous runs recorded — "
+                             "see `agent.py history`")
+    elif value.isdigit():
+        run_dir = history.run_dir_for(history.db_path(), int(value))
+        if not run_dir:
+            raise SystemExit(f"[ERROR] --resume: no run with id {value} — "
+                             f"see `agent.py history`")
+    else:
+        run_dir = value
+    ws_dir = os.path.join(run_dir, "workspace")
+    if not os.path.isdir(ws_dir):
+        ws_dir = run_dir  # the path already points at a workspace
+    if not os.path.isdir(ws_dir):
+        raise SystemExit(f"[ERROR] --resume: no workspace directory at "
+                         f"{run_dir}")
+    return ws_dir
+
+
 def _load_resume_context(workspace_dir: str, files: list[str],
                          max_chars: int = 3_000) -> str:
     """If the reused workspace sits inside a previous run dir (sibling
@@ -132,18 +183,8 @@ def _load_resume_context(workspace_dir: str, files: list[str],
     if not any(os.path.isfile(os.path.join(prev_run_dir, a)) for a in artifacts):
         return ""
 
-    prev_goal = outcome = feedback = ""
-    try:
-        with open(os.path.join(prev_run_dir, "events.jsonl")) as f:
-            for line in f:
-                try:
-                    e = _json.loads(line)
-                except _json.JSONDecodeError:
-                    continue
-                if e.get("event") == "run_start" and not prev_goal:
-                    prev_goal = e.get("goal", "")
-    except OSError:
-        pass
+    prev_goal = _previous_goal(workspace_dir)
+    outcome = feedback = ""
     try:
         with open(os.path.join(prev_run_dir, "attempt_history.json")) as f:
             history = _json.load(f)
@@ -194,8 +235,25 @@ def main():
         _history_command(sys.argv[2:])
         return
     args, parser = parse_args()
+    if not (args.goal or args.smart_goal or args.command or args.resume):
+        parser.error("one of -g/--goal, -sg/--smart-goal, -c/--command or "
+                     "-r/--resume is required")
     if args.command:
         _apply_command(args, parser)
+    if args.resume:
+        if args.workspace:
+            raise SystemExit("[ERROR] --resume already picks the workspace — "
+                             "drop --workspace (or use it alone)")
+        args.workspace = _resolve_resume(args.resume)
+        if not (args.goal or args.smart_goal):
+            prev = _previous_goal(args.workspace)
+            if not prev:
+                raise SystemExit("[ERROR] --resume: couldn't recover the "
+                                 "previous goal from that run — pass -g/-sg "
+                                 "alongside --resume")
+            args.goal = ("Continue the previous session in this workspace. "
+                         "Its goal was: " + prev)
+        print(f"[resume] {os.path.dirname(args.workspace)}")
     if args.url:
         settings.url = args.url
     settings.model = args.model

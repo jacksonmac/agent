@@ -48,7 +48,7 @@ class Settings:
     goalsmith: RoleOptions = field(default_factory=lambda: RoleOptions(temperature=0.3))
     reviewer_tools: bool = True  # --no-reviewer-tools disables
 
-    subagent_max_rounds: int = 8  # tool rounds a spawn_subagent child gets
+    subagent_max_rounds: int = 20  # tool rounds a spawn_subagent child gets
     memory: bool = True           # write an AGENT.md lessons note after each run
     skills: bool = True           # advertise skills/ + honor load_skill (--no-skills)
     skill_body_max: int = 8_000   # cap on a loaded SKILL.md body (AGENT.md-sized)

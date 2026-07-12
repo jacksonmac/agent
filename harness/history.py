@@ -51,20 +51,39 @@ def record(path: str, *, ts: str, goal: str, model: str,
              int(passed), attempts, duration_secs, run_dir))
 
 
+def latest_run_dir(path: str) -> str | None:
+    """run_dir of the most recent recorded run, or None."""
+    with _connect(path) as conn:
+        row = conn.execute(
+            "SELECT run_dir FROM runs ORDER BY id DESC LIMIT 1").fetchone()
+    return row[0] if row else None
+
+
+def run_dir_for(path: str, run_id: int) -> str | None:
+    """run_dir for a history id (the `id` column in the listing), or None."""
+    with _connect(path) as conn:
+        row = conn.execute(
+            "SELECT run_dir FROM runs WHERE id = ?", (run_id,)).fetchone()
+    return row[0] if row else None
+
+
 def print_history(path: str, limit: int = 20) -> None:
     with _connect(path) as conn:
         rows = conn.execute(
-            "SELECT ts, goal, COALESCE(executor_model, model), passed,"
+            "SELECT id, ts, goal, COALESCE(executor_model, model), passed,"
             " attempts, duration_secs, run_dir FROM runs"
             " ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     if not rows:
         print("(no runs recorded yet)")
         return
-    print(f"{'when':<20} {'pass':<5} {'att':<4} {'secs':>7}  {'executor':<24} goal")
-    for ts, goal, model, passed, attempts, secs, _run_dir in rows:
+    print(f"{'id':<4} {'when':<20} {'pass':<5} {'att':<4} {'secs':>7}  "
+          f"{'executor':<24} goal")
+    for rid, ts, goal, model, passed, attempts, secs, _run_dir in rows:
         goal_s = " ".join(goal.split())[:60]
-        print(f"{ts:<20} {'yes' if passed else 'NO':<5} {attempts:<4} "
+        print(f"{rid:<4} {ts:<20} {'yes' if passed else 'NO':<5} {attempts:<4} "
               f"{secs:>7.1f}  {model[:24]:<24} {goal_s}")
+    print("\ncontinue one with: agent.py --resume <id>   (or just --resume "
+          "for the latest)")
 
 
 def print_stats(path: str) -> None:

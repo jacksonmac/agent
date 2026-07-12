@@ -1,8 +1,12 @@
-"""Tests for session resume: _load_resume_context over previous run artifacts."""
+"""Tests for session resume: _load_resume_context over previous run artifacts,
+plus the --resume flag's target resolution and goal recovery."""
 
 import json
 
-from harness.cli import _load_resume_context
+import pytest
+
+from harness import history
+from harness.cli import _load_resume_context, _previous_goal, _resolve_resume
 
 
 def _seed_run(tmp_path, passed=True, feedback="fix the tests"):
@@ -65,3 +69,61 @@ def test_file_list_capped_at_30(tmp_path):
     ws = _seed_run(tmp_path)
     out = _load_resume_context(ws, files=[f"f{i}.py" for i in range(50)])
     assert "30 shown of 50" in out
+
+
+# ── --resume: goal recovery + target resolution ─────────────────────
+
+def test_previous_goal_recovered(tmp_path):
+    ws = _seed_run(tmp_path)
+    assert _previous_goal(ws) == "build a calculator"
+    fresh = tmp_path / "fresh" / "workspace"
+    fresh.mkdir(parents=True)
+    assert _previous_goal(str(fresh)) == ""
+
+
+def _seed_history(tmp_path, monkeypatch, n=2):
+    """n fake run dirs (each with a workspace/) recorded in a temp history db."""
+    db = str(tmp_path / "history.db")
+    monkeypatch.setattr(history, "db_path", lambda: db)
+    dirs = []
+    for i in range(1, n + 1):
+        run = tmp_path / f"run_{i}"
+        (run / "workspace").mkdir(parents=True)
+        history.record(db, ts=f"t{i}", goal=f"goal {i}", model="m",
+                       executor_model=None, reviewer_model=None, passed=False,
+                       attempts=1, duration_secs=1.0, run_dir=str(run))
+        dirs.append(str(run))
+    return dirs
+
+
+def test_resolve_resume_latest_and_id(tmp_path, monkeypatch):
+    run1, run2 = _seed_history(tmp_path, monkeypatch)
+    assert _resolve_resume("latest") == f"{run2}/workspace"
+    assert _resolve_resume("1") == f"{run1}/workspace"
+
+
+def test_resolve_resume_path_forms(tmp_path):
+    run = tmp_path / "run_x"
+    ws = run / "workspace"
+    ws.mkdir(parents=True)
+    assert _resolve_resume(str(run)) == str(ws)   # run dir → its workspace
+    assert _resolve_resume(str(ws)) == str(ws)    # workspace dir → itself
+
+
+def test_resolve_resume_errors(tmp_path, monkeypatch):
+    monkeypatch.setattr(history, "db_path",
+                        lambda: str(tmp_path / "empty.db"))
+    with pytest.raises(SystemExit, match="no previous runs"):
+        _resolve_resume("latest")
+    with pytest.raises(SystemExit, match="no run with id 9"):
+        _resolve_resume("9")
+    with pytest.raises(SystemExit, match="no workspace directory"):
+        _resolve_resume(str(tmp_path / "nope"))
+
+
+def test_history_listing_shows_ids_and_hint(tmp_path, monkeypatch, capsys):
+    _seed_history(tmp_path, monkeypatch)
+    history.print_history(history.db_path())
+    out = capsys.readouterr().out
+    assert out.splitlines()[0].startswith("id")
+    assert "--resume <id>" in out
