@@ -831,6 +831,34 @@ def drain_messages() -> list[str]:
         return msgs
 
 
+def steer() -> str | None:
+    """--interactive: pause after a failed verdict. Enter = plain retry
+    (returns None), typed text = guidance for the next attempt, q = stop
+    (raises QuitRequested). Non-TTY stdin never blocks — evals and pipes
+    behave as if the flag were off."""
+    if not sys.stdin.isatty():
+        return None
+    prompt = "steer the retry — Enter: continue · q: stop · or type guidance: "
+    try:
+        if _dash:
+            _dash.live.stop()
+            try:
+                with _stdin_handoff():
+                    ans = _dash.console.input(
+                        f"[bold yellow]{rich_escape(prompt)}[/bold yellow]")
+            finally:
+                _dash.live.start()
+                _dash.refresh()
+        else:
+            ans = input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        return None
+    ans = ans.strip()
+    if ans.lower() == "q":
+        raise QuitRequested()
+    return ans or None
+
+
 def _show_tool_history() -> None:
     if _dash is None:
         return

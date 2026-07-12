@@ -6,6 +6,8 @@ the tool replaces it wholesale on every call, the UI and the reviewer read it.
 
 from __future__ import annotations
 
+import re
+
 from . import runlog, ui
 
 STATUSES = ("pending", "in_progress", "done")
@@ -22,6 +24,30 @@ def render() -> str:
     if not current:
         return "(no todos recorded)"
     return "\n".join(f"{_MARKS[t['status']]} {t['text']}" for t in current)
+
+
+_STEP_PAT = re.compile(r"^\s*\d+[.)]\s+(.+)")
+
+
+def seed_from_plan(plan: str) -> int:
+    """Parse the plan turn's numbered steps into a fresh pending checklist,
+    so the executor starts from concrete phases instead of prose. Returns
+    the number of steps seeded; 0 (nothing parseable) leaves todos alone
+    and the model is told to call set_todos itself."""
+    steps = []
+    for line in plan.splitlines():
+        m = _STEP_PAT.match(line)
+        if m:
+            text = m.group(1).strip().strip("*_").strip()
+            if text:
+                steps.append(text[:160])
+    steps = steps[:12]
+    if len(steps) < 2:
+        return 0
+    current[:] = [{"text": s, "status": "pending"} for s in steps]
+    ui.todos(current)
+    runlog.log_event("todos_seeded", items=[s[:80] for s in steps])
+    return len(steps)
 
 
 def set_todos(todos) -> str:

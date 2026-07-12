@@ -59,5 +59,13 @@ class Settings:
     plan_first: bool = True   # attempt 1 opens with a no-tool planning turn
     self_check: bool = True   # verify-and-fix turn before each review
 
+    workspace_git: bool = True  # commit per attempt, reviewer judges git diffs (--no-git)
+    interactive: bool = False   # -i: pause after a failed verdict for user steering
+
+    # --sandbox: run execute tools in a per-run Docker container (workspace
+    # mounted at /ws); the shell allowlist is waived inside it
+    sandbox: bool = False
+    sandbox_image: str = "python:3.12-slim"
+
 
 settings = Settings()

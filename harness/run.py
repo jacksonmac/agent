@@ -61,6 +61,9 @@ def _run_attempt(session: Session, ws: Workspace, log: RunLog, user_msg: str,
         plan = session.send(PLAN_PROMPT.format(task=user_msg), with_tools=False)
         log.event("plan", n=attempt, chars=len(plan))
         log.transcript(f"\n### Plan (attempt {attempt})\n\n{plan}\n")
+        seeded = todos_mod.seed_from_plan(plan)
+        if seeded:
+            ui.info(f"seeded {seeded} todos from the plan")
         answer = session.send(EXECUTE_AFTER_PLAN)
     else:
         answer = session.send(user_msg)
@@ -81,7 +84,10 @@ def _run_attempt(session: Session, ws: Workspace, log: RunLog, user_msg: str,
 
 
 def _copy_workspace(src: str, dst: str) -> None:
-    shutil.copytree(src, dst, dirs_exist_ok=True)
+    # .git stays with the main workspace: candidates are judged by snapshot,
+    # and promotion must not clobber the run's attempt history
+    shutil.copytree(src, dst, dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns(".git"))
 
 
 def _run_candidates(model: str, goal: str, user_msg: str, ws: Workspace,
@@ -138,6 +144,8 @@ def main(model: str, goal: str, task: str, ws: Workspace, log: RunLog,
     t0 = time.time()
     executor_model = settings.executor_model or model
     todos_mod.reset()
+    if settings.workspace_git and ws.init_git():
+        log.event("git_evidence", enabled=True)
     attempts = []            # keep EVERY attempt + verdict, nothing gets overwritten
     feedback_history = []    # ALL reviewer feedback, so retries fix everything at once
     prev_answer = None
@@ -177,12 +185,14 @@ def main(model: str, goal: str, task: str, ws: Workspace, log: RunLog,
             if pending is not None:
                 answer, changed_files, verdict = pending
                 pending = None
+                ws.commit_attempt(attempt)  # record the promoted candidate
             else:
                 ui.attempt(attempt, max_attempts)
                 ui.phase("executing")
                 plan_first = settings.plan_first and attempt == 1
                 answer, changed_files, tool_calls = _run_attempt(
                     session, ws, log, user_msg, goal, criteria, attempt, plan_first)
+                ws.commit_attempt(attempt)
 
                 # Stall detection: reviewing a do-nothing or repeat attempt wastes an
                 # expensive LLM call — skip straight to a retry that redirects it.
@@ -238,6 +248,12 @@ def main(model: str, goal: str, task: str, ws: Workspace, log: RunLog,
             ws.save_artifact(f"attempt_{attempt}.txt", answer)
             feedback_history.append(f"[attempt {attempt}] {cap(verdict.summary(), 800)}")
 
+            # --interactive: let the user steer the retry (may raise
+            # QuitRequested, landing in the same finalization as [q])
+            guidance = None
+            if settings.interactive and attempt < max_attempts:
+                guidance = ui.steer()
+
             # Preferred path: continue the SAME session — the model keeps its own
             # memory of what it read, wrote, and saw fail. Compact the finished
             # attempt down to stubs first so the history stays under budget.
@@ -262,6 +278,12 @@ def main(model: str, goal: str, task: str, ws: Workspace, log: RunLog,
             if stalled:
                 user_msg += ("\n\nIMPORTANT: your last two attempts were nearly "
                              "identical. Take a DIFFERENT approach this time.")
+            if guidance:
+                log.event("user_steer", chars=len(guidance))
+                log.transcript(f"\n**User guidance:** {guidance}\n")
+                user_msg += ("\n\nUSER GUIDANCE for this retry (follow it, it "
+                             "overrides the feedback above where they conflict):\n"
+                             + guidance)
             prev_answer = answer
         else:
             ui.warn(f"hit max attempts ({max_attempts}) without meeting the goal")

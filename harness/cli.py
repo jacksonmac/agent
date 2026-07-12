@@ -58,10 +58,22 @@ def parse_args():
                    help="skip the no-tool planning turn at the start of attempt 1")
     p.add_argument("--no-self-check", action="store_true",
                    help="skip the verify-and-fix turn that runs before each review")
+    p.add_argument("-i", "--interactive", action="store_true",
+                   help="pause after each failed verdict: Enter retries, typed text "
+                        "steers the next attempt, q stops the run")
+    p.add_argument("--no-git", action="store_true",
+                   help="don't git-commit the workspace per attempt; the reviewer "
+                        "falls back to file snapshots instead of diffs")
     p.add_argument("--no-memory", action="store_true",
                    help="don't write a lessons note to the workspace AGENT.md at run end")
     p.add_argument("--no-skills", action="store_true",
                    help="don't advertise skills/ or the load_skill tool to the model")
+    p.add_argument("--sandbox", action="store_true",
+                   help="run run_python/run_script/run_shell inside a Docker "
+                        "container (workspace mounted at /ws); lifts the shell "
+                        "allowlist — any command, pipes, pip installs")
+    p.add_argument("--sandbox-image", default=settings.sandbox_image,
+                   help=f"container image for --sandbox (default: {settings.sandbox_image})")
     p.add_argument("--yolo", action="store_true",
                    help="skip permission prompts for code-executing tools "
                         "(run_shell/run_python/run_script)")
@@ -266,6 +278,10 @@ def main():
     settings.plan_first = not args.no_plan
     settings.self_check = not args.no_self_check
     settings.memory = not args.no_memory
+    settings.workspace_git = not args.no_git
+    settings.interactive = args.interactive
+    settings.sandbox = args.sandbox
+    settings.sandbox_image = args.sandbox_image
     settings.skills = not args.no_skills
     permissions.configure(yolo=args.yolo)
     settings.stream = not args.no_stream
@@ -284,6 +300,12 @@ def main():
     print(f"[run] {ws.run_dir}")
 
     executor_system = EXECUTOR_SYSTEM
+    if settings.sandbox:
+        executor_system += (
+            "\n\nSANDBOX MODE: run_shell executes inside a Docker container "
+            "(the workspace is /ws, already the working directory). Any command "
+            "is allowed, including pipes, chaining, and 'pip install ...'; "
+            "installed packages persist for the rest of this run.")
     agent_md = _load_agent_md(ws.root)
     if agent_md:
         executor_system += agent_md

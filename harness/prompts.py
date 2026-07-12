@@ -41,10 +41,11 @@ you will create or modify (with names), in what order, and the exact commands yo
 run to verify the result. No tool calls, no code — just the plan. You will execute it
 in the next turn."""
 
-EXECUTE_AFTER_PLAN = """Now execute your plan step by step using your tools. Start by
-calling set_todos with your plan steps, and keep it updated as you work. If reality
-disagrees with the plan, adapt — the goal is what matters, not the plan. Finish with
-your final answer in the required format."""
+EXECUTE_AFTER_PLAN = """Now execute your plan step by step using your tools. Your plan's
+numbered steps have been loaded into your todo checklist — keep it updated with set_todos
+as you work (if the checklist is empty, declare your steps with set_todos first). If
+reality disagrees with the plan, adapt — the goal is what matters, not the plan. Finish
+with your final answer in the required format."""
 
 # a spawn_subagent child gets a fresh conversation with this system prompt;
 # only its final text comes back to the parent, so the summary carries everything
@@ -101,7 +102,8 @@ EXECUTOR'S OWN CHECKLIST (self-reported — verify claims of 'done' against the 
 WORKSPACE FILE LISTING:
 {listing}
 
-FILES CREATED OR MODIFIED THIS ATTEMPT (actual on-disk content, possibly truncated):
+CHANGES MADE THIS ATTEMPT (unified git diff of the actual on-disk changes, or file
+snapshots when git is unavailable; possibly truncated):
 {files}
 
 AUTOMATED CHECK OUTPUT:

@@ -252,6 +252,12 @@ The jail is `workspace.resolve()`: every file tool resolves its path against
 tracking is mtime-based, so the reviewer judges files however they were produced —
 `write_file`, `run_python`, a shell command, anything.
 
+The workspace is also a **git repo** (`--no-git` disables): the harness commits the
+starting state, then one commit per attempt, and the reviewer receives the attempt's
+`git diff` instead of truncated file snapshots — every change fits the evidence budget,
+and a bad attempt can be rolled back with plain git. Snapshots remain the fallback when
+git is unavailable or the diff is empty.
+
 Reuse a previous workspace (to continue earlier work) with
 `--workspace runs/run_.../workspace`.
 
@@ -316,6 +322,12 @@ Guardrails on the risky tools: `run_shell` only accepts one plain allowlisted co
 redirection, enforced with `shell=False`), and `fetch_page` refuses local/private-network
 addresses. `run_python`/`run_script` execute with the workspace as cwd and per-call timeouts.
 
+With **`--sandbox`** the execute tools run inside a per-run Docker container instead
+(`--sandbox-image`, default `python:3.12-slim`, workspace mounted at `/ws`). The container
+is the guardrail there, so the shell allowlist is lifted: any command, pipes, chaining,
+and `pip install`s that persist for the rest of the run (one long-lived container per
+workspace, removed at exit).
+
 The reviewer gets a **read-only subset** (`read_file`, `list_files`, `run_script`,
 `run_shell`) so it can gather evidence but never fix the work itself. `--no-reviewer-tools`
 drops even those for a faster snapshot-only review.
@@ -334,6 +346,9 @@ python3 agent.py -g "..." --mcp                                    # + Docker MC
 python3 agent.py -g "..." --mcp --mcp-profile work                 # specific MCP Toolkit profile
 python3 agent.py -g "Delegate the file survey to a subagent, then write a report"  # invites spawn_subagent
 python3 agent.py -g "..." --workspace runs/latest/workspace        # continue earlier work
+python3 agent.py -g "..." -i                                       # steer failed attempts by hand (--interactive)
+python3 agent.py -g "..." --sandbox                                # execute tools inside a Docker container
+python3 agent.py -g "..." --no-git                                 # snapshot evidence instead of git diffs
 python3 agent.py -g "..." --no-reviewer-tools                      # faster, snapshot-only review
 python3 agent.py -g "..." --best-of 3                              # 3 independent first attempts, keep the best
 python3 agent.py -g "..." --no-plan --no-self-check                # skip the quality turns (faster)
@@ -470,9 +485,11 @@ Defaults live in `harness/config.py` (`Settings` dataclass): server URL, per-rol
 truncation caps, the per-call request timeout (`request_timeout`), per-role sampling
 options (executor 0.7, reviewer 0.1, goalsmith 0.3), and feature toggles (`stream`,
 `memory`, `skills`, `skill_body_max`, `plan_first`, `self_check`,
-`subagent_max_rounds`). Everything relevant is also overridable per run via CLI
+`subagent_max_rounds`, `workspace_git`, `interactive`, `sandbox`/`sandbox_image`).
+Everything relevant is also overridable per run via CLI
 flags (`--url`, `--model`, `-em`, `-rm`, `-gm`, `--num-ctx`, `--attempts`,
-`--no-stream`, `--no-memory`, `--no-skills`, `--yolo`, ...).
+`--no-stream`, `--no-memory`, `--no-skills`, `--no-git`, `-i`, `--sandbox`,
+`--yolo`, ...).
 
 ## Claude-Code-style extras
 
@@ -481,6 +498,13 @@ flags (`--url`, `--model`, `-em`, `-rm`, `-gm`, `--num-ctx`, `--attempts`,
 - **Permission prompts** — `run_shell`/`run_python`/`run_script` pause for y/n/a
   approval before executing. Non-interactive sessions auto-deny with an error the
   model can react to; `--yolo` disables the gate (evals pass it automatically).
+- **Interactive steering** — `-i`/`--interactive` pauses after each failed verdict:
+  Enter retries as usual, typed text is injected into the retry message as user
+  guidance (logged as a `user_steer` event), and `q` ends the run with the normal
+  finalization. Non-TTY stdin never blocks, so pipes and evals are unaffected.
+- **Plan-seeded todos** — the numbered steps from the attempt-1 planning turn are
+  parsed straight into the todo checklist (a `todos_seeded` event), so the executor
+  starts from concrete phases and the reviewer sees which were claimed done.
 - **Persistent memory** — after each run the goalsmith model distills 3-6 durable
   lessons into the workspace `AGENT.md` (dated sections, oldest trimmed, user
   preamble untouched); the file is injected back into the executor's system prompt
@@ -512,9 +536,9 @@ flags (`--url`, `--model`, `-em`, `-rm`, `-gm`, `--num-ctx`, `--attempts`,
 
 ## Roadmap
 
-- Multi-phase planning for big goals (plan → execute each phase → review each phase)
-- Git-aware workspace: commit per attempt, give the reviewer real diffs
-- Sandboxed execution (containers) instead of the command allowlist
+- Multi-phase planning for big goals (plan → execute each phase → review each phase);
+  plan-seeded todos are the first slice of this
+- Unique run-dir names for runs started within the same second
 
 ## License
 
