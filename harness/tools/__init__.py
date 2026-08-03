@@ -8,7 +8,7 @@ the filesystem and are registered as-is.
 import json
 from functools import partial
 
-from .. import hooks, permissions, runlog, ui
+from .. import hooks, permissions, policy, runlog, ui
 from ..skills import load_skill
 from ..todos import set_todos
 from ..workspace import Workspace
@@ -38,10 +38,28 @@ _WORKSPACE_TOOLS = {
 
 
 def configure(ws: Workspace) -> None:
-    """Bind the workspace into every tool that touches disk."""
+    """Bind the workspace into every tool that touches disk, and stop
+    advertising tools the active policy has switched off."""
     permissions.set_workspace(ws.root)  # shown on the permission card
     for name, func in _WORKSPACE_TOOLS.items():
         tools[name] = partial(func, ws)
+    _apply_policy_to_schemas()
+
+
+def _apply_policy_to_schemas() -> None:
+    """Drop policy-disabled tools from TOOL_SCHEMAS. The tool functions
+    refuse on their own too — this is so a disabled tool isn't dangled in
+    front of the model, where reaching for it costs a whole tool round.
+
+    Mutates the list in place: run.py, cli.py and review.py all hold a
+    reference to this exact object. Schemas registered after import (the
+    MCP gateway's) are kept as they are."""
+    net = policy.current.network
+    off = {name for name, on in (("web_search", net.web_search),
+                                 ("fetch_page", net.fetch_page)) if not on}
+    extra = [s for s in TOOL_SCHEMAS if s not in _BUILTIN_SCHEMAS]
+    TOOL_SCHEMAS[:] = [s for s in _BUILTIN_SCHEMAS
+                       if s["function"]["name"] not in off] + extra
 
 
 TOOL_SCHEMAS = [
@@ -249,6 +267,9 @@ TOOL_SCHEMAS = [
         },
     },
 ]
+
+# the schemas this module ships, before any policy filtering or MCP additions
+_BUILTIN_SCHEMAS = list(TOOL_SCHEMAS)
 
 
 def execute_tool_call(name: str, arguments) -> str:

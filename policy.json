@@ -1,0 +1,23 @@
+{
+  "name": "default",
+  "shell": {
+    "mode": "allowlist",
+    "allowed": ["pip", "pip3", "python3", "pytest", "ls", "mkdir", "cat", "echo"]
+  },
+  "network": {
+    "web_search": true,
+    "fetch_page": true,
+    "block_private_addresses": true,
+    "allowed_domains": ["*"]
+  },
+  "execution": {
+    "require_approval": ["run_shell", "run_python", "run_script"],
+    "allow_yolo": true,
+    "sandbox": "optional"
+  },
+  "limits": {
+    "max_attempts": 5,
+    "max_tool_rounds": 15,
+    "subagent_max_rounds": 20
+  }
+}

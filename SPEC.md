@@ -358,7 +358,7 @@ Claude-Code-style skills with progressive disclosure: reusable expert instructio
   so compaction never evicts it. Empty/absent skills → nothing injected.
 - **`load_skill(name)` tool**: returns `SKILL: <name>` + the body, truncated middle-out to
   `skill_body_max` (default 8000). Unknown name → `[ERROR] no such skill: … (available: …)`.
-  Not in `permissions.GATED` (read-only, never prompts). Each successful load logs a `skill`
+  Not gated by the policy's `execution.require_approval` (read-only, never prompts). Each successful load logs a `skill`
   event (name, chars). In `llm.Session`, `load_skill` results are capped at `skill_body_max`
   instead of `tool_result_max`, so instructions arrive intact; old loaded bodies are still
   compacted to stubs later like any tool result (the model can reload).

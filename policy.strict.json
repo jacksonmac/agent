@@ -1,0 +1,23 @@
+{
+  "name": "strict",
+  "shell": {
+    "mode": "allowlist",
+    "allowed": []
+  },
+  "network": {
+    "web_search": true,
+    "fetch_page": false,
+    "block_private_addresses": true,
+    "allowed_domains": []
+  },
+  "execution": {
+    "require_approval": ["run_shell", "run_python", "run_script"],
+    "allow_yolo": false,
+    "sandbox": "required"
+  },
+  "limits": {
+    "max_attempts": 3,
+    "max_tool_rounds": 15,
+    "subagent_max_rounds": 8
+  }
+}

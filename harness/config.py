@@ -10,6 +10,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+from .policy import Policy
+
 # repo root — tools are rooted here until the Workspace lands (Phase 2)
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -66,6 +68,11 @@ class Settings:
     # mounted at /ws); the shell allowlist is waived inside it
     sandbox: bool = False
     sandbox_image: str = "python:3.12-slim"
+
+    # the resolved guardrails for this run (--policy, default policy.json).
+    # policy.configure() publishes the same object as policy.current, which
+    # is what the tools actually read; this field is the record of it.
+    policy: Policy = field(default_factory=Policy)
 
 
 settings = Settings()

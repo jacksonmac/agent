@@ -317,7 +317,8 @@ Claude Code:
   permission-prompts; each load is a `skill` event. The reviewer never sees skills.
   `--no-skills` disables the index and the tool.
 
-Guardrails on the risky tools: `run_shell` only accepts one plain allowlisted command
+Guardrails on the risky tools come from **`policy.json`** (see below), not from constants
+in the code: by default `run_shell` only accepts one plain allowlisted command
 (`pip`, `pip3`, `python3`, `pytest`, `ls`, `mkdir`, `cat`, `echo` — no pipes, chaining, or
 redirection, enforced with `shell=False`), and `fetch_page` refuses local/private-network
 addresses. `run_python`/`run_script` execute with the workspace as cwd and per-call timeouts.
@@ -354,6 +355,7 @@ python3 agent.py -g "..." --best-of 3                              # 3 independe
 python3 agent.py -g "..." --no-plan --no-self-check                # skip the quality turns (faster)
 python3 agent.py -c fix-tests "focus on test_api"                  # saved command from commands/fix-tests.md
 python3 agent.py -g "..." --yolo                                   # skip permission prompts (needed for cron/pipes)
+python3 agent.py -g "..." --policy policy.strict.json              # run under tighter guardrails (refuses --yolo)
 python3 agent.py -g "..." --no-stream --no-memory                  # disable streaming / AGENT.md notes
 python3 agent.py history                                           # past runs from runs/history.db
 python3 agent.py history --stats                                   # pass-rate per executor model
@@ -390,6 +392,9 @@ Local models have small windows, so the harness spends tokens deliberately:
 
 ```
 agent.py              # entry-point shim (python3 agent.py -g ...)
+policy.json           # the guardrails this repo runs under (--policy to swap)
+policy.strict.json    # worked example: nothing executes without a human at a TTY
+policy.open.json      # worked example: real shell, no gate (throwaway VM only)
 harness/
 ├── cli.py            # argument parsing, settings mutation, AGENT.md/MCP wiring
 ├── config.py         # Settings dataclass: models per role, budgets, temperatures
@@ -405,14 +410,15 @@ harness/
 ├── commands.py       # commands/*.md loader (-c)
 ├── skills.py         # skills/<name>/SKILL.md index + load_skill tool
 ├── hooks.py          # observe-only hooks.json event hooks
-├── permissions.py    # y/n/a gate for code-executing tools (--yolo)
+├── policy.py         # policy.json loader/validator: the guardrails as data
+├── permissions.py    # y/n/a gate for the policy's gated tools (--yolo)
 ├── run.py            # the execute → review → retry loop (+ plan/self-check/best-of)
 ├── ui.py             # rich live dashboard, plain-print fallback
 ├── report.py         # self-contained report.html per run
 └── tools/
     ├── __init__.py   # registry, Ollama schemas, execute_tool_call dispatch
     ├── files.py      # read/write/edit/list/grep, all jailed
-    ├── execute.py    # run_python / run_script / run_shell (allowlisted)
+    ├── execute.py    # run_python / run_script / run_shell (policy allowlist)
     ├── subagent.py   # spawn_subagent: scoped child sessions
     ├── web.py        # web_search (ddgs), fetch_page (trafilatura)
     └── mcp.py        # Docker MCP Toolkit gateway client
@@ -491,13 +497,50 @@ flags (`--url`, `--model`, `-em`, `-rm`, `-gm`, `--num-ctx`, `--attempts`,
 `--no-stream`, `--no-memory`, `--no-skills`, `--no-git`, `-i`, `--sandbox`,
 `--yolo`, ...).
 
+### Guardrails: `policy.json`
+
+What the agent is *allowed* to do is separate from how it's tuned, and lives in a
+repo-root `policy.json` (`--policy PATH` to pick another; `policy.strict.json` and
+`policy.open.json` ship as worked examples):
+
+```json
+{
+  "name": "default",
+  "shell":     { "mode": "allowlist",
+                 "allowed": ["pip", "pip3", "python3", "pytest", "ls", "mkdir", "cat", "echo"] },
+  "network":   { "web_search": true, "fetch_page": true,
+                 "block_private_addresses": true, "allowed_domains": ["*"] },
+  "execution": { "require_approval": ["run_shell", "run_python", "run_script"],
+                 "allow_yolo": true, "sandbox": "optional" },
+  "limits":    { "max_attempts": 5, "max_tool_rounds": 15, "subagent_max_rounds": 20 }
+}
+```
+
+Three things make this more than a config file:
+
+- **A policy is a ceiling, not a default.** `allow_yolo: false` makes `--yolo` an error
+  rather than an override, `sandbox: "required"` forces the container on, and
+  `limits.max_attempts` clamps a larger `--attempts`. So "this run could not have
+  executed unapproved code" is a property of the run, not a claim about what was typed.
+- **The resolved policy is written into the `run_start` event**, alongside whether
+  `--yolo` and `--sandbox` were actually in force. Which rules governed a past run is
+  answerable from `events.jsonl`, by someone who wasn't there.
+- **Validation is strict and loud.** An unknown key is an error naming the key, not a
+  silent no-op — a policy that reads strict but isn't, because `aloud_domains` was a
+  typo, would be worse than no policy at all.
+
+A missing `policy.json` means the built-in defaults, which are exactly the constants
+this file replaced: installing the repo without one changes nothing.
+
 ## Claude-Code-style extras
 
 - **Streaming** — tokens render live (a rolling panel in the dashboard, progressive
   print in plain mode); `--no-stream` waits for complete responses.
-- **Permission prompts** — `run_shell`/`run_python`/`run_script` pause for y/n/a
-  approval before executing. Non-interactive sessions auto-deny with an error the
-  model can react to; `--yolo` disables the gate (evals pass it automatically).
+- **Permission prompts** — the tools named in the policy's `execution.require_approval`
+  (by default `run_shell`/`run_python`/`run_script`) pause for y/n/a approval before
+  executing, and the approved command is recorded in the `permission` event.
+  Non-interactive sessions auto-deny with an error the model can react to; `--yolo`
+  disables the gate (evals pass it automatically) unless the policy forbids it.
 - **Interactive steering** — `-i`/`--interactive` pauses after each failed verdict:
   Enter retries as usual, typed text is injected into the retry message as user
   guidance (logged as a `user_steer` event), and `q` ends the run with the normal
