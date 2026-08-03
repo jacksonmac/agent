@@ -695,6 +695,15 @@ this file replaced: installing the repo without one changes nothing.
 
 ## Roadmap
 
+- **Trustworthy verdicts** — the reviewer is the component everything else depends on, and
+  its accuracy has never been measured: every eval row records both the reviewer's verdict
+  and the programmatic checker's, and nothing compares them. The false-pass rate matters
+  most, because a false pass *ends the run* and hands you broken work with a green tick,
+  while a false fail merely costs one attempt. **[VERIFICATION.md](VERIFICATION.md)** is a
+  five-phase proposal: measure the confusion matrix first (and let that measurement cancel
+  the rest if the problem turns out to be small), then require evidence for a PASS, make the
+  eval checkers prove they reject wrong answers, and require the agent's own verifier to
+  fail against the previous attempt before its pass counts for anything.
 - Multi-phase planning for big goals (plan → execute each phase → review each phase);
   plan-seeded todos are the first slice of this
 - **Office documents as first-class deliverables** — spreadsheets and documents first
