@@ -185,7 +185,7 @@ A reviewer model judges the workspace artifacts — not the executor's claims �
 
 #### 3.3.2 Functional Requirements
 
-- **REQ-16:** The review prompt shall include the goal, the criteria (or an instruction to derive 3–6 binary-checkable ones), the capped executor output, the todo checklist labeled *self-reported — verify*, a workspace file listing, capped snapshots of the files changed this attempt, and automated check output.
+- **REQ-16:** The review prompt shall include the goal, the criteria (or an instruction to derive 3–6 binary-checkable ones), the capped executor output, the todo checklist labeled *self-reported — verify*, a workspace file listing, the evidence for what changed this attempt, and automated check output. Change evidence shall be the attempt's unified git diff where git evidence is enabled, falling back to capped per-file snapshots otherwise.
 - **REQ-17:** Automated checks shall run pytest against any `test_*.py` files in the workspace and include capped output as evidence.
 - **REQ-18:** The reviewer shall by default receive a read-only tool subset (`read_file`, `list_files`, `run_script`, `run_shell`) so it can gather evidence but not modify the work; `--no-reviewer-tools` shall remove even those. Tool restriction shall be enforced by the session's allowed-tool set, not by prompt text alone.
 - **REQ-19:** Verdict parsing shall be resilient: extract the first balanced JSON object (tolerating code fences); on failure re-ask once in strict mode; then fall back to YES/NO regex matching; then default to `passed = False`. Review shall never raise and never abort the run.
@@ -204,7 +204,7 @@ The executor's capabilities: file manipulation, code execution, web access, self
 - **REQ-23:** File tools (`write_file`, `read_file` with offset/`max_chars` paging, `list_files` recursive with sizes and junk filtering, `edit_file` exact unique-snippet replace with a close-match hint on miss, `grep_files` regex or literal returning `file:line` results) shall operate only on paths resolved through the workspace jail.
 - **REQ-24:** `write_file` and `edit_file` shall emit a display-only unified diff to the UI; the string returned to the model shall be unchanged by this.
 - **REQ-25:** Execution tools shall run with the workspace as cwd and per-call timeouts: `run_python` (`python3 -c`, 120 s), `run_script` (saved `.py`, 120 s), `run_shell` (360 s).
-- **REQ-26:** `run_shell` shall accept only a single plain command whose executable is on the allowlist (`pip`, `pip3`, `python3`, `pytest`, `ls`, `mkdir`, `cat`, `echo`), shall reject shell metacharacters (`;`, `|`, `&`, `<`, `>`, backtick, `$`), and shall execute with `shell=False` via `shlex` splitting.
+- **REQ-26:** Under the default `shell.mode: "allowlist"`, `run_shell` shall accept only a single plain command whose executable is on `policy.shell.allowed` (by default `pip`, `pip3`, `python3`, `pytest`, `ls`, `mkdir`, `cat`, `echo`), shall reject shell metacharacters (`;`, `|`, `&`, `<`, `>`, backtick, `$`, newline), and shall execute with `shell=False` via `shlex` splitting. An empty `allowed` list shall refuse every command with an error naming the policy. Under `shell.mode: "any"`, or under `--sandbox` where the container is the guardrail, the command shall be handed to a real shell (`sh -c`) with no allowlist or metacharacter filtering.
 - **REQ-27:** `web_search` shall use DuckDuckGo via the optional `ddgs` package; `fetch_page` shall extract readable text via optional `trafilatura` with a tag-stripping fallback, shall refuse local and private-network addresses, and shall cap returned text at `page_text_max`. Missing optional packages shall produce actionable error strings, not crashes.
 - **REQ-28:** `set_todos` shall replace the executor's checklist wholesale after validation, update the live dashboard, be logged as `todos` events, and deliver its final state to the reviewer marked as self-reported.
 - **REQ-29:** Tool results returned to the model shall be capped at `tool_result_max` characters.
@@ -218,7 +218,7 @@ Delegation of self-contained subtasks to a fresh child session, keeping the pare
 
 #### 3.5.2 Functional Requirements
 
-- **REQ-31:** `spawn_subagent(task, kind)` shall run a child session under `SUBAGENT_SYSTEM` on the executor model with a smaller tool-round budget (`subagent_max_rounds`, default 8).
+- **REQ-31:** `spawn_subagent(task, kind)` shall run a child session under `SUBAGENT_SYSTEM` on the executor model with its own tool-round budget (`subagent_max_rounds`, default 20).
 - **REQ-32:** The child's tool belt shall exclude `spawn_subagent` (depth guard — no recursive spawning) and `set_todos` (the checklist belongs to the parent).
 - **REQ-33:** Only the child's final text shall be returned to the parent, capped like any tool result; each spawn shall be bracketed by `subagent_start`/`subagent_end` events, and the UI shall nest the child's tool lines under a `└` prefix.
 
@@ -234,7 +234,7 @@ Per-run filesystem containment and continuation of earlier work. **Priority: Hig
 - **REQ-35:** Path resolution shall raise on any name that escapes the workspace root (`../`, absolute paths); every file/exec tool shall use this resolver.
 - **REQ-36:** Changed-file detection shall be mtime-based (with 1 s slack) from an attempt-start baseline, so files written by any means (file tool, script, shell) are caught.
 - **REQ-37:** `snapshot_files` shall read changed files for the reviewer with per-file and total character caps.
-- **REQ-38:** `--workspace DIR` shall reuse an existing workspace, and the harness shall inject a mechanical summary of the previous run (goal, verdict, feedback, files — derived from its `events.jsonl` / `attempt_history.json`) into the executor system prompt.
+- **REQ-38:** `--workspace DIR` shall reuse an existing workspace, and the harness shall inject a mechanical summary of the previous run (goal, verdict, feedback, files — derived from its `events.jsonl` / `attempt_history.json`) into the executor system prompt. `-r/--resume` shall select that workspace by run id, by directory, or — bare — by the latest run, and shall reuse the previous run's goal when no goal source is given.
 
 ### 3.7 LLM Sessions & Context Management
 
@@ -286,7 +286,7 @@ Terminal UX for interactive and headless use. **Priority: Medium.**
 
 #### 3.10.2 Functional Requirements
 
-- **REQ-54:** When `rich` is importable and stdout is a TTY, the harness shall render a live dashboard showing goal/model/attempt/phase with elapsed time, a color-coded context-token progress bar, a rolling recent-tools panel, a live streaming tail, the todo checklist, and the last verdict; persistent lines (answers, verdicts, warnings) shall print above the live region.
+- **REQ-54:** When `rich` is importable and stdout is a TTY, the harness shall render a live dashboard showing goal/model/attempt/phase with elapsed time, a color-coded context-token progress bar, a rolling recent-tools panel, a live streaming tail, the todo checklist, the criteria checklist, per-file change totals, and the last verdict; it shall warn inline when a tool call repeats or no file has changed for an extended period; and it shall offer on-demand overlays for the transcript, tool history, last diff, the per-attempt criteria ledger, and the per-role token budget. Persistent lines (answers, verdicts, warnings) shall print above the live region.
 - **REQ-55:** Without `rich` or a TTY, all the same information shall degrade to plain progressive printing; no harness feature may depend on the rich backend being present.
 - **REQ-56:** Final answers shall render as Markdown (with a plain-text fallback on parse failure); file writes/edits shall show unified diff previews capped at ~80 lines; per-call LLM stats (seconds, prompt→eval tokens) shall be displayed.
 - **REQ-57:** On run completion the harness shall ring the terminal bell and, on macOS, post a notification banner; both best-effort and suppressed by `--no-notify`.
@@ -349,7 +349,7 @@ Objective measurement of harness and model changes. **Priority: Medium.**
 ### 5.2 Safety Requirements
 
 - **SF-1:** The workspace jail (REQ-35) shall prevent the agent from reading or writing any file outside its per-run `workspace/`, protecting the host system and the harness's own code from agent action.
-- **SF-2:** Arbitrary shell execution shall be impossible via `run_shell`: allowlist + metacharacter rejection + `shell=False` (REQ-26).
+- **SF-2:** Under the default policy, arbitrary shell execution shall be impossible via `run_shell`: allowlist + metacharacter rejection + `shell=False` (REQ-26). This guarantee is explicitly waived by `shell.mode: "any"` and by `--sandbox`, both of which hand over a real shell — the container, not the allowlist, is the boundary in the sandboxed case.
 - **SF-3:** Code-executing tools (the policy's `execution.require_approval`, by default `run_shell`, `run_python`, `run_script`) shall require explicit interactive approval (y/n/a, plus `c` to grant a base command for the run) unless `--yolo` was given — and a policy may forbid `--yolo` outright via `allow_yolo: false`; non-interactive sessions shall auto-deny with an actionable error rather than silently executing (see §5.3).
 - **SF-4:** `fetch_page`'s private-address block shall prevent the agent from being steered into probing the local network (SSRF-style).
 - **SF-5:** Failed runs shall be clearly labeled (`final_output_UNVERIFIED.txt`) so unverified output is never mistaken for verified output.

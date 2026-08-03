@@ -165,9 +165,17 @@ workspace in). `TOOL_SCHEMAS` is the Ollama tool-schema list advertised to model
   literal, `file:line` results). `write_file`/`edit_file` now emit a **display-only** unified
   diff via `ui.diff(...)`; the string returned to the model is unchanged.
 - Exec tools (`tools/execute.py`, cwd = workspace): `run_python` (`python3 -c`, 120s),
-  `run_script` (a saved `.py`, 120s), `run_shell` (allowlisted: `pip pip3 python3 pytest ls
-  mkdir cat echo`; shell metacharacters `; | & < > ` $` rejected; `shell=False` + `shlex`;
-  360s). These three are the permission-gated set.
+  `run_script` (a saved `.py`, 120s), `run_shell` (360s). Under the default
+  `shell.mode: "allowlist"` the command must be a single plain command from
+  `policy.shell.allowed` (`pip pip3 python3 pytest ls mkdir cat echo`), shell
+  metacharacters `; | & < > ` $` and newline are rejected, and it runs `shell=False` via
+  `shlex` — so the allowlist cannot be bypassed by chaining. Under `shell.mode: "any"`,
+  **or under `--sandbox` where the container is the guardrail**, the command goes to a real
+  shell (`sh -c`) with no filtering. An empty `allowed` list refuses everything, naming the
+  policy. These three tools are the default permission-gated set.
+- `--sandbox` runs the exec tools in one long-lived Docker container per workspace
+  (`--sandbox-image`, default `python:3.12-slim`, workspace bind-mounted at `/ws`, removed
+  at exit), so `pip install`s persist across calls within a run.
 - `set_todos` (`todos.py`) — the executor's self-maintained checklist; replaces the list
   wholesale, validates before mutating, and updates the UI and reviewer view.
 - `spawn_subagent` (`tools/subagent.py`) — see §13.
@@ -209,7 +217,9 @@ run dir so runs can't contaminate each other.
   `attempt_diff()` hands the reviewer a real unified diff of that attempt. `review.py`
   prefers the diff and falls back to `snapshot_files` when there is no git — a diff shows
   every change within the budget two truncated snapshots would spend.
-- `--workspace DIR` reuses an existing directory to continue earlier work.
+- `--workspace DIR` reuses an existing directory to continue earlier work; `-r/--resume`
+  resolves one for you from a history id, a run/workspace path, or — bare — the latest run,
+  and reuses that run's goal when no goal source is given.
 
 ---
 
@@ -217,9 +227,11 @@ run dir so runs can't contaminate each other.
 
 `review(model, goal, output, ws, criteria, changed_files)` always returns a `Verdict`:
 - Builds `REVIEW_USER` from the goal, criteria (or an instruction to derive 3–6
-  binary-checkable ones), the capped output, the todo list, the file listing, the changed-file
-  snapshot, and `automated_checks(ws)` — which runs pytest on any `test_*.py` in the workspace
-  and returns capped output.
+  binary-checkable ones), the capped output, the todo list, the file listing, the change
+  evidence (`ws.attempt_diff()` where git is enabled, else `snapshot_files`), and
+  `automated_checks(ws)` — which runs pytest on any `test_*.py` in the workspace and returns
+  capped output. The check output is also handed to `ui.checks()` so the attempt ledger can
+  show it beside the verdict it produced (§17).
 - By default the reviewer gets a **read-only-ish tool subset**
   (`read_file, list_files, run_script, run_shell`) so it can inspect/run code itself;
   `--no-reviewer-tools` disables that.
@@ -279,7 +291,8 @@ that session/verdict.
 
 `spawn_subagent(task, kind)` runs a scoped child `Session` with `SUBAGENT_SYSTEM` (plus the
 skills index when skills exist, §20), the executor model, and the normal tool belt **minus** `spawn_subagent` (a depth guard blocks
-recursion) and `set_todos` (the checklist belongs to the parent). Only the child's final text
+recursion) and `set_todos` (the checklist belongs to the parent). The child gets its own
+round budget, `settings.subagent_max_rounds` (default 20). Only the child's final text
 is returned to the parent, capped like any tool result. The UI nests the child's tool lines
 under a `└` prefix.
 

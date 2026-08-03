@@ -123,7 +123,7 @@ sequenceDiagram
     C->>C: settings.model / executor_model /<br/>reviewer_model / goalsmith_model
     C->>C: load policy.json → shell/network/<br/>execution/limits, drop disabled tools
     C->>C: create Workspace + RunLog, configure<br/>hooks.json + permission gate
-    C->>C: system prompt += AGENT.md + SKILLS index<br/>+= previous-run summary (--workspace)
+    C->>C: system prompt += AGENT.md + SKILLS index<br/>+= previous-run summary (resume)
     opt -sg (smart goal)
         C->>G: make_goal_task(goalsmith_model or model, prompt)
         G->>O: chat (GOALSMITH_SYSTEM)
@@ -230,16 +230,16 @@ Who produces what, and who consumes it:
 | Conversation history | `llm.Session.messages` — grows with every turn, compacted between attempts | Ollama `/api/chat` payload | `list[{role, content, tool_calls?}]` |
 | Stream deltas | Ollama line-JSON chunks, aggregated in `llm._consume_stream` | `ui.stream_delta` (live panel / progressive print); Session sees only the final message | text fragments |
 | Tool calls | Ollama reply `tool_calls` | `tools.execute_tool_call` → permission check → hooks → dispatch → result appended back as a `role: tool` message | name + JSON args → capped string |
-| Permission decision | `permissions.check()` (y/n/a prompt, `_always` grants, non-TTY auto-deny) | `execute_tool_call` (denial returned to the model as `[ERROR]`), `permission` events | `None` (allow) or error string |
+| Permission decision | `permissions.check()` (y/n/a/c prompt, `_always` / base-command grants, non-TTY auto-deny) | `execute_tool_call` (denial returned to the model as `[ERROR]`), `permission` events | `None` (allow) or error string |
 | Todo checklist | `set_todos` tool → `todos.current` | dashboard panel, `REVIEW_USER` ("self-reported — verify") | `[{text, status}]` |
 | Subagent summary | child `Session` in `tools/subagent.py` (fresh context, executor model) | parent's tool result, capped like any other | string |
 | Changed files | `workspace.files_changed_this_attempt()` (mtime scan — catches files written by *any* tool) | `review.py` snapshots, `run.py` stall gate, logs | `list[str]` relative paths |
-| Review evidence | `workspace.snapshot_files()` + `review.automated_checks()` (pytest) | `REVIEW_USER` prompt | capped text blocks |
+| Review evidence | `workspace.attempt_diff()` (git), falling back to `workspace.snapshot_files()`, + `review.automated_checks()` (pytest) | `REVIEW_USER` prompt | capped text blocks |
 | `Verdict` | `review.parse_verdict()` (JSON → re-ask → YES/NO → default NO) | `run.py` pass/retry decision, retry feedback | `{passed, criteria[], feedback}` |
 | Retry message | `run.py` from `Verdict.unmet()` + feedback history | same executor `Session` (preferred) or a fresh one | `RETRY_CONTINUE` / `RETRY_NOTE` template |
 | `events.jsonl` | `runlog.log_event()` called from `run.py`, `llm.py`, `tools/`, `hooks.py`, `permissions.py` | `report.py`, `evals/run_evals.py`, the resume summary, you | one JSON object per line |
 | Memory note | `memory.update_agent_md()` — goalsmith-model call at run end, bullets appended as a dated section | `<workspace>/AGENT.md` → next run's system prompt | markdown section, trimmed to budget |
-| Resume summary | `cli._load_resume_context()` — mechanical, from the previous run's `events.jsonl` / `attempt_history.json` | executor system prompt on `--workspace` reuse | capped text block |
+| Resume summary | `cli._load_resume_context()` — mechanical, from the previous run's `events.jsonl` / `attempt_history.json` | executor system prompt on `--workspace` / `-r` reuse | capped text block |
 | Hook commands | user-authored `hooks.json` at the repo root | `hooks.fire()` on pre/post_tool, attempt_end, run_end (observe-only) | shell commands with `{placeholders}` |
 | `runs/history.db` | `history.record()` at run end | `agent.py history` / `history --stats` | sqlite row per run |
 | `report.html` | `report.py` at the end of every run | your browser | self-contained HTML |
@@ -281,7 +281,10 @@ and a bad attempt can be rolled back with plain git. Snapshots remain the fallba
 git is unavailable or the diff is empty.
 
 Reuse a previous workspace (to continue earlier work) with
-`--workspace runs/run_.../workspace`.
+`--workspace runs/run_.../workspace`, or let the harness find it: `-r/--resume`
+takes a run id from `agent.py history`, a run/workspace directory, or nothing at
+all (bare `--resume` picks the latest run). With `-r` and no goal source, the
+previous run's goal is reused too.
 
 ## The tool belt
 
@@ -322,8 +325,10 @@ Claude Code:
   and the final state is handed to the reviewer labeled *self-reported — verify against
   the workspace*, so claimed-done vs actually-done is visible.
 - **`spawn_subagent`** — delegates a self-contained subtask (exploration, research, a
-  contained build step) to a fresh child session with its own context and a smaller
-  tool-round budget (`subagent_max_rounds`, default 8). Only the child's final summary
+  contained build step) to a fresh child session with its own context and its own
+  tool-round budget (`policy.limits.subagent_max_rounds`, default 20 — deliberately more
+  than the executor's 15, since the child starts from an empty context and has to
+  rediscover the workspace). Only the child's final summary
   returns to the parent, capped like any tool result — the parent's context stays small.
   Subagents can't spawn subagents, and the child doesn't get `set_todos` (the checklist
   belongs to the parent). There's no CLI flag: the **executor decides** to call it when a
@@ -370,6 +375,8 @@ python3 agent.py -g "..." --mcp                                    # + Docker MC
 python3 agent.py -g "..." --mcp --mcp-profile work                 # specific MCP Toolkit profile
 python3 agent.py -g "Delegate the file survey to a subagent, then write a report"  # invites spawn_subagent
 python3 agent.py -g "..." --workspace runs/latest/workspace        # continue earlier work
+python3 agent.py -r                                                # same, but resume the latest run + its goal
+python3 agent.py -r 42 -g "now add tests"                          # resume run 42 from `agent.py history`
 python3 agent.py -g "..." -i                                       # steer failed attempts by hand (--interactive)
 python3 agent.py -g "..." --sandbox                                # execute tools inside a Docker container
 python3 agent.py -g "..." --no-git                                 # snapshot evidence instead of git diffs
@@ -391,8 +398,9 @@ model commits to filenames and a verification step before touching tools), the
 fix failures before the reviewer sees it). `--best-of N` additionally runs N independent
 first attempts in separate `candidate_*` workspaces, reviews each, and continues the loop
 from the winner. On a real terminal you get a live rich dashboard (attempt/phase/token
-budget/tool log/todos/streaming panel); piped output falls back to plain lines with
-progressive streaming. Every run ends by writing a self-contained **`report.html`**
+budget/tool log/todos/criteria/streaming panel, plus on-demand overlays for the transcript,
+tool history, last diff, attempt ledger and per-role budget); piped output falls back to
+plain lines with progressive streaming. Every run ends by writing a self-contained **`report.html`**
 into the run dir (regenerate with `python3 -m harness.report runs/latest`), recording
 a row in `runs/history.db`, and appending a memory note to the workspace AGENT.md.
 
@@ -562,7 +570,7 @@ this file replaced: installing the repo without one changes nothing.
 - **Streaming** — tokens render live (a rolling panel in the dashboard, progressive
   print in plain mode); `--no-stream` waits for complete responses.
 - **Permission prompts** — the tools named in the policy's `execution.require_approval`
-  (by default `run_shell`/`run_python`/`run_script`) pause for y/n/a approval before
+  (by default `run_shell`/`run_python`/`run_script`) pause for y/n/a/c approval before
   executing, and the approved command is recorded in the `permission` event.
   Non-interactive sessions auto-deny with an error the model can react to; `--yolo`
   disables the gate (evals pass it automatically) unless the policy forbids it.
@@ -587,7 +595,8 @@ this file replaced: installing the repo without one changes nothing.
   lessons into the workspace `AGENT.md` (dated sections, oldest trimmed, user
   preamble untouched); the file is injected back into the executor's system prompt
   on the next run. `--no-memory` skips it.
-- **Session resume** — reusing a workspace with `--workspace runs/<run>/workspace`
+- **Session resume** — `-r/--resume` (bare = latest run, or a history id, or a
+  directory) and `--workspace runs/<run>/workspace`
   auto-injects a mechanical summary of that run (goal, verdict, feedback, files)
   so the next session builds on the work instead of redoing it.
 - **Custom commands** — `commands/<name>.md` files: a goal template with `{args}`
