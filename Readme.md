@@ -748,8 +748,6 @@ this file replaced: installing the repo without one changes nothing.
      exists to catch. `workspace.py` needs the matching change: accept binary seed
      files and stop treating them as text for change detection (mtime scanning is
      fine; snapshotting is not).
-  4. **docx tools** — read paragraphs and tables, rewrite a paragraph, append
-     sections. Cheaper than xlsx because step 1 proved no guard is needed.
 
   Deferred until the above is in real use: `.pptx`, and surgical zip-level patching
   (rewriting a single part and leaving the rest byte-identical), which is the

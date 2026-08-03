@@ -154,3 +154,113 @@ def describe(problems: list[str]) -> str:
             "The original file is untouched. Do not retry the same edit — "
             "either make the change without re-saving the whole workbook, or "
             "tell the user which feature blocks it.")
+
+
+# ── text extraction for the reviewer ─────────────────────────────────
+#
+# A reviewer handed a .xlsx sees a zip full of XML, judges nothing, and the
+# verdict quietly degrades to "the file exists" — the exact failure the
+# review loop exists to catch. Extraction is stdlib-only for the same reason
+# the fingerprint is: the reviewer must work whether or not openpyxl happens
+# to be installed.
+
+_NS_SHEET = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+_NS_WORD = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_NS_DRAW = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+
+
+def _xlsx_text(z: zipfile.ZipFile, max_rows: int) -> str:
+    import xml.etree.ElementTree as ET
+    shared = []
+    if "xl/sharedStrings.xml" in z.namelist():
+        root = ET.fromstring(z.read("xl/sharedStrings.xml"))
+        for si in root:
+            shared.append("".join(t.text or "" for t in si.iter(_NS_SHEET + "t")))
+
+    names = {}   # sheet part -> display name, so the reviewer sees "Data" not "sheet1"
+    if "xl/workbook.xml" in z.namelist():
+        root = ET.fromstring(z.read("xl/workbook.xml"))
+        for i, sh in enumerate(root.iter(_NS_SHEET + "sheet"), start=1):
+            names[f"xl/worksheets/sheet{i}.xml"] = sh.get("name", f"sheet{i}")
+
+    out = []
+    parts = sorted(n for n in z.namelist()
+                   if n.startswith("xl/worksheets/") and n.endswith(".xml"))
+    for part in parts:
+        root = ET.fromstring(z.read(part))
+        out.append(f"[{names.get(part, part)}]")
+        rows = 0
+        for row in root.iter(_NS_SHEET + "row"):
+            cells = []
+            for c in row.iter(_NS_SHEET + "c"):
+                formula = c.find(_NS_SHEET + "f")
+                v = c.find(_NS_SHEET + "v")
+                kind = c.get("t")
+                text = ""
+                if kind == "inlineStr":
+                    # openpyxl writes inline strings; Excel writes shared ones.
+                    # An extractor that handles only one silently loses every
+                    # label in files produced by the other.
+                    inline = c.find(_NS_SHEET + "is")
+                    if inline is not None:
+                        text = "".join(t.text or ""
+                                       for t in inline.iter(_NS_SHEET + "t"))
+                elif kind == "s" and v is not None and v.text:
+                    idx = int(v.text)
+                    text = shared[idx] if idx < len(shared) else ""
+                elif v is not None:
+                    text = v.text or ""
+                if formula is not None:
+                    # the formula is what the reviewer must judge; the cached
+                    # value alone hides whether the sheet computes anything
+                    text = f"={formula.text or ''}" + (f" -> {text}" if text else "")
+                if text:
+                    cells.append(f"{c.get('r', '')}={text}")
+            if cells:
+                out.append("  " + "  ".join(cells))
+                rows += 1
+            if rows >= max_rows:
+                out.append(f"  … more rows omitted")
+                break
+    return "\n".join(out)
+
+
+def _para_text(z: zipfile.ZipFile, part: str, para_tag: str, run_tag: str) -> str:
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(z.read(part))
+    lines = []
+    for para in root.iter(para_tag):
+        text = "".join(t.text or "" for t in para.iter(run_tag))
+        if text.strip():
+            lines.append(text)
+    return "\n".join(lines)
+
+
+def extract_text(path: str, max_rows: int = 200) -> str:
+    """Readable text from an office package, or "" if this is not one.
+
+    Never raises: a deliverable the reviewer cannot parse should degrade to
+    a note saying so, not abort the run.
+    """
+    lower = path.lower()
+    if not lower.endswith(OFFICE_SUFFIXES):
+        return ""          # not ours; a text file is the caller's to read
+    try:
+        with zipfile.ZipFile(path) as z:
+            if lower.endswith((".xlsx", ".xlsm", ".xltx", ".xltm")):
+                return _xlsx_text(z, max_rows)
+            if lower.endswith((".docx", ".docm", ".dotx")):
+                return _para_text(z, "word/document.xml",
+                                  _NS_WORD + "p", _NS_WORD + "t")
+            if lower.endswith((".pptx", ".pptm", ".potx")):
+                slides = sorted(n for n in z.namelist()
+                                if n.startswith("ppt/slides/slide")
+                                and n.endswith(".xml"))
+                out = []
+                for i, part in enumerate(slides, start=1):
+                    out.append(f"[slide {i}]")
+                    out.append(_para_text(z, part, _NS_DRAW + "p", _NS_DRAW + "t"))
+                return "\n".join(out)
+    except (OSError, zipfile.BadZipFile, KeyError, ValueError) as e:
+        return f"[could not extract text: {type(e).__name__}: {e}]"
+    return ""

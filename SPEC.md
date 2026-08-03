@@ -484,6 +484,16 @@ legitimate edit and only the calling tool knows that. `describe(problems)` rende
 refusal the model receives — it states that the original is untouched and that retrying the
 same call will not help, since a bare error otherwise invites an identical retry.
 
+**Text extraction.** `extract_text(path)` renders an office package as readable text —
+worksheets as `A2=north  B2=260  C2==B2*2 -> 520` under their real sheet names, documents
+and slides as paragraphs. `workspace.snapshot_files` routes any office package through it,
+so the reviewer judges content rather than zip bytes; without this a verdict on a document
+deliverable degrades to "the file exists". Stdlib-only for the same reason as the
+fingerprint, and it handles **both** string encodings: the inline strings openpyxl writes
+and the shared strings Excel writes — an extractor that handled only one would silently
+lose every label in files produced by the other. It never raises: an unparseable package
+returns a note.
+
 **Tests** (`tests/test_office.py`): two tiers. Hand-built OPC packages exercise the logic
 with no third-party dependency (including the loss-inside-a-surviving-part case); real
 openpyxl/python-docx round-trips pin the measurements above and skip via

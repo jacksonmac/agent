@@ -247,3 +247,92 @@ def test_python_docx_round_trips_losslessly(tmp_path):
     assert office.check_edit(src, edited) == []
     assert any(p.text == "Rewritten by the agent."
                for p in docx.Document(edited).paragraphs)
+
+
+# ─── text extraction for the reviewer (I-9) ─────────────────────────
+
+def test_extract_text_reads_a_workbook_without_openpyxl(tmp_path):
+    """Stdlib-only: the reviewer must work whether or not openpyxl is around."""
+    openpyxl = pytest.importorskip("openpyxl")
+    wb = openpyxl.Workbook()
+    sh = wb.active
+    sh.title = "Data"
+    sh.append(["region", "q1", "q2", "total"])
+    sh.append(["north", 120, 140])
+    sh["D2"] = "=B2+C2"
+    wb.create_sheet("Notes")["A1"] = "seeded by the user"
+    path = str(tmp_path / "b.xlsx")
+    wb.save(path)
+
+    text = office.extract_text(path)
+    assert "[Data]" in text and "[Notes]" in text     # sheet names, not sheet1
+    assert "region" in text and "north" in text       # shared strings resolved
+    assert "120" in text
+    assert "=B2+C2" in text                           # the formula, not just a value
+    assert "seeded by the user" in text
+
+
+def test_extract_text_reads_a_document(tmp_path):
+    docx = pytest.importorskip("docx")
+    d = docx.Document()
+    d.add_heading("Quarterly report", level=1)
+    d.add_paragraph("Revenue rose in the north region.")
+    path = str(tmp_path / "r.docx")
+    d.save(path)
+    text = office.extract_text(path)
+    assert "Quarterly report" in text
+    assert "Revenue rose in the north region." in text
+
+
+def test_extract_text_ignores_non_office_files(tmp_path):
+    p = tmp_path / "a.txt"
+    p.write_text("plain")
+    assert office.extract_text(str(p)) == ""
+
+
+def test_extract_text_never_raises_on_a_broken_package(tmp_path):
+    """A deliverable the reviewer cannot parse must degrade to a note, not
+    abort the run."""
+    p = tmp_path / "broken.xlsx"
+    p.write_bytes(b"not a zip at all")
+    out = office.extract_text(str(p))
+    assert out.startswith("[could not extract text")
+
+
+def test_extract_text_caps_runaway_rows(tmp_path):
+    openpyxl = pytest.importorskip("openpyxl")
+    wb = openpyxl.Workbook()
+    for i in range(500):
+        wb.active.append([f"row{i}"])
+    path = str(tmp_path / "big.xlsx")
+    wb.save(path)
+    text = office.extract_text(path, max_rows=10)
+    assert "more rows omitted" in text
+    assert "row400" not in text
+
+
+def test_snapshot_gives_the_reviewer_readable_spreadsheet_content(tmp_path):
+    """The whole point of I-9: without this the reviewer sees zip bytes and
+    every verdict on a workbook degrades to 'the file exists'."""
+    openpyxl = pytest.importorskip("openpyxl")
+    from harness.workspace import Workspace
+    ws = Workspace(str(tmp_path / "run"))
+    wb = openpyxl.Workbook()
+    wb.active.title = "Data"
+    wb.active.append(["region", "total"])
+    wb.active.append(["north", 260])
+    wb.save(ws.resolve("out.xlsx"))
+
+    snap = ws.snapshot_files(["out.xlsx"])
+    assert "--- out.xlsx" in snap
+    assert "[Data]" in snap and "north" in snap and "260" in snap
+    assert "PK" not in snap            # not raw zip bytes
+
+
+def test_snapshot_still_reads_text_files_normally(tmp_path):
+    from harness.workspace import Workspace
+    ws = Workspace(str(tmp_path / "run"))
+    with open(ws.resolve("a.py"), "w") as f:
+        f.write("print('hello')\n")
+    snap = ws.snapshot_files(["a.py"])
+    assert "print('hello')" in snap
