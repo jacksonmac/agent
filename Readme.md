@@ -37,14 +37,16 @@ flowchart TB
     subgraph toolslayer ["Tools (jailed to workspace/)"]
         TOOLS["tools/__init__.py<br/><i>registry + Ollama schemas<br/>+ permission/hook choke point</i>"]
         FILES["tools/files.py<br/><i>read/write/edit/list/grep</i>"]
-        EXEC["tools/execute.py<br/><i>run_python/script/shell</i>"]
+        EXEC["tools/execute.py<br/><i>run_python/script/shell<br/>(--sandbox: docker container)</i>"]
         WEB["tools/web.py<br/><i>web_search, fetch_page</i>"]
         MCP["tools/mcp.py<br/><i>Docker MCP gateway</i>"]
         SUB["tools/subagent.py<br/><i>scoped child Session</i>"]
+        SKILLS["skills.py<br/><i>load_skill + SKILLS index</i>"]
     end
 
     subgraph gates ["Gates & observers"]
-        PERM["permissions.py<br/><i>y/n/a gate for run_* tools</i>"]
+        POLICY["policy.py<br/><i>policy.json → shell/network/<br/>execution/limits</i>"]
+        PERM["permissions.py<br/><i>y/n/a/c gate for the policy's<br/>require_approval tools</i>"]
         HOOKS["hooks.py<br/><i>hooks.json shell observers</i>"]
     end
 
@@ -58,9 +60,11 @@ flowchart TB
         CONFIG["config.py<br/><i>Settings singleton</i>"]
         CMDS["commands.py<br/><i>-c goal templates</i>"]
         TODOS["todos.py<br/><i>set_todos checklist</i>"]
-        WS["workspace.py<br/><i>path jail, change tracking</i>"]
+        WS["workspace.py<br/><i>path jail, change tracking,<br/>per-attempt git commits</i>"]
         RUNLOG["runlog.py<br/><i>events.jsonl + transcript.md</i>"]
-        UI["ui.py<br/><i>dashboard, streaming panel,<br/>confirm prompts</i>"]
+        UI["ui.py<br/><i>dashboard, ledger/budget panels,<br/>streaming, confirm prompts</i>"]
+        KEYS["keys.py<br/><i>non-blocking TTY key reads</i>"]
+        OFFICE["office.py<br/><i>office-doc fidelity guard</i>"]
     end
 
     OLLAMA[("Ollama server<br/>POST /api/chat<br/>(streamed)")]
@@ -69,8 +73,9 @@ flowchart TB
     CLI -->|"mutates settings once"| CONFIG
     CLI -->|"-c: goal from template"| CMDS
     CLI -->|"goal, task, criteria"| GOALSMITH
+    CLI -->|"load(policy.json)"| POLICY
     CLI -->|"configure(hooks.json)"| HOOKS
-    CLI -->|"configure(--yolo)"| PERM
+    CLI -->|"SKILLS block → system prompt"| SKILLS
     CLI -->|"model, goal, task, ws, log"| RUN
     RUN -->|"Session.send()"| LLM
     RUN -->|"review(model, goal, answer, ws)"| REVIEW
@@ -80,14 +85,21 @@ flowchart TB
     LLM -->|"execute_tool_call(name, args)"| TOOLS
     TOOLS -->|"check() before dispatch"| PERM
     TOOLS -->|"fire(pre/post_tool)"| HOOKS
-    TOOLS --> FILES & EXEC & WEB & MCP & SUB & TODOS
+    POLICY -->|"require_approval, allow_yolo"| PERM
+    POLICY -.->|"drops disabled tools<br/>from TOOL_SCHEMAS"| TOOLS
+    TOOLS --> FILES & EXEC & WEB & MCP & SUB & TODOS & SKILLS
     SUB -->|"child Session"| LLM
     FILES & EXEC -->|"ws.resolve() jail"| WS
+    REVIEW -->|"attempt_diff / snapshot_files"| WS
     RUN & REVIEW & GOALSMITH & MEM --> PROMPTS
     RUN & LLM & TOOLS & HOOKS & PERM -->|"log_event()"| RUNLOG
     RUN & LLM & REVIEW & TODOS & PERM -->|"phase/stream/todos/confirm"| UI
+    UI -->|"pause, message, interrupt,<br/>ledger, budget, quit …"| KEYS
     RUN & REVIEW & LLM & CLI -.->|"read"| CONFIG
 ```
+
+`office.py` has no caller yet — it is the fidelity guard the planned document tools
+will sit behind (see the Roadmap).
 
 ## The run loop, end to end
 
@@ -109,8 +121,9 @@ sequenceDiagram
         C->>C: load commands/<name>.md,<br/>goal from template, frontmatter defaults
     end
     C->>C: settings.model / executor_model /<br/>reviewer_model / goalsmith_model
+    C->>C: load policy.json → shell/network/<br/>execution/limits, drop disabled tools
     C->>C: create Workspace + RunLog, configure<br/>hooks.json + permission gate
-    C->>C: system prompt += AGENT.md<br/>+= previous-run summary (--workspace)
+    C->>C: system prompt += AGENT.md + SKILLS index<br/>+= previous-run summary (--workspace)
     opt -sg (smart goal)
         C->>G: make_goal_task(goalsmith_model or model, prompt)
         G->>O: chat (GOALSMITH_SYSTEM)
@@ -127,32 +140,41 @@ sequenceDiagram
             O-->>S: plan text
         end
         R->>S: send(task) — full TOOL_SCHEMAS
-        loop tool rounds (max 15)
+        loop tool rounds (max_tool_rounds, default 15)
+            S->>S: poll_controls() — pause/quit keys;<br/>drain queued user messages into history
             S->>O: chat (model=executor_model, stream:true)
             O-->>S: content/thinking deltas → live UI,<br/>then tool_calls or final text
             S->>T: execute_tool_call(name, args)
-            Note over T: permission gate (run_* tools:<br/>y/n/a prompt, non-TTY denies)<br/>then pre/post_tool hooks
+            Note over T: permission gate (the policy's<br/>require_approval tools: y/n/a/c prompt,<br/>non-TTY denies) then pre/post_tool hooks
             T-->>S: result string (capped, appended as role:tool)
+            opt interrupt key pressed mid-round
+                S->>S: skip the remaining tool calls<br/>(each still gets a skipped result)
+            end
         end
         S-->>R: answer text
         opt unless --no-self-check
             R->>S: send(SELF_CHECK_PROMPT) — verify & fix with tools
         end
-        R->>R: ws.files_changed_this_attempt() (mtime scan)
+        R->>R: ws.files_changed_this_attempt() (mtime scan)<br/>ws.commit_attempt(n) (git evidence)
 
         alt zero tool calls OR near-identical to last attempt
             R->>R: synthetic FAIL verdict — review call skipped
         else normal attempt
             R->>V: review(reviewer_model or settings.model, goal, answer, ws, changed)
-            V->>V: workspace listing + changed-file snapshots + pytest run
+            V->>V: workspace listing + ws.attempt_diff()<br/>(snapshots as the no-git fallback) + pytest run
             V->>O: chat (REVIEWER_SYSTEM, read-only tools, temp 0.1)
             O-->>V: JSON {pass, criteria[], feedback}
             V-->>R: Verdict (with re-ask + YES/NO fallbacks)
         end
 
+        R->>R: ui.attempt_result(n, …) → attempt-ledger row
+
         alt verdict passed
             R->>R: save final_output.txt — done
         else failed
+            opt -i / --interactive
+                R->>U: steer the retry (Enter / guidance / q)
+            end
             R->>S: compact old attempts to stubs,<br/>send RETRY_CONTINUE (same conversation)
             Note over R,S: if history still over budget:<br/>fresh Session + feedback digest (context_reset)
         end
@@ -274,7 +296,7 @@ flowchart LR
         LF[list_files] & RF[read_file] & WF[write_file] & EF["edit_file<br/>(exact replace)"] & GF["grep_files<br/>(regex search)"]
     end
     subgraph exect ["execute.py"]
-        RP[run_python] & RS[run_script] & SH["run_shell<br/>(allowlist)"]
+        RP[run_python] & RS[run_script] & SH["run_shell<br/>(policy shell.mode)"]
     end
     subgraph webt ["web.py"]
         WSR[web_search] & FP[fetch_page]
@@ -287,8 +309,9 @@ flowchart LR
         SA["spawn_subagent<br/>(scoped child session,<br/>returns only a summary)"]
         LS["load_skill<br/>(pull skills/&lt;name&gt;/SKILL.md<br/>instructions on demand)"]
     end
-    REG --> filet & exect & webt & mcpt & agentt
+    REG -->|"policy gate: require_approval → y/n/a/c<br/>disabled tools never advertised"| filet & exect & webt & mcpt & agentt
     filet & exect --> JAIL["workspace/ path jail"]
+    exect -.->|"--sandbox"| BOX["docker container<br/>(one per workspace)"]
 ```
 
 Three tools work on the agent itself rather than the workspace, all borrowed from
