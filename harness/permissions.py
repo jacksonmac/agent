@@ -9,6 +9,10 @@ cron) auto-deny with an error the model can react to.
 The gate sits in tools.execute_tool_call, so the executor, reviewer, and
 subagents all share it — nothing executes code without approval, and an
 "always" grant covers the whole run.
+
+Which tools are gated comes from the active policy
+(policy.execution.require_approval), and a policy with allow_yolo false
+refuses --yolo outright — see harness/policy.py.
 """
 
 from __future__ import annotations
@@ -16,10 +20,8 @@ from __future__ import annotations
 import shlex
 import sys
 
-from . import ui
+from . import policy, ui
 from .runlog import log_event
-
-GATED = frozenset({"run_shell", "run_python", "run_script"})
 
 _yolo = False
 _always: set = set()        # tools granted "always" this run
@@ -32,10 +34,23 @@ def _interactive() -> bool:  # wrapped for testability
     return sys.stdin.isatty()
 
 
+def gated() -> frozenset:
+    """The tools requiring approval under the active policy."""
+    return frozenset(policy.current.execution.require_approval)
+
+
+def is_yolo() -> bool:
+    """Whether the gate is actually off — recorded in run_start, so the log
+    says what was in force rather than what was requested."""
+    return _yolo
+
+
 def configure(yolo: bool) -> None:
-    """Set the gate for this run. Resets per-run grants."""
+    """Set the gate for this run. Resets per-run grants. A policy with
+    allow_yolo false is a ceiling, not a default: --yolo is rejected in
+    cli.main before we get here, and ignored if it somehow arrives."""
     global _yolo, _always, _always_cmd, _warned_non_tty
-    _yolo = yolo
+    _yolo = yolo and policy.current.execution.allow_yolo
     _always = set()
     _always_cmd = set()
     _warned_non_tty = False
@@ -81,15 +96,18 @@ def check(name: str, arguments) -> str | None:
     """None = allowed; otherwise an '[ERROR] permission denied ...' string
     returned to the model instead of running the tool."""
     global _warned_non_tty
-    if _yolo or name not in GATED or name in _always:
+    if _yolo or name not in gated() or name in _always:
         return None
 
+    # the command, not just the tool name: "run_shell was approved" tells a
+    # later reader nothing about what actually ran
+    detail = _detail(name, arguments)[:500]
     if not _interactive():
         if not _warned_non_tty:
             _warned_non_tty = True
             ui.warn("permission prompts need a terminal — code-executing tools "
                     "will be denied (use --yolo for non-interactive runs)")
-        log_event("permission", tool=name, decision="auto-deny")
+        log_event("permission", tool=name, detail=detail, decision="auto-deny")
         return (f"[ERROR] permission denied: '{name}' requires interactive "
                 f"approval and this session is non-interactive. Re-run with "
                 f"--yolo to allow execution tools, or accomplish the task "
@@ -105,16 +123,17 @@ def check(name: str, arguments) -> str | None:
         command_scope=base)
     if ans == "c" and base:
         _always_cmd.add((name, base))
-        log_event("permission", tool=name, decision=f"always-cmd:{base}")
+        log_event("permission", tool=name, detail=detail,
+                  decision=f"always-cmd:{base}")
         return None
     if ans == "a":
         _always.add(name)
-        log_event("permission", tool=name, decision="always")
+        log_event("permission", tool=name, detail=detail, decision="always")
         return None
     if ans == "y":
-        log_event("permission", tool=name, decision="allow")
+        log_event("permission", tool=name, detail=detail, decision="allow")
         return None
-    log_event("permission", tool=name, decision="deny")
+    log_event("permission", tool=name, detail=detail, decision="deny")
     return (f"[ERROR] permission denied by user for '{name}'. Do not retry "
             f"this exact call; explain what you wanted to run and continue "
             f"another way.")

@@ -1,17 +1,31 @@
-"""Web research tools: DuckDuckGo search + page fetching."""
+"""Web research tools: DuckDuckGo search + page fetching.
+
+Both are switchable off by policy (network.web_search / network.fetch_page),
+in which case tools.configure also stops advertising them. fetch_page is
+additionally bounded by network.allowed_domains and the standing refusal to
+touch private addresses — see harness/policy.py.
+"""
 
 import re
 from urllib.parse import urlparse
 
 import requests
 
+from .. import policy
 from ..config import settings
 from ..llm import truncate_middle
+
+
+def _disabled(tool: str) -> str:
+    return (f"[ERROR] {tool} is disabled by policy "
+            f"'{policy.current.name}'. Work without it.")
 
 
 def web_search(query: str, max_results: int = 5) -> str:
     """DuckDuckGo search — no API key needed. Returns numbered results with
     title, URL and snippet so the model can pick what to fetch_page next."""
+    if not policy.current.network.web_search:
+        return _disabled("web_search")
     try:
         from ddgs import DDGS  # pip install ddgs
     except ImportError:
@@ -41,12 +55,20 @@ _BLOCKED_HOSTS = ("localhost", "127.", "0.0.0.0", "10.", "192.168.", "169.254.",
 def fetch_page(url: str) -> str:
     """Fetch a web page and return its readable text, capped at
     settings.page_text_max chars so one giant page can't blow the context window."""
+    if not policy.current.network.fetch_page:
+        return _disabled("fetch_page")
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         return "[ERROR] only http/https URLs are allowed"
     host = (parsed.hostname or "").lower()
-    if any(host == b.rstrip(".") or host.startswith(b) for b in _BLOCKED_HOSTS):
+    if policy.current.network.block_private_addresses and \
+            any(host == b.rstrip(".") or host.startswith(b) for b in _BLOCKED_HOSTS):
         return "[ERROR] refusing to fetch local/private network addresses"
+    if not policy.domain_allowed(host):
+        allowed = policy.current.network.allowed_domains
+        return (f"[ERROR] policy '{policy.current.name}' does not allow "
+                f"fetching {host}. Allowed domains: "
+                + (", ".join(allowed) if allowed else "(none)"))
     try:
         resp = requests.get(url, timeout=30, headers={
             "User-Agent": "Mozilla/5.0 (compatible; research-agent/1.0)"})

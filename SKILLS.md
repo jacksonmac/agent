@@ -196,7 +196,8 @@ Everything lives in one small module, [`harness/skills.py`](harness/skills.py):
 Wiring points:
 
 - Registered as a tool in [`harness/tools/__init__.py`](harness/tools/__init__.py)
-  (`tools` dict + `TOOL_SCHEMAS`); **not** in `permissions.GATED`.
+  (`tools` dict + `TOOL_SCHEMAS`); **not** gated (it is absent from
+  `execution.require_approval` in the policy, and not gateable).
 - Injected into the executor prompt in [`harness/cli.py`](harness/cli.py) and the
   subagent prompt in [`harness/tools/subagent.py`](harness/tools/subagent.py).
 - Cap exception for loaded bodies in [`harness/llm.py`](harness/llm.py).

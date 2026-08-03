@@ -1,0 +1,23 @@
+{
+  "name": "open",
+  "shell": {
+    "mode": "any",
+    "allowed": []
+  },
+  "network": {
+    "web_search": true,
+    "fetch_page": true,
+    "block_private_addresses": false,
+    "allowed_domains": ["*"]
+  },
+  "execution": {
+    "require_approval": [],
+    "allow_yolo": true,
+    "sandbox": "optional"
+  },
+  "limits": {
+    "max_attempts": 10,
+    "max_tool_rounds": 30,
+    "subagent_max_rounds": 30
+  }
+}

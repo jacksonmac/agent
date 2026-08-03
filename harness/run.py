@@ -9,6 +9,7 @@ import shutil
 import time
 
 from . import hooks as hooks_mod
+from . import permissions
 from . import todos as todos_mod
 from . import ui
 from .config import settings
@@ -154,12 +155,17 @@ def main(model: str, goal: str, task: str, ws: Workspace, log: RunLog,
     # against the goal, so the worker should know it too
     user_msg = f"GOAL: {goal}\n\nTASK: {task}" if goal != task else task
 
+    # the guardrails go in the log, not just in memory: what a run was allowed
+    # to do has to be answerable from events.jsonl afterwards, by someone who
+    # wasn't there
     log.event("run_start", goal=goal, task=task, model=model,
               executor=executor_model,
               reviewer=settings.reviewer_model or settings.model,
               max_attempts=max_attempts,
               criteria=criteria or [], best_of=best_of,
-              plan_first=settings.plan_first, self_check=settings.self_check)
+              plan_first=settings.plan_first, self_check=settings.self_check,
+              policy=settings.policy.as_dict(), yolo=permissions.is_yolo(),
+              sandbox=settings.sandbox)
     log.transcript(f"# Agent run {time.strftime('%Y-%m-%dT%H:%M:%S')}\n\n"
                    f"**Goal:** {goal}\n\n**Task:** {task}\n\n")
     if criteria:

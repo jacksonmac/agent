@@ -8,7 +8,7 @@ from typing import Optional
 
 import requests
 
-from . import ui
+from . import policy, ui
 from .config import settings
 
 
@@ -229,13 +229,15 @@ class Session:
     what it read, wrote, and saw fail) instead of starting blind."""
 
     def __init__(self, model: str, system: str, tool_schemas: Optional[list],
-                 think: bool = True, max_tool_rounds: int = 15,
+                 think: bool = True, max_tool_rounds: Optional[int] = None,
                  label: str = "llm", options: Optional[dict] = None,
                  accept_user_messages: bool = False):
         self.model = model
         self.tool_schemas = tool_schemas
         self.think = think
-        self.max_tool_rounds = max_tool_rounds
+        # None = whatever the active policy allows (limits.max_tool_rounds)
+        self.max_tool_rounds = (policy.current.limits.max_tool_rounds
+                                if max_tool_rounds is None else max_tool_rounds)
         self.label = label
         self.options = options
         # only the executor opts in — reviewer/subagent sessions must not
@@ -359,7 +361,7 @@ class Session:
 
 @timed
 def chat_v2(model: str, system: str, user: str, tool_schemas: Optional[list],
-            think: bool = True, max_tool_rounds: int = 15,
+            think: bool = True, max_tool_rounds: Optional[int] = None,
             label: str = "llm", options: Optional[dict] = None) -> str:
     """One system + one user turn, with an optional tool-calling loop."""
     return Session(model, system, tool_schemas, think=think,

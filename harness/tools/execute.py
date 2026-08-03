@@ -4,6 +4,9 @@ All run with cwd inside the run's workspace, so scripts and generated
 files land there — never in the repo. With --sandbox they run inside a
 per-run Docker container instead (workspace mounted at /ws), which is why
 the shell allowlist is waived there.
+
+The allowlist itself comes from the active policy (policy.shell), not from
+a constant here — see harness/policy.py.
 """
 
 import atexit
@@ -11,6 +14,7 @@ import os
 import shlex
 import subprocess
 
+from .. import policy
 from ..config import settings
 from ..workspace import Workspace
 
@@ -101,16 +105,16 @@ def run_script(ws: Workspace, name: str, args: list = None) -> str:
     return _run(ws, ["python3", rel, *argv], timeout=120, what="script")
 
 
-ALLOWED_COMMANDS = ["pip", "pip3", "python3", "pytest", "ls", "mkdir", "cat", "echo"]
 _SHELL_META = set(";|&<>`$\n")
 
 
 def run_shell(ws: Workspace, command: str) -> str:
-    """Run a shell command. Outside the sandbox: one plain allowlisted
-    command, shell=False + shlex so the allowlist can't be bypassed with
-    'echo hi; curl ... | sh' style chaining. Inside the sandbox the
-    container is the guardrail, so the model gets a real shell."""
-    if settings.sandbox:
+    """Run a shell command. Under shell.mode 'allowlist': one plain command
+    from policy.shell.allowed, shell=False + shlex so the allowlist can't be
+    bypassed with 'echo hi; curl ... | sh' style chaining. Under 'any' — or
+    inside --sandbox, where the container is the guardrail — the model gets a
+    real shell."""
+    if settings.sandbox or policy.current.shell.mode == "any":
         return _run(ws, ["sh", "-c", command], timeout=360, what="command")
     if any(ch in _SHELL_META for ch in command):
         return ("[ERROR] shell metacharacters (; | & < > ` $) are not allowed. "
@@ -121,7 +125,11 @@ def run_shell(ws: Workspace, command: str) -> str:
         return f"[ERROR] could not parse command: {e}"
     if not parts:
         return "[ERROR] empty command"
-    if parts[0] not in ALLOWED_COMMANDS:
+    allowed = policy.current.shell.allowed
+    if parts[0] not in allowed:
+        if not allowed:
+            return (f"[ERROR] command '{parts[0]}' is not allowed: policy "
+                    f"'{policy.current.name}' permits no shell commands at all.")
         return (f"[ERROR] command '{parts[0]}' is not allowed. "
-                f"Allowed commands: {', '.join(ALLOWED_COMMANDS)}")
+                f"Allowed commands: {', '.join(allowed)}")
     return _run(ws, parts, timeout=360, what="command")

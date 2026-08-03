@@ -9,6 +9,7 @@ import requests
 from . import hooks as hooks_mod
 from . import llm as llm_mod
 from . import permissions
+from . import policy
 from . import run as run_mod
 from . import runlog
 from . import skills as skills_mod
@@ -76,7 +77,14 @@ def parse_args():
                    help=f"container image for --sandbox (default: {settings.sandbox_image})")
     p.add_argument("--yolo", action="store_true",
                    help="skip permission prompts for code-executing tools "
-                        "(run_shell/run_python/run_script)")
+                        "(run_shell/run_python/run_script); a policy with "
+                        "allow_yolo false refuses this")
+    p.add_argument("--policy", default=os.path.join(HERE, "policy.json"),
+                   metavar="PATH",
+                   help="guardrails to run under: which shell commands are "
+                        "allowed, which tools need approval, which domains are "
+                        "fetchable, and the run limits (default: policy.json; "
+                        "see policy.strict.json / policy.open.json)")
     p.add_argument("--no-stream", action="store_true",
                    help="wait for complete responses instead of streaming tokens live")
     p.add_argument("--no-notify", action="store_true",
@@ -122,6 +130,36 @@ def _apply_command(args, parser) -> None:
             setattr(args, dest, type(default)(val) if default is not None else val)
     desc = f": {cmd.description}" if cmd.description else ""
     print(f"[command] {cmd.name}{desc}")
+
+
+def _enforce_policy(args, parser, pol) -> None:
+    """Apply the policy as a ceiling rather than a default: a flag it forbids
+    is an error, and a limit it sets clamps what was asked for. Mutates args
+    and settings; raises SystemExit on a refused flag.
+
+    The point of erroring instead of quietly downgrading is that "this run
+    could not have executed unapproved code" should be a fact about the run,
+    not a hope about what someone typed."""
+    if args.yolo and not pol.execution.allow_yolo:
+        raise SystemExit(f"[ERROR] policy '{pol.name}' does not allow --yolo — "
+                         f"code-executing tools have to be approved "
+                         f"interactively under it. Use a different --policy, "
+                         f"or run without --yolo.")
+    if pol.execution.sandbox == "forbidden" and args.sandbox:
+        raise SystemExit(f"[ERROR] policy '{pol.name}' forbids --sandbox.")
+    if pol.execution.sandbox == "required" and not settings.sandbox:
+        settings.sandbox = True
+        print(f"[policy] {pol.name} requires the sandbox — enabling it")
+    if args.attempts > pol.limits.max_attempts:
+        # an explicit --attempts gets a warning; the argparse default just
+        # gets clamped (same "did the user actually ask for this?" test as
+        # _apply_command uses for command frontmatter)
+        if args.attempts != parser.get_default("attempts"):
+            ui.warn(f"policy '{pol.name}' caps attempts at "
+                    f"{pol.limits.max_attempts}; ignoring --attempts "
+                    f"{args.attempts}")
+        args.attempts = pol.limits.max_attempts
+    settings.subagent_max_rounds = pol.limits.subagent_max_rounds
 
 
 def _load_agent_md(ws_root: str) -> str:
@@ -268,6 +306,14 @@ def main():
         print(f"[resume] {os.path.dirname(args.workspace)}")
     if args.url:
         settings.url = args.url
+    # the policy loads before anything else it can veto, and a bad policy
+    # file stops the run here rather than half-way through it
+    try:
+        pol = policy.load(args.policy)
+    except policy.PolicyError as e:
+        raise SystemExit(f"[ERROR] {e}")
+    policy.configure(pol)
+    settings.policy = pol
     settings.model = args.model
     settings.reviewer_model = args.reviewer_model
     settings.executor_model = args.executor_model
@@ -283,6 +329,8 @@ def main():
     settings.sandbox = args.sandbox
     settings.sandbox_image = args.sandbox_image
     settings.skills = not args.no_skills
+    _enforce_policy(args, parser, pol)
+    print(f"[policy] {pol.name} ({args.policy})")
     permissions.configure(yolo=args.yolo)
     settings.stream = not args.no_stream
     settings.notify = not args.no_notify
