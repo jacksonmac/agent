@@ -100,7 +100,7 @@ User (CLI) ──► Harness (this product) ──HTTP──► Ollama server (L
 - **F8 — Extensibility:** MCP gateway tools, user hooks, and saved commands.
 - **F9 — Persistence & reporting:** transcript, machine-readable event log, self-contained HTML report, sqlite run history, and AGENT.md memory notes.
 - **F10 — Presentation:** live rich terminal dashboard with a plain-print fallback, streaming, diffs, and notifications.
-- **F11 — Evaluation suite:** 8 benchmark goals with programmatic checkers for A/B-testing harness changes and models.
+- **F11 — Evaluation suite:** 8 benchmark goals with programmatic checkers for benchmarking harness changes and models. Statistically sound A/B comparison (repeats, paired arms, significance) is I-12.
 
 ### 2.3 User Classes and Characteristics
 
@@ -108,7 +108,7 @@ User (CLI) ──► Harness (this product) ──HTTP──► Ollama server (L
 |---|---|---|
 | **Operator (primary)** | A technically proficient developer running goals from a terminal. Comfortable with CLI flags, Python, and git. Uses the product frequently and interactively; expects the dashboard, permission prompts, and readable reports. | Favored |
 | **Automation user** | The same developer (or a scheduler such as cron/CI) invoking the harness non-interactively with `--yolo`. Needs deterministic non-TTY behavior: plain output, auto-deny or auto-allow permissions, machine-readable artifacts. | Favored |
-| **Harness developer** | A contributor modifying `harness/` itself. Relies on the pytest suite (~161 tests) and the eval suite to validate changes. | Secondary |
+| **Harness developer** | A contributor modifying `harness/` itself. Relies on the pytest suite (372 tests) and the eval suite to validate changes. | Secondary |
 | **Extension author** | A user writing `commands/*.md` templates, `hooks.json` entries, or attaching MCP tools. Needs stable placeholder/frontmatter contracts. | Secondary |
 
 ### 2.4 Operating Environment
@@ -125,7 +125,7 @@ User (CLI) ──► Harness (this product) ──HTTP──► Ollama server (L
 - **CO-2:** All model I/O goes through Ollama's `/api/chat` endpoint and its tool-calling schema; no other LLM providers are supported.
 - **CO-3:** Python 3.10+ standard library preferred; runtime dependencies are limited to `requests` and `rich`, with optional extras degrading gracefully.
 - **CO-4:** All agent file/exec activity must stay inside the per-run workspace jail; nothing is written to the repo root during a run.
-- **CO-5:** Code execution safety relies on a command allowlist and metacharacter rejection, not OS-level sandboxing (containers are a roadmap item — see Appendix).
+- **CO-5:** Code execution safety relies by default on a command allowlist and metacharacter rejection rather than OS-level isolation; `--sandbox` adds a per-workspace Docker container (I-1), but it is opt-in, so the allowlist is what carries the guarantee in the default configuration.
 - **CO-6:** Hooks are strictly observational: they must never be able to block or mutate a run.
 - **CO-7:** The UI must function without `rich` and without a TTY (plain-print fallback), since the eval suite and tests run headless.
 - **CO-8:** Configuration is a single module-level `Settings` singleton mutated once at CLI startup and read-only everywhere else.
@@ -310,7 +310,7 @@ Objective measurement of harness and model changes. **Priority: Medium.**
 ### 4.1 User Interfaces
 
 - **UI-1:** The sole user interface is the command line: `python3 agent.py <goal-source> [flags]` plus the `history` subcommand. There is no GUI; the per-run `report.html` is a static artifact opened in a browser.
-- **UI-2:** Interactive elements: the live rich dashboard (§3.10), streaming output, y/n/a permission prompts, and terminal-bell/banner notifications. All are TTY-conditional with plain fallbacks.
+- **UI-2:** Interactive elements: the live rich dashboard (§3.10), streaming output, y/n/a/c permission prompts, single-key dashboard controls (pause, message, interrupt, attempt ledger, budget, transcript, quit), and terminal-bell/banner notifications. All are TTY-conditional with plain fallbacks.
 - **UI-3:** Errors surfaced to the model use a uniform `[ERROR] ...` string convention; errors surfaced to the user are printed as warnings above the live region and never silently swallowed at run level.
 
 ### 4.2 Hardware Interfaces
@@ -350,7 +350,7 @@ Objective measurement of harness and model changes. **Priority: Medium.**
 
 - **SF-1:** The workspace jail (REQ-35) shall prevent the agent from reading or writing any file outside its per-run `workspace/`, protecting the host system and the harness's own code from agent action.
 - **SF-2:** Arbitrary shell execution shall be impossible via `run_shell`: allowlist + metacharacter rejection + `shell=False` (REQ-26).
-- **SF-3:** Code-executing tools (`run_shell`, `run_python`, `run_script`) shall require explicit interactive approval (y/n/a) unless `--yolo` was given; non-interactive sessions shall auto-deny with an actionable error rather than silently executing (see §5.3).
+- **SF-3:** Code-executing tools (the policy's `execution.require_approval`, by default `run_shell`, `run_python`, `run_script`) shall require explicit interactive approval (y/n/a, plus `c` to grant a base command for the run) unless `--yolo` was given — and a policy may forbid `--yolo` outright via `allow_yolo: false`; non-interactive sessions shall auto-deny with an actionable error rather than silently executing (see §5.3).
 - **SF-4:** `fetch_page`'s private-address block shall prevent the agent from being steered into probing the local network (SSRF-style).
 - **SF-5:** Failed runs shall be clearly labeled (`final_output_UNVERIFIED.txt`) so unverified output is never mistaken for verified output.
 
@@ -367,7 +367,7 @@ Objective measurement of harness and model changes. **Priority: Medium.**
 ### 5.4 Software Quality Attributes
 
 - **QA-1 — Robustness:** Non-core subsystems (review parsing, report generation, memory writing, notifications, hooks, optional web tools) shall degrade or fall back rather than abort a run; the run loop is the only component allowed to end a run.
-- **QA-2 — Testability:** The harness shall be fully exercisable headless; the pytest suite (~161 tests under `tests/`) covers the loop, sessions, streaming, review, tools, permissions, hooks, memory, history, resume, subagents, todos, commands, and reporting.
+- **QA-2 — Testability:** The harness shall be fully exercisable headless; the pytest suite (372 tests under `tests/`) covers the loop, sessions, streaming, review, tools, permissions, policy, hooks, memory, history, resume, subagents, todos, commands, skills, git evidence, sandbox, reporting, and office fidelity. Dashboard rendering and the interactive key controls are covered headlessly, so a TTY is not required to exercise them.
 - **QA-3 — Measurability:** Any behavior change shall be benchmarkable with the eval suite against a baseline (REQ-59/60); real token counts and per-phase timings shall be logged per run.
 - **QA-4 — Observability:** Every significant action (LLM call, tool call, permission decision, hook, attempt, verdict) shall appear in `events.jsonl`; a human shall be able to reconstruct a run from `transcript.md` or `report.html` alone.
 - **QA-5 — Portability:** macOS and Linux, TTY and non-TTY, with and without optional packages.
@@ -390,14 +390,15 @@ Objective measurement of harness and model changes. **Priority: Medium.**
 
 | # | Issue | Status |
 |---|---|---|
-| I-1 | **Sandboxed execution** — replace the `run_shell` allowlist with container-based isolation for exec tools. | Open (roadmap) |
+| I-1 | **Sandboxed execution** — container-based isolation for the exec tools. | **Closed** — `--sandbox` runs them in a per-workspace Docker container (`tools/execute.py`, `tests/test_sandbox.py`). The allowlist remains the default: the container is opt-in, so `policy.shell` still carries the guarantee when it is off. |
 | I-2 | **Untrusted-network deployment** — plain-HTTP LAN transport to Ollama; TLS/auth story is TBD if the server ever leaves the trusted LAN. | Open |
 | I-3 | **Multi-phase planning** — plan → execute-per-phase → review-per-phase for large goals. | Open (roadmap) |
-| I-4 | **Git-aware workspace** — commit per attempt and give the reviewer real diffs instead of mtime-based snapshots. | Open (roadmap) |
-| I-5 | **Reviewer model selection** — the default reviewer is the executor's model; a benchmarked ~30B-class default is TBD pending eval A/B runs. | Open |
+| I-4 | **Git-aware workspace** — commit per attempt and give the reviewer real diffs instead of mtime-based snapshots. | **Closed** — `workspace_git` (on by default, `--no-git`): `init_git`/`commit_attempt`/`attempt_diff`, consumed by `review.py` with snapshots as the no-git fallback (`tests/test_git_evidence.py`). |
+| I-5 | **Reviewer model selection** — the default reviewer is the executor's model; a benchmarked ~30B-class default is TBD pending eval A/B runs. Blocked on I-12: with one run per goal the suite cannot currently tell a better reviewer from a lucky one. | Open |
 | I-6 | **Subagent discoverability** — smaller executor models rarely call `spawn_subagent` unless the goal names delegation explicitly; whether the harness should suggest delegation automatically is TBD. | Open |
 | I-7 | **Windows client support** — the harness targets macOS/Linux; Windows-as-client (path handling, notifications, symlinks for `runs/latest`) is untested and TBD. | Open |
 | I-8 | **Office-document tools** — first-class read/edit/write tools for `.xlsx`/`.csv` and `.docx` (presentations later) in `harness/tools/docs.py`, with `policy.json` entries. Editing an existing file with full round-trip fidelity is the requirement, not just authoring a new one. | Open (roadmap) |
 | I-9 | **Binary-aware review evidence** — `review.py` currently snapshots deliverables as text; office formats need extraction (docx/xlsx/pptx → text) in `snapshot_files` and `automated_checks`, or the verdict degrades to "the file exists". Blocks I-8. | Open (roadmap) |
 | I-10 | **xlsx edit fidelity guard** — measured (openpyxl 3.1.5): charts, images, conditional formatting, data validation, defined names, comments and merges survive a round-trip, but `<extLst>` constructs (sparklines, slicers, x14 rules) are dropped from *inside* surviving parts, `customXml/` is dropped, `vbaProject.bin` needs `keep_vba=True`, and `data_only=True` destroys every formula. Edit tools must fingerprint before/after (part inventory + unmodelled-construct scan + formula count) and refuse the write on any unrequested loss. Blocks I-8 for xlsx only — python-docx 1.2.0 round-trips docx losslessly, including content controls, tracked changes and fields. | **Closed** — `harness/office.py` + `tests/test_office.py` |
 | I-11 | **Presentations (`.pptx`) and surgical part-level patching** — deferred until I-8 is in real use. Patching (rewrite one OPC part, leave the rest byte-identical) is the fallback if I-10's guard refuses edits users legitimately want; there is no point building it before that is observed. | Open (deferred) |
+| I-12 | **A/B testing for the main loop** — `evals/run_evals.py` runs each of the 8 goals once per label and labels any single flip `improved`/`REGRESSED`, which at `temperature 0.7` cannot separate a real gain from sampling noise (one goal = 12.5 points of pass rate). Needs `--repeat N`, interleaved arms paired by `(goal, repeat)`, a paired test with an interval plus the minimum detectable effect for the N run, and per-arm resolved settings recorded in the results file. Prerequisite for deciding I-5 and any prompt or loop-structure change on evidence. | Open (roadmap) |

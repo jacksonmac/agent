@@ -432,11 +432,13 @@ harness/
 ├── history.py        # sqlite run index (agent.py history)
 ├── commands.py       # commands/*.md loader (-c)
 ├── skills.py         # skills/<name>/SKILL.md index + load_skill tool
+├── office.py         # office-doc fidelity guard (stdlib-only OPC fingerprint)
 ├── hooks.py          # observe-only hooks.json event hooks
 ├── policy.py         # policy.json loader/validator: the guardrails as data
-├── permissions.py    # y/n/a gate for the policy's gated tools (--yolo)
+├── permissions.py    # y/n/a/c gate for the policy's gated tools (--yolo)
 ├── run.py            # the execute → review → retry loop (+ plan/self-check/best-of)
 ├── ui.py             # rich live dashboard, plain-print fallback
+├── keys.py           # non-blocking single-key TTY reads for the dashboard
 ├── report.py         # self-contained report.html per run
 └── tools/
     ├── __init__.py   # registry, Ollama schemas, execute_tool_call dispatch
@@ -612,6 +614,33 @@ this file replaced: installing the repo without one changes nothing.
 
 ## Roadmap
 
+- **A/B testing for the main loop** — the eval suite can already answer "did this change
+  help?" but not "am I sure?", and every loop improvement worth making is small enough to
+  hide in the noise. Today each of the 8 goals runs **once** per label while the executor
+  samples at `temperature 0.7`, so a single flipped goal moves the pass rate by 12.5 points
+  and `--compare` will happily print `improved` or `REGRESSED` for what is one coin toss.
+  Comparing two labels also compares two moments in time on the same Ollama server. Four
+  changes turn it into an instrument:
+  - **Repeats.** `--repeat N` runs each goal N times per arm and keeps every outcome, so a
+    goal has a pass *rate* rather than a bit. Nothing else on this list works without it.
+  - **Interleaved arms.** `--arm baseline= --arm variant="--no-self-check"` defines the arms
+    up front and runs them interleaved within one session, pairing by `(goal, repeat)`.
+    Drift in server or model state then hits both arms equally instead of landing entirely
+    on whichever ran second.
+  - **Honest comparison.** Report per-goal `k/N` per arm and a paired test over the
+    discordant pairs (McNemar, or a bootstrap over goals) with an interval — and say
+    "within noise" when it is. Also report the **minimum detectable effect** for the N
+    actually run, so a cheap run that could never have answered the question says so
+    instead of implying a result.
+  - **Self-describing results.** Record each arm's resolved settings in the results file.
+    `run_start` already logs models, policy and every toggle; lifting that into the arm
+    record means a results file from last month still says what it tested.
+
+  The point is to make loop changes decidable: prompt wording, `--no-plan` vs plan-first,
+  self-check on/off, `--best-of`, retry-vs-fresh-session, and reviewer model choice (RD I-5)
+  are all one-line experiments once the arms exist. Cost is the real constraint — 8 goals ×
+  N repeats × 2 arms against a local model is hours — so a `--quick` subset and a printed
+  cost estimate before the run matter as much as the statistics.
 - Multi-phase planning for big goals (plan → execute each phase → review each phase);
   plan-seeded todos are the first slice of this
 - **Office documents as first-class deliverables** — spreadsheets and documents first
