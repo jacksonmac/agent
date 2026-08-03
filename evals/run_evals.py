@@ -30,13 +30,59 @@ from goals import GOALS, GOALS_BY_NAME  # noqa: E402
 RUN_DIR_PAT = re.compile(r"^\[run\] (.+)$", re.MULTILINE)
 
 
+ARM_KEYS = {"flags", "prompts", "description"}
+
+
+def load_experiment(path: str) -> dict:
+    """Parse an experiment file into {name, arms: {arm: {flags: [...]}}}.
+
+    Validation is strict and names the offending key, following policy.py:
+    an experiment that silently ignores a typo'd arm would report a
+    difference between two identical arms and waste a night proving it.
+    """
+    with open(path) as f:
+        raw = json.load(f)
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: top level must be an object")
+    unknown = set(raw) - {"name", "arms"}
+    if unknown:
+        raise ValueError(f"{path}: unknown key(s) {sorted(unknown)}")
+    arms = raw.get("arms")
+    if not isinstance(arms, dict) or len(arms) < 2:
+        raise ValueError(f"{path}: 'arms' must be an object with at least two "
+                         f"arms — one arm is not a comparison")
+    out = {}
+    for name, spec in arms.items():
+        if not isinstance(spec, dict):
+            raise ValueError(f"{path}: arm '{name}' must be an object")
+        bad = set(spec) - ARM_KEYS
+        if bad:
+            raise ValueError(f"{path}: arm '{name}' has unknown key(s) "
+                             f"{sorted(bad)} (allowed: {sorted(ARM_KEYS)})")
+        flags = spec.get("flags", [])
+        if not isinstance(flags, list) or any(not isinstance(f, str) for f in flags):
+            raise ValueError(f"{path}: arm '{name}': 'flags' must be a list of strings")
+        if spec.get("prompts"):
+            # honest failure rather than a silently ignored arm: the override
+            # hook is the last step of the roadmap item, not this one
+            raise ValueError(
+                f"{path}: arm '{name}' sets 'prompts', which needs the "
+                f"prompts.py override hook (roadmap I-12 step 5). Use 'flags' "
+                f"for now rather than running an experiment that ignores it.")
+        out[name] = {"flags": list(flags),
+                     "description": spec.get("description", "")}
+    return {"name": raw.get("name", os.path.basename(path)), "arms": out}
+
+
 def run_goal(goal, attempts: int, timeout: int, model: str | None,
              url: str | None, out_root: str,
              reviewer_model: str | None = None, extra_args: list | None = None,
-             repeat: int = 1) -> dict:
+             repeat: int = 1, arm: str = "") -> dict:
     # each repeat gets its own workspace: sharing one would let repeat 2 start
     # from the files repeat 1 produced, which measures nothing
-    ws_dir = os.path.join(out_root, goal.name, f"rep_{repeat}", "workspace")
+    parts = [out_root, goal.name] + ([arm] if arm else []) + [f"rep_{repeat}",
+                                                             "workspace"]
+    ws_dir = os.path.join(*parts)
     os.makedirs(ws_dir, exist_ok=True)
     for name, content in goal.seed_files.items():
         path = os.path.join(ws_dir, name)
@@ -82,7 +128,8 @@ def run_goal(goal, attempts: int, timeout: int, model: str | None,
               "timed_out": timed_out, "checker_passed": False, "checker_detail": "",
               "harness_passed": None, "attempts_used": None,
               "llm_secs": None, "prompt_tokens": None, "eval_tokens": None,
-              "tool_calls": None, "tool_errors": None, "tool_repeats": None}
+              "tool_calls": None, "tool_errors": None, "tool_repeats": None,
+              "arm": arm}
 
     try:
         ok, detail = goal.check(ws_dir)
@@ -221,6 +268,86 @@ def print_table(results: list[dict]) -> None:
               f"{g['tool_error_rate']:<6} {g['tool_repeat_rate']:<6} {fail[:30]}")
 
 
+def per_arm(results: list[dict]) -> dict:
+    """arm name -> its results, in the order the arms were declared."""
+    out: dict[str, list] = {}
+    for r in results:
+        out.setdefault(r.get("arm") or "", []).append(r)
+    return out
+
+
+def paired_deltas(control: list[dict], variant: list[dict]) -> dict:
+    """Pair the two arms by (goal, repeat) and report the mean difference.
+
+    Pairing is the whole point of interleaving: the two runs of a pair
+    happened seconds apart on the same server, so whatever drifted between
+    the start and the end of the night drifted for both of them.
+    """
+    def key(r):
+        return (r["goal"], r["repeat"])
+
+    a = {key(r): r for r in control}
+    b = {key(r): r for r in variant}
+    pairs = [(a[k], b[k]) for k in sorted(a.keys() & b.keys())]
+    if not pairs:
+        return {"pairs": 0}
+
+    def mean(f):
+        return sum(f(y) - f(x) for x, y in pairs) / len(pairs)
+
+    def num(r, k):
+        return r.get(k) or 0
+
+    wins = sum(1 for x, y in pairs if y["checker_passed"] and not x["checker_passed"])
+    losses = sum(1 for x, y in pairs if x["checker_passed"] and not y["checker_passed"])
+    return {
+        "pairs": len(pairs),
+        "pass_delta": round(mean(lambda r: float(bool(r["checker_passed"]))), 3),
+        "wins": wins, "losses": losses, "discordant": wins + losses,
+        "wall_delta": round(mean(lambda r: r["wall_secs"]), 1),
+        "token_delta": round(mean(lambda r: num(r, "prompt_tokens") + num(r, "eval_tokens"))),
+        "tool_call_delta": round(mean(lambda r: num(r, "tool_calls")), 1),
+        "tool_repeat_delta": round(mean(lambda r: num(r, "tool_repeats")), 1),
+    }
+
+
+def print_arms(experiment: dict, results: list[dict]) -> None:
+    """Per-arm tables, then each variant paired against the first arm."""
+    arms = per_arm(results)
+    order = [a for a in experiment["arms"] if a in arms]
+    for name in order:
+        desc = experiment["arms"][name].get("description") or \
+            " ".join(experiment["arms"][name]["flags"]) or "(no flags)"
+        print(f"\n=== arm: {name} — {desc} ===")
+        print_table(arms[name])
+        print(f"summary: {json.dumps(summarize(arms[name]))[:200]}")
+
+    if len(order) < 2:
+        return
+    control = order[0]
+    print(f"\n─── paired against '{control}' ───")
+    for name in order[1:]:
+        d = paired_deltas(arms[control], arms[name])
+        if not d["pairs"]:
+            print(f"  {name}: no comparable pairs")
+            continue
+        print(f"  {name}: {d['pairs']} pairs")
+        print(f"    pass rate   {d['pass_delta']:+.3f}   "
+              f"({d['wins']} won, {d['losses']} lost, "
+              f"{d['pairs'] - d['discordant']} unchanged)")
+        print(f"    wall secs   {d['wall_delta']:+.1f}")
+        print(f"    tokens      {d['token_delta']:+d}")
+        print(f"    tool calls  {d['tool_call_delta']:+.1f}   "
+              f"repeats {d['tool_repeat_delta']:+.1f}")
+        if d["discordant"] < 6:
+            # a paired proportion test on this many flips has no power worth
+            # the name; saying so is the point of the whole exercise
+            print(f"    NOTE: only {d['discordant']} goals changed outcome. "
+                  f"That is too few to call the pass-rate difference real — "
+                  f"the cost and tool numbers above are the ones this run "
+                  f"can actually speak to.")
+
+
 def _flaky(goals: dict) -> list[str]:
     """Goals that both passed and failed across their repeats. These are the
     reason one run per goal cannot be compared: they change answer on their
@@ -288,6 +415,10 @@ def main():
                    help="name for this results file")
     p.add_argument("--compare", default=None,
                    help="previous results_*.json to diff against")
+    p.add_argument("--experiment", default=None, metavar="FILE",
+                   help="JSON file defining two or more arms to run "
+                        "interleaved and compare pairwise; see "
+                        "evals/experiments/ for examples")
     args = p.parse_args()
 
     if args.goals:
@@ -305,28 +436,53 @@ def main():
     if args.repeat < 1:
         raise SystemExit("--repeat must be at least 1")
 
-    total = len(goals) * args.repeat
-    if args.repeat > 1:
-        print(f"{len(goals)} goals × {args.repeat} repeats = {total} runs", flush=True)
+    experiment = None
+    if args.experiment:
+        try:
+            experiment = load_experiment(args.experiment)
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            raise SystemExit(f"could not load experiment: {e}")
+    # no experiment == one unnamed arm, so the loop below has one shape
+    arms = experiment["arms"] if experiment else {"": {"flags": []}}
+    base_args = args.agent_args.split() if args.agent_args else []
+
+    total = len(goals) * args.repeat * len(arms)
+    if total != len(goals):
+        parts = [f"{len(goals)} goals", f"{args.repeat} repeats"]
+        if experiment:
+            parts.append(f"{len(arms)} arms")
+        print(" × ".join(parts) + f" = {total} runs", flush=True)
+    if experiment:
+        print(f"experiment: {experiment['name']}", flush=True)
+        for name, spec in arms.items():
+            print(f"  arm {name}: {' '.join(spec['flags']) or '(no extra flags)'}",
+                  flush=True)
 
     results = []
     n = 0
-    # repeat-major, not goal-major: an interrupted run then still holds one
-    # complete pass over every goal rather than all repeats of the first few
+    # Repeat-major so an interrupted run still holds complete passes, and
+    # arm-innermost so the arms of one (goal, repeat) pair run seconds apart.
+    # Whatever drifts over a long night — server load, model residency —
+    # then drifts for both arms of every pair rather than for one of them.
     for rep in range(1, args.repeat + 1):
         for goal in goals:
-            n += 1
-            tag = f"[eval {n}/{total}]"
-            rep_s = f" rep {rep}/{args.repeat}" if args.repeat > 1 else ""
-            print(f"{tag} {goal.name}{rep_s} ...", flush=True)
-            r = run_goal(goal, args.attempts, args.timeout, args.model, args.url,
-                         out_root, reviewer_model=args.reviewer_model,
-                         extra_args=args.agent_args.split() if args.agent_args else None,
-                         repeat=rep)
-            status = "PASS" if r["checker_passed"] else f"fail ({r['checker_detail'][:80]})"
-            print(f"{tag} {goal.name}{rep_s}: {status}  "
-                  f"[{r['wall_secs']}s, attempts={r['attempts_used']}]", flush=True)
-            results.append(r)
+            for arm_name, spec in arms.items():
+                n += 1
+                tag = f"[eval {n}/{total}]"
+                rep_s = f" rep {rep}/{args.repeat}" if args.repeat > 1 else ""
+                arm_s = f" [{arm_name}]" if arm_name else ""
+                print(f"{tag} {goal.name}{rep_s}{arm_s} ...", flush=True)
+                r = run_goal(goal, args.attempts, args.timeout, args.model,
+                             args.url, out_root,
+                             reviewer_model=args.reviewer_model,
+                             extra_args=(base_args + spec["flags"]) or None,
+                             repeat=rep, arm=arm_name)
+                status = ("PASS" if r["checker_passed"]
+                          else f"fail ({r['checker_detail'][:80]})")
+                print(f"{tag} {goal.name}{rep_s}{arm_s}: {status}  "
+                      f"[{r['wall_secs']}s, attempts={r['attempts_used']}]",
+                      flush=True)
+                results.append(r)
 
     summary = summarize(results)
     out_path = os.path.join(HERE, f"results_{args.label}.json")
@@ -334,11 +490,17 @@ def main():
         json.dump({"label": args.label, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
                    "attempts": args.attempts, "repeat": args.repeat,
                    "model": args.model,
+                   # the arms are recorded verbatim so a results file still
+                   # says what it tested months later
+                   "experiment": experiment,
                    "summary": summary, "results": results}, f, indent=2)
 
-    print_table(results)
-    print(f"\nsummary: {json.dumps(summary)}")
-    print(f"results written to {out_path}")
+    if experiment:
+        print_arms(experiment, results)
+    else:
+        print_table(results)
+        print(f"\nsummary: {json.dumps(summary)}")
+    print(f"\nresults written to {out_path}")
 
     if args.compare:
         with open(args.compare) as f:

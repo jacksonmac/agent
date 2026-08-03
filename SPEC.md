@@ -550,9 +550,22 @@ of argued about. The checker is the point: `harness_passed` is the reviewer's op
 - Runs are headless, so the UI takes its plain-print path and `--yolo` is passed
   automatically — the permission gate would otherwise auto-deny every `run_python`.
 
+- **`--experiment FILE`** (`load_experiment`) declares named arms, each a list of extra
+  `agent.py` flags. Validation is strict and names the offending key — following
+  `policy.py`, because an experiment that silently drops an arm's variable would report a
+  difference between two identical arms. An arm carrying `prompts` is rejected outright
+  until the `prompts.py` override hook exists (step 5), rather than run with its variable
+  ignored. Arms run **innermost** in the loop, so both runs of a `(goal, repeat)` pair are
+  adjacent in wall-clock time and share whatever drifted; `paired_deltas` then pairs on
+  `(goal, repeat)` and reports mean differences in pass, wall seconds, tokens, tool calls
+  and repeated calls, plus won/lost/unchanged. Below six discordant pairs the report states
+  that the pass-rate difference cannot be called real. The parsed experiment is stored in
+  the results file so it remains self-describing.
+
 **Where this is going.** `print_comparison` no longer labels a single flip `improved` or
 `REGRESSED`; it prints a pass-rate delta and, when either side has fewer than two runs per
 goal, states plainly that the comparison cannot separate a real change from a resample.
-What is still missing for a genuine A/B instrument — interleaved arms paired by
-`(goal, repeat)`, bootstrap confidence intervals, the minimum detectable effect printed
-before the run, and a tool-efficiency metric — is roadmap item I-12.
+Repeats, tool efficiency, and interleaved paired arms are in. What is still missing for a
+full A/B instrument — bootstrap confidence intervals, the minimum detectable effect printed
+before the run starts, and the `prompts.py` override hook that would let an arm vary prompt
+wording — is roadmap item I-12, steps 4 and 5.

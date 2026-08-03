@@ -290,3 +290,153 @@ def test_comparison_prints_efficiency_when_present(capsys):
     out = capsys.readouterr().out
     assert "tool calls  40 -> 20" in out
     assert "repeat rate 0.3 -> 0.1" in out
+
+
+# ─── arms and interleaving (A/B step 3) ─────────────────────────────
+
+def _exp(tmp_path, obj):
+    path = tmp_path / "exp.json"
+    path.write_text(json.dumps(obj))
+    return str(path)
+
+
+def test_experiment_file_parses(tmp_path):
+    import run_evals
+    e = run_evals.load_experiment(_exp(tmp_path, {
+        "name": "self-check", "arms": {
+            "baseline": {},
+            "off": {"flags": ["--no-self-check"], "description": "skip it"}}}))
+    assert e["name"] == "self-check"
+    assert e["arms"]["baseline"]["flags"] == []
+    assert e["arms"]["off"]["flags"] == ["--no-self-check"]
+
+
+def test_experiment_validation_is_strict(tmp_path):
+    """A silently ignored typo would report a difference between two
+    identical arms and waste a night proving it."""
+    import pytest
+    import run_evals
+    with pytest.raises(ValueError, match="at least two"):
+        run_evals.load_experiment(_exp(tmp_path, {"arms": {"only": {}}}))
+    with pytest.raises(ValueError, match="unknown key"):
+        run_evals.load_experiment(_exp(tmp_path, {"armz": {}}))
+    with pytest.raises(ValueError, match="unknown key"):
+        run_evals.load_experiment(_exp(tmp_path, {"arms": {
+            "a": {"flagz": ["--x"]}, "b": {}}}))
+    with pytest.raises(ValueError, match="list of strings"):
+        run_evals.load_experiment(_exp(tmp_path, {"arms": {
+            "a": {"flags": "--no-plan"}, "b": {}}}))
+
+
+def test_prompt_arms_fail_loudly_until_the_hook_exists(tmp_path):
+    """Better to refuse than to run an experiment whose variable is ignored."""
+    import pytest
+    import run_evals
+    with pytest.raises(ValueError, match="prompts.py override hook"):
+        run_evals.load_experiment(_exp(tmp_path, {"arms": {
+            "a": {}, "b": {"prompts": {"PLAN_PROMPT": "shorter"}}}}))
+
+
+def test_arms_are_interleaved_within_each_goal_and_repeat(tmp_path, monkeypatch):
+    """Arms of a pair must run back to back, so drift over a long night hits
+    both sides of the pair rather than one whole arm."""
+    import run_evals
+    order = []
+
+    class FakeProc:
+        stdout = ""
+        returncode = 0
+
+    monkeypatch.setattr(run_evals.subprocess, "run",
+                        lambda cmd, **kw: FakeProc())
+    real = run_evals.run_goal
+
+    def spy(goal, *a, **kw):
+        order.append((goal.name, kw["repeat"], kw["arm"]))
+        return real(goal, *a, **kw)
+
+    monkeypatch.setattr(run_evals, "run_goal", spy)
+    monkeypatch.setattr(sys, "argv", [
+        "run_evals.py", "--goals", "csv_cleanup,log_parse", "--repeat", "2",
+        "--label", "t", "--experiment",
+        _exp(tmp_path, {"arms": {"a": {}, "b": {"flags": ["--no-plan"]}}})])
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(run_evals, "HERE", str(tmp_path))
+    run_evals.main()
+
+    assert order == [
+        ("csv_cleanup", 1, "a"), ("csv_cleanup", 1, "b"),
+        ("log_parse", 1, "a"), ("log_parse", 1, "b"),
+        ("csv_cleanup", 2, "a"), ("csv_cleanup", 2, "b"),
+        ("log_parse", 2, "a"), ("log_parse", 2, "b"),
+    ]
+
+
+def test_arm_flags_reach_the_subprocess(tmp_path, monkeypatch):
+    import run_evals
+    cmds = []
+
+    class FakeProc:
+        stdout = ""
+        returncode = 0
+
+    monkeypatch.setattr(run_evals.subprocess, "run",
+                        lambda cmd, **kw: (cmds.append(cmd), FakeProc())[1])
+    run_evals.run_goal(GOALS[0], 1, 60, None, None, str(tmp_path),
+                       extra_args=["--no-self-check"], arm="off")
+    assert "--no-self-check" in cmds[0]
+    assert os.path.join("off", "rep_1") in cmds[0][cmds[0].index("--workspace") + 1]
+
+
+def test_paired_deltas_pairs_by_goal_and_repeat():
+    import run_evals
+    a = [_row("g", 1, False, wall=20.0, calls=30, repeats=10),
+         _row("g", 2, True, wall=20.0, calls=30, repeats=10)]
+    b = [_row("g", 1, True, wall=10.0, calls=15, repeats=2),
+         _row("g", 2, True, wall=10.0, calls=15, repeats=2)]
+    d = run_evals.paired_deltas(a, b)
+    assert d["pairs"] == 2
+    assert d["pass_delta"] == 0.5          # one flip up, one unchanged
+    assert d["wins"] == 1 and d["losses"] == 0
+    assert d["wall_delta"] == -10.0        # the variant is faster
+    assert d["tool_call_delta"] == -15.0
+    assert d["tool_repeat_delta"] == -8.0
+
+
+def test_paired_deltas_ignores_unpaired_runs():
+    import run_evals
+    a = [_row("g", 1, True), _row("g", 2, True)]
+    b = [_row("g", 1, True)]               # arm b crashed before repeat 2
+    assert run_evals.paired_deltas(a, b)["pairs"] == 1
+    assert run_evals.paired_deltas([], [])["pairs"] == 0
+
+
+def test_arm_report_flags_too_few_discordant_pairs(capsys):
+    import run_evals
+    exp = {"name": "x", "arms": {"a": {"flags": [], "description": ""},
+                                 "b": {"flags": [], "description": ""}}}
+    rows = ([dict(_row("g", i, True), arm="a") for i in range(1, 6)] +
+            [dict(_row("g", i, i > 4), arm="b") for i in range(1, 6)])
+    run_evals.print_arms(exp, rows)
+    out = capsys.readouterr().out
+    assert "paired against 'a'" in out
+    assert "too few to call the pass-rate difference real" in out
+
+
+def test_arm_report_stays_quiet_with_enough_flips(capsys):
+    import run_evals
+    exp = {"name": "x", "arms": {"a": {"flags": [], "description": ""},
+                                 "b": {"flags": [], "description": ""}}}
+    rows = ([dict(_row("g", i, False), arm="a") for i in range(1, 9)] +
+            [dict(_row("g", i, True), arm="b") for i in range(1, 9)])
+    run_evals.print_arms(exp, rows)
+    assert "too few to call" not in capsys.readouterr().out
+
+
+def test_shipped_experiment_files_are_valid():
+    import glob
+    import run_evals
+    files = glob.glob(os.path.join(REPO, "evals", "experiments", "*.json"))
+    assert files, "no example experiments shipped"
+    for f in files:
+        run_evals.load_experiment(f)

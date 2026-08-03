@@ -458,6 +458,7 @@ harness/
 skills/               # model-loadable skills, one SKILL.md per subdirectory
 tests/                # pytest suite for the harness itself (venv/bin/python -m pytest)
 evals/                # benchmark goals + runner for measuring harness changes
+└── experiments/      # A/B arm definitions (--experiment)
 ```
 
 ## Requirements
@@ -478,6 +479,8 @@ venv/bin/python evals/run_evals.py --label after            # run all 8, write r
 venv/bin/python evals/run_evals.py --goals csv_cleanup      # subset
 venv/bin/python evals/run_evals.py --label after --repeat 5 # 5 runs per goal (40 runs)
 venv/bin/python evals/run_evals.py --label after --compare evals/results_baseline.json
+venv/bin/python evals/run_evals.py --label plan --repeat 5 \
+    --experiment evals/experiments/self-check.json      # A/B two arms, interleaved
 ```
 
 Each run also records how much of the work was wasted motion — total tool calls, the
@@ -495,6 +498,29 @@ a result. Every repeat gets its own workspace, so repeat 2 never starts from the
 repeat 1 produced. Repeats run goal-major within each pass, so an interrupted run still
 holds one complete sweep of every goal.
 
+**`--experiment FILE` runs two or more arms head to head.** An arm is a name plus a set
+of `agent.py` flags:
+
+```json
+{"name": "is the self-check turn worth its tokens?",
+ "arms": {"baseline":      {"description": "the loop as shipped"},
+          "no-self-check": {"flags": ["--no-self-check"]}}}
+```
+
+The arms run **interleaved** — innermost in the loop, so the two runs of a `(goal, repeat)`
+pair happen seconds apart. Whatever drifts across a long night (server load, model
+residency) then drifts for both sides of every pair instead of landing on whichever arm
+ran second. Results are paired by `(goal, repeat)` and reported as a mean difference in
+pass rate, wall seconds, tokens and tool calls, with the won/lost/unchanged split spelled
+out. When fewer than six goals actually changed outcome, the report says the pass-rate
+difference cannot be called real and points you at the cost numbers instead. The arm
+definitions are copied into the results file, so it still says what it tested months later.
+
+Validation is strict: an unknown key, a single arm, or a `prompts` override (which needs
+the harness hook that is still roadmap work) is an error rather than a silently ignored
+setting — an experiment whose variable is quietly dropped would report a difference between
+two identical arms and waste a night proving it.
+
 Keep `--attempts` constant across runs you compare. To capture a **baseline for the
 pre-improvement harness** (the eval suite works against whatever code is checked out):
 
@@ -503,6 +529,8 @@ git stash                                                    # park the new harn
 venv/bin/python evals/run_evals.py --label baseline
 git stash pop
 venv/bin/python evals/run_evals.py --label after --compare evals/results_baseline.json
+venv/bin/python evals/run_evals.py --label plan --repeat 5 \
+    --experiment evals/experiments/self-check.json      # A/B two arms, interleaved
 ```
 
 ### Picking a bigger reviewer model
@@ -710,7 +738,10 @@ this file replaced: installing the repo without one changes nothing.
      so arms of different length stay comparable. This is the metric that can
      move when pass rate cannot: halving the flailing on a goal that passed
      either way is a real improvement the pass rate scores as a tie.
-  3. Arm config and interleaving.
+  3. **Arm config and interleaving — done.** `--experiment FILE` declares named arms,
+     runs them innermost so each `(goal, repeat)` pair is adjacent in time, pairs the
+     results, and reports mean deltas plus a won/lost/unchanged split. It refuses an
+     experiment it cannot honestly run rather than ignoring an arm's variable.
   4. Bootstrap intervals and the up-front minimum detectable effect.
   5. The prompt-override hook, last — the only part that touches `harness/`.
 - Multi-phase planning for big goals (plan → execute each phase → review each phase);
