@@ -1,6 +1,7 @@
 # Proposal — Making the Verdict Trustworthy
 
 **Status:** proposal, nothing implemented
+**Execution plan:** [PLAN.md](PLAN.md) — the work items, acceptance criteria and sequencing
 **Scope:** `harness/review.py`, `harness/prompts.py`, `harness/run.py`, `evals/`
 **Tracks:** RD I-13 (new), and unblocks RD I-5
 

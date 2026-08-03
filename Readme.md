@@ -704,6 +704,8 @@ this file replaced: installing the repo without one changes nothing.
   the rest if the problem turns out to be small), then require evidence for a PASS, make the
   eval checkers prove they reject wrong answers, and require the agent's own verifier to
   fail against the previous attempt before its pass counts for anything.
+  [PLAN.md](PLAN.md) is the execution plan: numbered work items with acceptance criteria,
+  a decision gate after the measurement phase, and a risk register.
 - Multi-phase planning for big goals (plan → execute each phase → review each phase);
   plan-seeded todos are the first slice of this
 - **Office documents as first-class deliverables** — spreadsheets and documents first
