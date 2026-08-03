@@ -348,7 +348,7 @@ exercised. Run with `venv/bin/python -m pytest tests/`.
 ## 19. Dependencies (`requirements.txt`)
 
 Required: `requests`, `rich>=13`. Dev: `pytest`. Optional (enable web tools): `ddgs`,
-`trafilatura`. Everything else is stdlib. The harness runs without the optional packages
+`trafilatura`; (office round-trip tests only): `openpyxl`, `python-docx`. Everything else is stdlib. The harness runs without the optional packages
 (tools degrade with actionable errors) and without `rich` (plain UI).
 
 ---
@@ -383,3 +383,38 @@ Claude-Code-style skills with progressive disclosure: reusable expert instructio
 - **Disable**: `--no-skills` (or `settings.skills = False`) removes the index and makes the
   tool return a disabled error.
 - Ships with three starter skills: `pytest-debugging`, `python-packaging` (on-demand), and `hi-jackson` (`always: true`).
+
+---
+
+## 21. Office-document fidelity (`harness/office.py`)
+
+Support module for the planned document tools (RD I-8), landed ahead of them because it
+is what makes editing a user-supplied file defensible.
+
+**Why it exists.** Measured against openpyxl 3.1.5 and python-docx 1.2.0: python-docx
+repackages parts it has no model for, so docx round-trips losslessly (content controls,
+tracked changes, fields, headers, images all survive an edit). openpyxl preserves charts,
+images, conditional formatting, data validation, defined names, comments and merges — but
+silently drops what it cannot model, and not all of it at the package level: an `<extLst>`
+sparkline group vanishes from *inside* `sheet1.xml` while the part count is unchanged.
+`customXml/` is dropped, `vbaProject.bin` needs `keep_vba=True`, and `data_only=True`
+replaces every formula with a cached value.
+
+**Design.** `fingerprint(path) -> Fingerprint(parts, constructs, formulas)` reads the OPC
+zip directly — no third-party dependency, so it runs whether or not openpyxl is installed
+and can judge a file written by any library. Three signals because one is not enough:
+the part inventory, a substring scan for `MARKERS` (sparklines, slicers, pivots, macros,
+custom XML, tracked changes, content controls, fields, …) across every textual part, and a
+formula count over `xl/worksheets/*.xml`. Matching is deliberately crude: a false positive
+costs one refused edit, a false negative ships a damaged file.
+
+`compare(before, after, allow=())` / `check_edit(original, edited)` return the losses as
+readable lines; `allow` exists because deleting the sheet that held the sparklines is a
+legitimate edit and only the calling tool knows that. `describe(problems)` renders the
+refusal the model receives — it states that the original is untouched and that retrying the
+same call will not help, since a bare error otherwise invites an identical retry.
+
+**Tests** (`tests/test_office.py`): two tiers. Hand-built OPC packages exercise the logic
+with no third-party dependency (including the loss-inside-a-surviving-part case); real
+openpyxl/python-docx round-trips pin the measurements above and skip via
+`pytest.importorskip` when those optional packages are absent.

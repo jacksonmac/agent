@@ -7,4 +7,9 @@ pytest
 # Optional, only needed for the web research tools (web_search / fetch_page):
 #   ddgs
 #   trafilatura
+
+# Optional, only needed for the office round-trip tests in tests/test_office.py
+# (harness/office.py itself is stdlib-only and always runs):
+#   openpyxl
+#   python-docx
 rich>=13

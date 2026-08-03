@@ -612,20 +612,38 @@ this file replaced: installing the repo without one changes nothing.
     unless `keep_vba=True`, and `data_only=True` replaces every formula with a
     cached value — turning "read the numbers" into "destroy the spreadsheet" if
     the same workbook is later saved.
-  So the edit tools fingerprint the file before and after (OPC part inventory plus
-  a scan for known-unmodelled constructs and a formula count) and refuse to write a
+  So the edit tools fingerprint the file before and after and refuse to write a
   result that lost anything the edit did not ask to remove. A refusal surfaces to
   the model as a tool error it can react to, which is the harness's existing
   pattern; silently shipping a damaged workbook is not.
 
-  That pulls in two changes elsewhere:
-  - `workspace.py` must accept binary seed files and stop treating them as text for
-    change detection (mtime scanning is fine; snapshotting is not).
-  - `review.py` must extract text from `.docx`/`.xlsx`/`.pptx` in `snapshot_files` and
-    `automated_checks`, so the reviewer judges the actual content instead of being
-    handed a binary blob it can only guess about. Without this the review step silently
-    degrades to "the file exists", which is exactly the failure mode the harness exists
-    to prevent.
+  The work is in four steps, in this order:
+
+  1. **The fidelity guard** — `harness/office.py`. **Done.** Fingerprints an OPC
+     package three ways (part inventory, a scan for known-unmodelled constructs,
+     and a formula count), because the losses are not all visible at the package
+     level — a sparkline disappears from *inside* a part that still exists. No
+     third-party dependencies: it reads the zip directly, so it works whether or
+     not openpyxl is installed and can judge a file written by anything.
+     `office.describe()` turns a loss list into the refusal the model sees.
+  2. **xlsx tools** — `read_sheet` / `write_sheet` / `edit_cells` in
+     `harness/tools/docs.py`, with `policy.json` entries. Always `keep_vba=True`,
+     never `data_only=True` on a path that ends in a save, and every edit runs
+     through `office.check_edit` before the result is published. Ships the format
+     picked first, with the guard already behind it.
+  3. **Reviewer extraction** (`review.py`) — extract text from `.xlsx`/`.docx` in
+     `snapshot_files` and `automated_checks` so the reviewer judges real content
+     instead of a binary blob. Without it every verdict on a document deliverable
+     degrades to "the file exists", which is the exact failure the review loop
+     exists to catch. `workspace.py` needs the matching change: accept binary seed
+     files and stop treating them as text for change detection (mtime scanning is
+     fine; snapshotting is not).
+  4. **docx tools** — read paragraphs and tables, rewrite a paragraph, append
+     sections. Cheaper than xlsx because step 1 proved no guard is needed.
+
+  Deferred until the above is in real use: `.pptx`, and surgical zip-level patching
+  (rewriting a single part and leaving the rest byte-identical), which is the
+  fallback if the guard turns out to refuse edits people legitimately want.
 
 ## License
 
