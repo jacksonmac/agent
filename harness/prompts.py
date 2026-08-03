@@ -159,3 +159,56 @@ CRITERIA:
 1. <condition>
 2. <condition>
 TASK: <one paragraph>"""
+
+
+# ── experiment overrides ─────────────────────────────────────────────
+#
+# A/B-ing prompt wording is the most common change worth measuring, and no
+# CLI flag can express it. AGENT_PROMPT_OVERRIDES points at a JSON file of
+# {TEMPLATE_NAME: replacement}; the eval runner writes one per arm
+# (evals/run_evals.py). Applied at import so every consumer sees the same
+# text, and validated strictly — a typo'd name would otherwise leave the arm
+# running the stock prompt and the experiment reporting a difference between
+# two identical configurations.
+
+PROMPT_OVERRIDES_ENV = "AGENT_PROMPT_OVERRIDES"
+
+
+def _overridable() -> dict:
+    """Module-level template strings, by name. Private helpers and dunders
+    are not templates and must not be replaceable."""
+    return {k: v for k, v in globals().items()
+            if k.isupper() and not k.startswith("_") and isinstance(v, str)
+            and k != "PROMPT_OVERRIDES_ENV"}
+
+
+def apply_overrides(mapping: dict) -> list:
+    """Replace templates by name. Returns the names replaced. Raises
+    ValueError on an unknown name or a non-string value."""
+    known = _overridable()
+    applied = []
+    for name, text in mapping.items():
+        if name not in known:
+            raise ValueError(
+                f"unknown prompt template {name!r} "
+                f"(known: {', '.join(sorted(known))})")
+        if not isinstance(text, str):
+            raise ValueError(f"prompt override {name!r} must be a string")
+        globals()[name] = text
+        applied.append(name)
+    return applied
+
+
+def _load_overrides_from_env() -> list:
+    import json
+    import os
+    path = os.environ.get(PROMPT_OVERRIDES_ENV)
+    if not path:
+        return []
+    with open(path) as f:
+        return apply_overrides(json.load(f))
+
+
+# a bad override file must fail the run loudly, not silently leave the arm
+# running stock prompts
+OVERRIDDEN = _load_overrides_from_env()

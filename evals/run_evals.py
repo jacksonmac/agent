@@ -35,6 +35,16 @@ RUN_DIR_PAT = re.compile(r"^\[run\] (.+)$", re.MULTILINE)
 ARM_KEYS = {"flags", "prompts", "description"}
 
 
+def _unknown_prompt_names(mapping: dict) -> set:
+    """Validate override names against harness.prompts up front, so a typo
+    fails when the experiment is loaded rather than 8 hours in."""
+    if not mapping:
+        return set()
+    sys.path.insert(0, REPO)
+    from harness import prompts as prompts_mod
+    return set(mapping) - set(prompts_mod._overridable())
+
+
 def load_experiment(path: str) -> dict:
     """Parse an experiment file into {name, arms: {arm: {flags: [...]}}}.
 
@@ -64,14 +74,19 @@ def load_experiment(path: str) -> dict:
         flags = spec.get("flags", [])
         if not isinstance(flags, list) or any(not isinstance(f, str) for f in flags):
             raise ValueError(f"{path}: arm '{name}': 'flags' must be a list of strings")
-        if spec.get("prompts"):
-            # honest failure rather than a silently ignored arm: the override
-            # hook is the last step of the roadmap item, not this one
-            raise ValueError(
-                f"{path}: arm '{name}' sets 'prompts', which needs the "
-                f"prompts.py override hook (roadmap I-12 step 5). Use 'flags' "
-                f"for now rather than running an experiment that ignores it.")
-        out[name] = {"flags": list(flags),
+        prompts = spec.get("prompts") or {}
+        if not isinstance(prompts, dict) or \
+                any(not isinstance(v, str) for v in prompts.values()):
+            raise ValueError(f"{path}: arm '{name}': 'prompts' must map "
+                             f"template names to strings")
+        unknown = _unknown_prompt_names(prompts)
+        if unknown:
+            # a typo'd name would leave this arm running the stock prompt,
+            # and the experiment would report a difference between two
+            # identical configurations
+            raise ValueError(f"{path}: arm '{name}': unknown prompt "
+                             f"template(s) {sorted(unknown)}")
+        out[name] = {"flags": list(flags), "prompts": dict(prompts),
                      "description": spec.get("description", "")}
     return {"name": raw.get("name", os.path.basename(path)), "arms": out}
 
@@ -79,7 +94,8 @@ def load_experiment(path: str) -> dict:
 def run_goal(goal, attempts: int, timeout: int, model: str | None,
              url: str | None, out_root: str,
              reviewer_model: str | None = None, extra_args: list | None = None,
-             repeat: int = 1, arm: str = "") -> dict:
+             repeat: int = 1, arm: str = "",
+             prompt_overrides: dict | None = None) -> dict:
     # each repeat gets its own workspace: sharing one would let repeat 2 start
     # from the files repeat 1 produced, which measures nothing
     parts = [out_root, goal.name] + ([arm] if arm else []) + [f"rep_{repeat}",
@@ -113,6 +129,15 @@ def run_goal(goal, attempts: int, timeout: int, model: str | None,
     # checkers use (system python3 has no pytest on this machine)
     env = dict(os.environ)
     env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
+    if prompt_overrides:
+        # one file per (goal, repeat, arm), beside that run's workspace, so a
+        # results directory records exactly which prompts its arm ran with
+        ov_path = os.path.join(os.path.dirname(ws_dir), "prompt_overrides.json")
+        with open(ov_path, "w") as f:
+            json.dump(prompt_overrides, f, indent=2)
+        env["AGENT_PROMPT_OVERRIDES"] = ov_path
+    else:
+        env.pop("AGENT_PROMPT_OVERRIDES", None)
 
     t0 = time.time()
     try:
@@ -529,7 +554,7 @@ def main():
         except (OSError, ValueError, json.JSONDecodeError) as e:
             raise SystemExit(f"could not load experiment: {e}")
     # no experiment == one unnamed arm, so the loop below has one shape
-    arms = experiment["arms"] if experiment else {"": {"flags": []}}
+    arms = experiment["arms"] if experiment else {"": {"flags": [], "prompts": {}}}
     base_args = args.agent_args.split() if args.agent_args else []
 
     total = len(goals) * args.repeat * len(arms)
@@ -541,8 +566,11 @@ def main():
     if experiment:
         print(f"experiment: {experiment['name']}", flush=True)
         for name, spec in arms.items():
-            print(f"  arm {name}: {' '.join(spec['flags']) or '(no extra flags)'}",
-                  flush=True)
+            bits = " ".join(spec["flags"])
+            if spec.get("prompts"):
+                over = "prompts: " + ", ".join(sorted(spec["prompts"]))
+                bits = f"{bits} {over}".strip()
+            print(f"  arm {name}: {bits or '(no changes)'}", flush=True)
 
     print_budget(len(goals), args.repeat, len(arms))
 
@@ -564,7 +592,8 @@ def main():
                              args.url, out_root,
                              reviewer_model=args.reviewer_model,
                              extra_args=(base_args + spec["flags"]) or None,
-                             repeat=rep, arm=arm_name)
+                             repeat=rep, arm=arm_name,
+                             prompt_overrides=spec.get("prompts"))
                 status = ("PASS" if r["checker_passed"]
                           else f"fail ({r['checker_detail'][:80]})")
                 print(f"{tag} {goal.name}{rep_s}{arm_s}: {status}  "

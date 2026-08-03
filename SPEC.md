@@ -571,10 +571,19 @@ of argued about. The checker is the point: `harness_passed` is the reviewer's op
   the repeat count that would resolve 15 points. No ship/don't-ship verdict is produced,
   by design.
 
+- **Prompt overrides.** An arm's `prompts` map is written beside its run and named by
+  `AGENT_PROMPT_OVERRIDES`; `harness/prompts.py` reads it at import time
+  (`apply_overrides`), replacing module-level templates by name. Only upper-case string
+  globals are replaceable, names are validated against the real set, and a bad name raises
+  rather than leaving the arm on the stock prompt. `run.py` logs the replaced names in
+  `run_start`, so which prompts a run used is answerable from `events.jsonl`. The runner
+  also strips the variable from the control arm's environment, so an operator who has it
+  exported does not silently contaminate the baseline.
+
 **Where this is going.** `print_comparison` no longer labels a single flip `improved` or
 `REGRESSED`; it prints a pass-rate delta and, when either side has fewer than two runs per
 goal, states plainly that the comparison cannot separate a real change from a resample.
-Repeats, tool efficiency, interleaved paired arms, and bootstrap intervals with an up-front
-minimum detectable effect are all in. The one remaining piece — the `prompts.py` override
-hook that would let an arm vary prompt wording rather than only flags — is roadmap item
-I-12, step 5, and is the only part of the feature that touches `harness/`.
+All five steps of roadmap item I-12 are in: repeats, tool efficiency, interleaved paired
+arms, bootstrap intervals with an up-front minimum detectable effect, and prompt overrides.
+What the suite still cannot do is decide for you — by design. It reports effects with
+intervals and says when an interval includes zero.

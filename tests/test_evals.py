@@ -328,13 +328,21 @@ def test_experiment_validation_is_strict(tmp_path):
             "a": {"flags": "--no-plan"}, "b": {}}}))
 
 
-def test_prompt_arms_fail_loudly_until_the_hook_exists(tmp_path):
-    """Better to refuse than to run an experiment whose variable is ignored."""
+def test_prompt_arms_are_accepted_and_validated(tmp_path):
+    """A typo'd template name would leave the arm on the stock prompt, and the
+    experiment would report a difference between two identical setups."""
     import pytest
     import run_evals
-    with pytest.raises(ValueError, match="prompts.py override hook"):
+    e = run_evals.load_experiment(_exp(tmp_path, {"arms": {
+        "a": {}, "b": {"prompts": {"PLAN_PROMPT": "shorter"}}}}))
+    assert e["arms"]["b"]["prompts"] == {"PLAN_PROMPT": "shorter"}
+    assert e["arms"]["a"]["prompts"] == {}
+    with pytest.raises(ValueError, match="unknown prompt template"):
         run_evals.load_experiment(_exp(tmp_path, {"arms": {
-            "a": {}, "b": {"prompts": {"PLAN_PROMPT": "shorter"}}}}))
+            "a": {}, "b": {"prompts": {"PLAN_PROMTP": "typo"}}}}))
+    with pytest.raises(ValueError, match="map template names to strings"):
+        run_evals.load_experiment(_exp(tmp_path, {"arms": {
+            "a": {}, "b": {"prompts": {"PLAN_PROMPT": 7}}}}))
 
 
 def test_arms_are_interleaved_within_each_goal_and_repeat(tmp_path, monkeypatch):
@@ -518,3 +526,83 @@ def test_arm_report_prints_intervals_not_verdicts(capsys):
     assert "-30.0" in out                        # wall: a real, resolved change
     for word in ("ship", "SHIP", "significant", "REGRESSED", "improved"):
         assert word not in out
+
+
+# ─── prompt overrides (A/B step 5) ──────────────────────────────────
+
+def test_prompt_override_env_replaces_the_template(tmp_path):
+    """The harness side: a JSON file named by the env var is applied at
+    import, so every consumer of the template sees the same text."""
+    import subprocess as sp
+    ov = tmp_path / "ov.json"
+    ov.write_text(json.dumps({"PLAN_PROMPT": "TERSE PLAN {task}"}))
+    env = dict(os.environ, AGENT_PROMPT_OVERRIDES=str(ov))
+    out = sp.run([sys.executable, "-c",
+                  "import sys; sys.path.insert(0, %r);"
+                  "from harness import prompts;"
+                  "print(prompts.PLAN_PROMPT); print(prompts.OVERRIDDEN)" % REPO],
+                 capture_output=True, text=True, env=env, cwd=REPO)
+    assert out.returncode == 0, out.stderr
+    assert "TERSE PLAN" in out.stdout
+    assert "PLAN_PROMPT" in out.stdout.splitlines()[-1]
+
+
+def test_prompt_override_with_a_bad_name_fails_the_run(tmp_path):
+    """Silently ignoring it would mean an arm ran the stock prompt while the
+    report claimed it was testing a new one."""
+    import subprocess as sp
+    ov = tmp_path / "ov.json"
+    ov.write_text(json.dumps({"NOT_A_TEMPLATE": "x"}))
+    env = dict(os.environ, AGENT_PROMPT_OVERRIDES=str(ov))
+    out = sp.run([sys.executable, "-c",
+                  "import sys; sys.path.insert(0, %r); from harness import prompts" % REPO],
+                 capture_output=True, text=True, env=env, cwd=REPO)
+    assert out.returncode != 0
+    assert "unknown prompt template" in out.stderr
+
+
+def test_apply_overrides_rejects_non_templates():
+    import pytest
+    sys.path.insert(0, REPO)
+    from harness import prompts
+    with pytest.raises(ValueError, match="unknown prompt template"):
+        prompts.apply_overrides({"_overridable": "nope"})
+    with pytest.raises(ValueError, match="must be a string"):
+        prompts.apply_overrides({"PLAN_PROMPT": 3})
+
+
+def test_arm_prompts_are_written_beside_the_run(tmp_path, monkeypatch):
+    import run_evals
+    envs = []
+
+    class FakeProc:
+        stdout = ""
+        returncode = 0
+
+    monkeypatch.setattr(run_evals.subprocess, "run",
+                        lambda cmd, **kw: (envs.append(kw["env"]), FakeProc())[1])
+    run_evals.run_goal(GOALS[0], 1, 60, None, None, str(tmp_path),
+                       arm="terse", prompt_overrides={"PLAN_PROMPT": "short"})
+    path = envs[0]["AGENT_PROMPT_OVERRIDES"]
+    assert json.load(open(path)) == {"PLAN_PROMPT": "short"}
+    assert "terse" in path          # recorded next to the arm's own run
+
+    run_evals.run_goal(GOALS[0], 1, 60, None, None, str(tmp_path), arm="baseline")
+    assert "AGENT_PROMPT_OVERRIDES" not in envs[1]   # never leaks to the control
+
+
+def test_prompt_override_env_does_not_leak_from_the_parent(tmp_path, monkeypatch):
+    """If the operator has the var set in their shell, the control arm must
+    still run stock prompts."""
+    import run_evals
+    envs = []
+
+    class FakeProc:
+        stdout = ""
+        returncode = 0
+
+    monkeypatch.setenv("AGENT_PROMPT_OVERRIDES", "/some/stale/file.json")
+    monkeypatch.setattr(run_evals.subprocess, "run",
+                        lambda cmd, **kw: (envs.append(kw["env"]), FakeProc())[1])
+    run_evals.run_goal(GOALS[0], 1, 60, None, None, str(tmp_path), arm="baseline")
+    assert "AGENT_PROMPT_OVERRIDES" not in envs[0]

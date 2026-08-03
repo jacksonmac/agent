@@ -524,10 +524,22 @@ out. When fewer than six goals actually changed outcome, the report says the pas
 difference cannot be called real and points you at the cost numbers instead. The arm
 definitions are copied into the results file, so it still says what it tested months later.
 
-Validation is strict: an unknown key, a single arm, or a `prompts` override (which needs
-the harness hook that is still roadmap work) is an error rather than a silently ignored
-setting — an experiment whose variable is quietly dropped would report a difference between
-two identical arms and waste a night proving it.
+An arm can also vary **prompt wording**, which no flag can express:
+
+```json
+{"arms": {"baseline": {},
+          "terse": {"prompts": {"PLAN_PROMPT": "List the files you will create…"}}}}
+```
+
+The runner writes each arm's overrides beside that run's workspace and points
+`AGENT_PROMPT_OVERRIDES` at the file; `harness/prompts.py` applies it at import, so every
+consumer of the template sees the same text, and the `run_start` event records which
+templates were replaced. Set the variable yourself to try a prompt outside the eval suite.
+
+Validation is strict throughout: an unknown key, a single arm, a non-list `flags`, or a
+prompt name that is not a real template is an error rather than a silently ignored setting
+— an experiment whose variable is quietly dropped would compare two identical arms and
+report the difference as a finding.
 
 Keep `--attempts` constant across runs you compare. To capture a **baseline for the
 pre-improvement harness** (the eval suite works against whatever code is checked out):
@@ -672,92 +684,14 @@ this file replaced: installing the repo without one changes nothing.
 - **Run history** — every run appends to `runs/history.db`; `agent.py history`
   lists past runs (`--limit N`, default 20), `history --stats` shows pass-rate
   per executor model.
+- **A/B experiments** — `evals/run_evals.py --experiment FILE --repeat N` runs two or
+  more arms (flag sets, prompt-wording variants, or both) interleaved, pairs them by
+  `(goal, repeat)`, and reports pass rate, cost and tool-efficiency deltas with bootstrap
+  95% intervals. It states before starting what size effect the run could resolve, and
+  never issues a ship/don't-ship verdict. See *Measuring changes* above.
 
 ## Roadmap
 
-- **A/B testing for the main loop** — the eval suite can already answer "did this
-  change help?" but not "am I sure?", and every loop improvement worth making is small
-  enough to hide in the noise. Today each of the 8 goals runs **once** per label while the
-  executor samples at `temperature 0.7`, so a single flipped goal moves the pass rate by
-  12.5 points and `--compare` will happily print `improved` or `REGRESSED` for what is one
-  coin toss.
-
-  **What it measures.** Three metrics, all derivable from what a run already writes to
-  `events.jsonl` — no new harness instrumentation:
-
-  | Metric | Source | Why |
-  | --- | --- | --- |
-  | Checker pass rate | `checker_passed` (already recorded) | The headline, and the bluntest — see the resolution note below. |
-  | Cost | `prompt_tokens + eval_tokens`, `wall_secs`, `llm_secs` (already recorded) | Catches a change that improves quality at 2× the tokens, and regressions that are pure waste. |
-  | Tool efficiency | count of `tool` events, their error rate, and the share that repeat an identical `(name, args)` — **implemented** | Measures flailing. The loop banner surfaces it live; until now nothing recorded it. |
-
-  `attempts_used` is already in every result row and stays there, but it is not a headline
-  metric. Worth revisiting: it is the most sensitive of the four, because a goal that starts
-  passing on attempt 1 instead of attempt 3 is a real gain that pass rate scores as a tie.
-
-  **What one experiment costs, and what it can actually resolve.** An overnight budget is
-  8 goals × 5 repeats × 2 arms = **80 runs**, roughly 8 hours at ~6 minutes a run. That
-  yields 40 paired observations per arm — and this is the part worth internalising: for a
-  *binary* outcome, 40 pairs only resolves differences of roughly 15 percentage points or
-  more. **The headline pass-rate comparison will usually come back inconclusive, and that is
-  the honest answer, not a bug.** The continuous metrics get far more resolution from the
-  same 80 runs, which is where an overnight experiment actually pays for itself. So the
-  runner prints the minimum detectable effect for the chosen N *before* the run starts —
-  if the experiment cannot answer the question, you find out in the first second rather
-  than after eight hours.
-
-  **How an arm is defined.** An experiment file names two or more arms, each a set of
-  `agent.py` flags plus optional overrides for named templates in `prompts.py`:
-
-  ```json
-  {"name": "self-check-value",
-   "arms": {"baseline": {},
-            "no-self-check": {"flags": ["--no-self-check"]},
-            "terser-prompt": {"prompts": {"SELF_CHECK_PROMPT": "..."}}}}
-  ```
-
-  Flags cover the structural questions (`--best-of`, `--no-plan`, `-rm`), and the prompt
-  override covers the most common tweak of all, which flags cannot reach. That override is
-  the **only production-code change** the whole feature needs: a hook letting `prompts.py`
-  load replacements at import. Everything else lives in `evals/`.
-
-  **How it runs.** Arms are **interleaved**, not run end to end: for each `(goal, repeat)`
-  the runner executes every arm back to back and pairs the results. Server load, model
-  residency and thermal drift then hit both arms roughly equally instead of landing
-  entirely on whichever ran second. Each arm's resolved settings are copied into the
-  results file from the `run_start` event, so a results file from last month still says
-  what it tested.
-
-  **What it concludes: nothing.** It reports the per-metric difference with a bootstrap
-  confidence interval over the paired observations and stops there. No ship/don't-ship
-  verdict — a hard threshold on 40 samples manufactures confidence that isn't there. When
-  an interval straddles zero it says so plainly.
-
-  Build order, with the first step **done**:
-  1. **Repeats and per-run records — done.** `--repeat N` gives each goal its own
-     workspace per repeat, records a `repeat` field on every row, reports per-goal pass
-     rates, names goals that pass and fail with no harness change, and makes `--compare`
-     print a rate delta plus an explicit warning when either side has only one run.
-     Useful on its own: it already tells you which goals are flaky.
-  2. **Tool efficiency — done.** Every run now records `tool_calls`,
-     `tool_errors` and `tool_repeats` (calls whose `(name, args)` was seen
-     before in that run), aggregated per goal as `mean_tool_calls` plus an
-     error rate and a repeat rate. Both rates are shares of *calls*, not runs,
-     so arms of different length stay comparable. This is the metric that can
-     move when pass rate cannot: halving the flailing on a goal that passed
-     either way is a real improvement the pass rate scores as a tie.
-  3. **Arm config and interleaving — done.** `--experiment FILE` declares named arms,
-     runs them innermost so each `(goal, repeat)` pair is adjacent in time, pairs the
-     results, and reports mean deltas plus a won/lost/unchanged split. It refuses an
-     experiment it cannot honestly run rather than ignoring an arm's variable.
-  4. **Intervals and the up-front MDE — done.** Every paired delta carries a
-     percentile bootstrap 95% interval over the per-pair differences, flagged when
-     it includes zero. Before the first run the tool prints how many paired
-     observations the experiment will have and the smallest pass-rate difference
-     they could resolve, with its assumption stated — so an experiment that could
-     never answer its question says so in the first second. There is deliberately
-     no ship/don't-ship verdict.
-  5. The prompt-override hook, last — the only part that touches `harness/`.
 - Multi-phase planning for big goals (plan → execute each phase → review each phase);
   plan-seeded todos are the first slice of this
 - **Office documents as first-class deliverables** — spreadsheets and documents first
