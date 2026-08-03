@@ -46,7 +46,7 @@ flowchart TB
 
     subgraph gates ["Gates & observers"]
         POLICY["policy.py<br/><i>policy.json → shell/network/<br/>execution/limits</i>"]
-        PERM["permissions.py<br/><i>y/n/a/c gate for the policy's<br/>require_approval tools</i>"]
+        PERM["permissions.py<br/><i>y/n/a/c gate for the<br/>require_approval tools</i>"]
         HOOKS["hooks.py<br/><i>hooks.json shell observers</i>"]
     end
 
@@ -94,7 +94,7 @@ flowchart TB
     RUN & REVIEW & GOALSMITH & MEM --> PROMPTS
     RUN & LLM & TOOLS & HOOKS & PERM -->|"log_event()"| RUNLOG
     RUN & LLM & REVIEW & TODOS & PERM -->|"phase/stream/todos/confirm"| UI
-    UI -->|"pause, message, interrupt,<br/>ledger, budget, quit …"| KEYS
+    UI -->|"pause, message, interrupt,<br/>ledger, budget, quit"| KEYS
     RUN & REVIEW & LLM & CLI -.->|"read"| CONFIG
 ```
 
@@ -141,11 +141,11 @@ sequenceDiagram
         end
         R->>S: send(task) — full TOOL_SCHEMAS
         loop tool rounds (max_tool_rounds, default 15)
-            S->>S: poll_controls() — pause/quit keys;<br/>drain queued user messages into history
+            S->>S: poll_controls() — pause/quit keys,<br/>then drain queued user messages into history
             S->>O: chat (model=executor_model, stream:true)
             O-->>S: content/thinking deltas → live UI,<br/>then tool_calls or final text
             S->>T: execute_tool_call(name, args)
-            Note over T: permission gate (the policy's<br/>require_approval tools: y/n/a/c prompt,<br/>non-TTY denies) then pre/post_tool hooks
+            Note over T: permission gate (policy require_approval<br/>tools: y/n/a/c prompt, non-TTY denies)<br/>then pre/post_tool hooks
             T-->>S: result string (capped, appended as role:tool)
             opt interrupt key pressed mid-round
                 S->>S: skip the remaining tool calls<br/>(each still gets a skipped result)
@@ -167,7 +167,7 @@ sequenceDiagram
             V-->>R: Verdict (with re-ask + YES/NO fallbacks)
         end
 
-        R->>R: ui.attempt_result(n, …) → attempt-ledger row
+        R->>R: ui.attempt_result(n, passed, criteria) → ledger row
 
         alt verdict passed
             R->>R: save final_output.txt — done
