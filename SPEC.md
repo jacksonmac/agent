@@ -534,6 +534,11 @@ of argued about. The checker is the point: `harness_passed` is the reviewer's op
   `--attempts` and `--timeout` bound each run, `--model` / `--url` / `--reviewer-model` /
   `--agent-args` pass through to the harness, and `--compare <file>` diffs against an
   earlier results file.
+- **Tool efficiency** — `_stats_from_events` counts `tool` events, those whose `ok` is
+  false, and those whose `(name, args)` was already seen in that run. `per_goal` turns them
+  into `mean_tool_calls`, `tool_error_rate` and `tool_repeat_rate`, both rates as shares of
+  calls rather than runs so arms of unequal length compare. Runs predating this (or that
+  timed out) carry `None` and contribute zero rather than dividing by zero.
 - **`--repeat N`** runs every goal N times. Each repeat gets its own workspace — sharing
   one would let repeat 2 start from the files repeat 1 produced, measuring nothing. Runs
   are repeat-major (a full sweep of the goals, then the next sweep), so an interrupted run

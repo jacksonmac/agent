@@ -480,6 +480,11 @@ venv/bin/python evals/run_evals.py --label after --repeat 5 # 5 runs per goal (4
 venv/bin/python evals/run_evals.py --label after --compare evals/results_baseline.json
 ```
 
+Each run also records how much of the work was wasted motion — total tool calls, the
+share that errored, and the share that repeated a call identical to an earlier one in
+the same run. `--compare` prints all three. A change that leaves the pass rate alone but
+halves the repeat rate is a real improvement, and this is the only place it shows up.
+
 **`--repeat N` is what makes a comparison mean anything.** The executor samples at
 `temperature 0.7`, so one run per goal cannot tell a real change from a resample — a
 goal that flips may simply have rolled differently. With repeats, each goal reports a
@@ -648,7 +653,7 @@ this file replaced: installing the repo without one changes nothing.
   | --- | --- | --- |
   | Checker pass rate | `checker_passed` (already recorded) | The headline, and the bluntest — see the resolution note below. |
   | Cost | `prompt_tokens + eval_tokens`, `wall_secs`, `llm_secs` (already recorded) | Catches a change that improves quality at 2× the tokens, and regressions that are pure waste. |
-  | Tool efficiency | count of `tool` events, their error rate, and the share that repeat an identical `(name, args)` | Measures flailing. The loop banner surfaces it live; nothing records it. One counter in `_stats_from_events`. |
+  | Tool efficiency | count of `tool` events, their error rate, and the share that repeat an identical `(name, args)` — **implemented** | Measures flailing. The loop banner surfaces it live; until now nothing recorded it. |
 
   `attempts_used` is already in every result row and stays there, but it is not a headline
   metric. Worth revisiting: it is the most sensitive of the four, because a goal that starts
@@ -698,7 +703,13 @@ this file replaced: installing the repo without one changes nothing.
      rates, names goals that pass and fail with no harness change, and makes `--compare`
      print a rate delta plus an explicit warning when either side has only one run.
      Useful on its own: it already tells you which goals are flaky.
-  2. The tool-efficiency counter in `_stats_from_events`.
+  2. **Tool efficiency — done.** Every run now records `tool_calls`,
+     `tool_errors` and `tool_repeats` (calls whose `(name, args)` was seen
+     before in that run), aggregated per goal as `mean_tool_calls` plus an
+     error rate and a repeat rate. Both rates are shares of *calls*, not runs,
+     so arms of different length stay comparable. This is the metric that can
+     move when pass rate cannot: halving the flailing on a goal that passed
+     either way is a real improvement the pass rate scores as a tie.
   3. Arm config and interleaving.
   4. Bootstrap intervals and the up-front minimum detectable effect.
   5. The prompt-override hook, last — the only part that touches `harness/`.

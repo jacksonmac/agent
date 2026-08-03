@@ -81,7 +81,8 @@ def run_goal(goal, attempts: int, timeout: int, model: str | None,
               "wall_secs": wall,
               "timed_out": timed_out, "checker_passed": False, "checker_detail": "",
               "harness_passed": None, "attempts_used": None,
-              "llm_secs": None, "prompt_tokens": None, "eval_tokens": None}
+              "llm_secs": None, "prompt_tokens": None, "eval_tokens": None,
+              "tool_calls": None, "tool_errors": None, "tool_repeats": None}
 
     try:
         ok, detail = goal.check(ws_dir)
@@ -98,7 +99,13 @@ def run_goal(goal, attempts: int, timeout: int, model: str | None,
 
 def _stats_from_events(path: str) -> dict:
     stats = {"harness_passed": False, "attempts_used": 0,
-             "llm_secs": 0.0, "prompt_tokens": 0, "eval_tokens": 0}
+             "llm_secs": 0.0, "prompt_tokens": 0, "eval_tokens": 0,
+             # tool efficiency: how much of the work was wasted motion.
+             # A change can leave the pass rate alone and still halve the
+             # flailing, which is the thing the loop banner shows live and
+             # nothing has ever recorded.
+             "tool_calls": 0, "tool_errors": 0, "tool_repeats": 0}
+    seen: set = set()
     try:
         with open(path) as f:
             for line in f:
@@ -106,14 +113,25 @@ def _stats_from_events(path: str) -> dict:
                     ev = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if ev.get("event") == "attempt":
+                kind = ev.get("event")
+                if kind == "attempt":
                     stats["attempts_used"] += 1
                     if ev.get("passed"):
                         stats["harness_passed"] = True
-                elif ev.get("event") == "llm":
+                elif kind == "llm":
                     stats["llm_secs"] += ev.get("secs") or 0
                     stats["prompt_tokens"] += ev.get("prompt_tokens") or 0
                     stats["eval_tokens"] += ev.get("eval_tokens") or 0
+                elif kind == "tool":
+                    stats["tool_calls"] += 1
+                    if ev.get("ok") is False:
+                        stats["tool_errors"] += 1
+                    # the args are already capped to 500 chars in the event,
+                    # so identical calls compare equal without re-reading
+                    sig = (ev.get("name"), ev.get("args"))
+                    if sig in seen:
+                        stats["tool_repeats"] += 1
+                    seen.add(sig)
     except OSError:
         return {}
     stats["llm_secs"] = round(stats["llm_secs"], 1)
@@ -127,18 +145,28 @@ def per_goal(results: list[dict]) -> dict:
     out: dict[str, dict] = {}
     for r in results:
         g = out.setdefault(r["goal"], {"runs": 0, "passed": 0, "wall_secs": 0.0,
-                                       "attempts": 0, "tokens": 0})
+                                       "attempts": 0, "tokens": 0,
+                                       "tool_calls": 0, "tool_errors": 0,
+                                       "tool_repeats": 0})
         g["runs"] += 1
         g["passed"] += bool(r["checker_passed"])
         g["wall_secs"] += r["wall_secs"]
         g["attempts"] += r["attempts_used"] or 0
         g["tokens"] += (r["prompt_tokens"] or 0) + (r["eval_tokens"] or 0)
+        for k in ("tool_calls", "tool_errors", "tool_repeats"):
+            g[k] += r.get(k) or 0
     for g in out.values():
         n = g["runs"]
+        calls = g["tool_calls"]
         g["pass_rate"] = round(g["passed"] / n, 3)
         g["mean_wall_secs"] = round(g["wall_secs"] / n, 1)
         g["mean_attempts"] = round(g["attempts"] / n, 2)
         g["mean_tokens"] = round(g["tokens"] / n)
+        g["mean_tool_calls"] = round(calls / n, 1)
+        # shares of calls, not of runs: "what fraction of the work was
+        # wasted" is the comparable number across arms of different length
+        g["tool_error_rate"] = round(g["tool_errors"] / calls, 3) if calls else 0
+        g["tool_repeat_rate"] = round(g["tool_repeats"] / calls, 3) if calls else 0
     return out
 
 
@@ -146,6 +174,9 @@ def summarize(results: list[dict]) -> dict:
     n = len(results)
     passed = sum(r["checker_passed"] for r in results)
     goals = per_goal(results)
+    tool_calls = sum(r.get("tool_calls") or 0 for r in results)
+    tool_errors = sum(r.get("tool_errors") or 0 for r in results)
+    tool_repeats = sum(r.get("tool_repeats") or 0 for r in results)
     return {
         # "goals" counts distinct goals; "runs" counts executions. They are
         # equal only at --repeat 1, which is why the old files can still be
@@ -157,6 +188,9 @@ def summarize(results: list[dict]) -> dict:
         "mean_attempts": round(sum(r["attempts_used"] or 0 for r in results) / n, 2) if n else 0,
         "total_wall_secs": round(sum(r["wall_secs"] for r in results), 1),
         "total_llm_secs": round(sum(r["llm_secs"] or 0 for r in results), 1),
+        "tool_calls": tool_calls,
+        "tool_error_rate": round(tool_errors / tool_calls, 3) if tool_calls else 0,
+        "tool_repeat_rate": round(tool_repeats / tool_calls, 3) if tool_calls else 0,
         "per_goal": goals,
     }
 
@@ -173,7 +207,7 @@ def print_table(results: list[dict]) -> None:
                   f"{r['wall_secs']:<8} {r['checker_detail'][:60]}")
         return
     hdr = (f"{'goal':<16} {'passed':<8} {'rate':<6} {'att':<5} {'wall s':<8} "
-           f"{'tokens':<9} first failure")
+           f"{'tokens':<9} {'tools':<7} {'err':<6} {'rpt':<6} first failure")
     print("\n" + hdr + "\n" + "-" * len(hdr))
     for name, g in goals.items():
         fail = next((r["checker_detail"] for r in results
@@ -183,7 +217,8 @@ def print_table(results: list[dict]) -> None:
         ratio = "{}/{}".format(g["passed"], g["runs"])
         print(f"{name:<16} {ratio:<8} {g['pass_rate']:<6} "
               f"{g['mean_attempts']:<5} {g['mean_wall_secs']:<8} "
-              f"{g['mean_tokens']:<9} {fail[:40]}")
+              f"{g['mean_tokens']:<9} {g['mean_tool_calls']:<7} "
+              f"{g['tool_error_rate']:<6} {g['tool_repeat_rate']:<6} {fail[:30]}")
 
 
 def _flaky(goals: dict) -> list[str]:
@@ -209,6 +244,12 @@ def print_comparison(before: dict, after_results: list[dict], after_summary: dic
     print(f"  pass rate  {b.get('checker_pass_rate')} -> {after_summary['checker_pass_rate']}")
     print(f"  mean attempts  {b.get('mean_attempts')} -> {after_summary['mean_attempts']}")
     print(f"  total wall s  {b.get('total_wall_secs')} -> {after_summary['total_wall_secs']}")
+    if after_summary.get("tool_calls"):
+        print(f"  tool calls  {b.get('tool_calls', '?')} -> {after_summary['tool_calls']}"
+              f"   error rate {b.get('tool_error_rate', '?')} -> "
+              f"{after_summary['tool_error_rate']}"
+              f"   repeat rate {b.get('tool_repeat_rate', '?')} -> "
+              f"{after_summary['tool_repeat_rate']}")
 
     # The honesty line. Single-run-per-goal comparisons used to print
     # "improved"/"REGRESSED" for what may be one coin toss; say so instead.

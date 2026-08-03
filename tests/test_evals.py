@@ -76,12 +76,14 @@ def test_stats_from_events(tmp_path):
 
 # ─── --repeat: goals become pass rates, not bits ────────────────────
 
-def _row(goal, repeat, passed, wall=10.0, attempts=1, ptok=100, etok=10):
+def _row(goal, repeat, passed, wall=10.0, attempts=1, ptok=100, etok=10,
+         calls=10, errors=1, repeats=2):
     return {"goal": goal, "category": "data", "repeat": repeat,
             "wall_secs": wall, "timed_out": False, "checker_passed": passed,
             "checker_detail": "" if passed else "assert failed",
             "harness_passed": passed, "attempts_used": attempts,
-            "llm_secs": 1.0, "prompt_tokens": ptok, "eval_tokens": etok}
+            "llm_secs": 1.0, "prompt_tokens": ptok, "eval_tokens": etok,
+            "tool_calls": calls, "tool_errors": errors, "tool_repeats": repeats}
 
 
 def test_per_goal_aggregates_repeats():
@@ -224,3 +226,67 @@ def test_the_fstring_check_actually_detects_the_pattern():
     assert _nested_same_quote_fstrings(bad), "the check missed a known-bad f-string"
     good = 'g = {"passed": 1}\nratio = "{}".format(g["passed"])\nprint(f"{ratio:<8}")\n'
     assert _nested_same_quote_fstrings(good) == []
+
+
+# ─── tool efficiency (A/B step 2) ───────────────────────────────────
+
+def test_stats_counts_tool_calls_errors_and_repeats(tmp_path):
+    import run_evals
+    path = tmp_path / "events.jsonl"
+    rows = [
+        {"event": "tool", "name": "read_file", "args": '{"name": "a.py"}', "ok": True},
+        {"event": "tool", "name": "read_file", "args": '{"name": "a.py"}', "ok": True},
+        {"event": "tool", "name": "read_file", "args": '{"name": "a.py"}', "ok": True},
+        {"event": "tool", "name": "read_file", "args": '{"name": "b.py"}', "ok": True},
+        {"event": "tool", "name": "run_shell", "args": '{"command": "boom"}', "ok": False},
+        {"event": "llm", "secs": 1.0, "prompt_tokens": 10, "eval_tokens": 2},
+    ]
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    s = run_evals._stats_from_events(str(path))
+    assert s["tool_calls"] == 5
+    assert s["tool_errors"] == 1
+    assert s["tool_repeats"] == 2      # the 2nd and 3rd identical read_file
+    assert s["llm_secs"] == 1.0        # unrelated counters still work
+
+
+def test_identical_name_with_different_args_is_not_a_repeat(tmp_path):
+    import run_evals
+    path = tmp_path / "events.jsonl"
+    rows = [{"event": "tool", "name": "read_file", "args": f'{{"name": "f{i}.py"}}',
+             "ok": True} for i in range(4)]
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    assert run_evals._stats_from_events(str(path))["tool_repeats"] == 0
+
+
+def test_efficiency_rates_are_shares_of_calls_not_runs():
+    import run_evals
+    g = run_evals.per_goal([_row("a", 1, True, calls=10, errors=1, repeats=2),
+                            _row("a", 2, True, calls=30, errors=3, repeats=6)])["a"]
+    assert g["tool_calls"] == 40 and g["mean_tool_calls"] == 20.0
+    assert g["tool_error_rate"] == 0.1      # 4/40, not 4/2 runs
+    assert g["tool_repeat_rate"] == 0.2     # 8/40
+
+
+def test_efficiency_survives_runs_with_no_tool_data():
+    """Old results files and timed-out runs carry None; rates must not divide
+    by zero or crash the comparison."""
+    import run_evals
+    row = _row("a", 1, False)
+    for k in ("tool_calls", "tool_errors", "tool_repeats"):
+        row[k] = None
+    g = run_evals.per_goal([row])["a"]
+    assert g["tool_calls"] == 0 and g["tool_error_rate"] == 0
+    s = run_evals.summarize([row])
+    assert s["tool_calls"] == 0 and s["tool_repeat_rate"] == 0
+
+
+def test_comparison_prints_efficiency_when_present(capsys):
+    import run_evals
+    b = [_row("a", 1, True, calls=40, errors=8, repeats=12)]
+    a = [_row("a", 1, True, calls=20, errors=1, repeats=2)]
+    run_evals.print_comparison(
+        {"label": "base", "results": b, "summary": run_evals.summarize(b)},
+        a, run_evals.summarize(a))
+    out = capsys.readouterr().out
+    assert "tool calls  40 -> 20" in out
+    assert "repeat rate 0.3 -> 0.1" in out
