@@ -597,8 +597,28 @@ this file replaced: installing the repo without one changes nothing.
   `run_python`, because small executor models drive a named tool far more reliably
   than a library API they have to recall. The hard requirement is **editing, not just
   authoring**: open a file the user seeded into the workspace, change the parts the
-  goal asks for, and round-trip everything else — styles, formulas, merged cells,
-  images — untouched. That pulls in two changes elsewhere:
+  goal asks for, and round-trip everything else untouched. A spike measured what
+  the libraries actually preserve (openpyxl 3.1.5, python-docx 1.2.0), and the two
+  formats need different treatment:
+  - **docx is safe.** python-docx keeps the underlying XML tree and repackages
+    every part it has no model for, so a plain save and a real paragraph edit both
+    preserved content controls, tracked changes, TOC fields, headers/footers,
+    tables and images — zero parts dropped.
+  - **xlsx needs a guard.** openpyxl preserved more than its reputation suggests
+    (charts, images, conditional formatting, data validation, defined names,
+    comments and merges all survived), but it silently drops anything it has no
+    model for: `<extLst>` extensions such as sparklines vanish from *inside* a
+    part that still exists, `customXml/` is dropped, `vbaProject.bin` is dropped
+    unless `keep_vba=True`, and `data_only=True` replaces every formula with a
+    cached value — turning "read the numbers" into "destroy the spreadsheet" if
+    the same workbook is later saved.
+  So the edit tools fingerprint the file before and after (OPC part inventory plus
+  a scan for known-unmodelled constructs and a formula count) and refuse to write a
+  result that lost anything the edit did not ask to remove. A refusal surfaces to
+  the model as a tool error it can react to, which is the harness's existing
+  pattern; silently shipping a damaged workbook is not.
+
+  That pulls in two changes elsewhere:
   - `workspace.py` must accept binary seed files and stop treating them as text for
     change detection (mtime scanning is fine; snapshotting is not).
   - `review.py` must extract text from `.docx`/`.xlsx`/`.pptx` in `snapshot_files` and
