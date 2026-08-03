@@ -111,8 +111,57 @@ def _spark(values, width: int = 8) -> str:
                    for v in vals)
 
 
+def _ledger_criteria(entry: dict) -> dict:
+    """{criterion text: met?} for one ledger entry, ignoring bare-string
+    (not-yet-reviewed) items."""
+    return {str(c.get("criterion", "?")): bool(c.get("met"))
+            for c in entry.get("criteria") or [] if isinstance(c, dict)}
+
+
+def _regressions(ledger: list) -> list[str]:
+    """Criteria that were met in some earlier attempt and are not met in the
+    latest reviewed one — the retry loop going backwards."""
+    reviewed = [e for e in ledger if _ledger_criteria(e)]
+    if len(reviewed) < 2:
+        return []
+    latest = _ledger_criteria(reviewed[-1])
+    ever_met = set()
+    for e in reviewed[:-1]:
+        ever_met |= {k for k, met in _ledger_criteria(e).items() if met}
+    return [k for k, met in latest.items() if not met and k in ever_met]
+
+
+def _digest_checks(output: str) -> str:
+    """One line out of a pytest run: the first failure if there is one, else
+    the summary line."""
+    lines = [ln.strip() for ln in (output or "").splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    for ln in lines:
+        if ln.startswith(("FAILED", "ERROR", "E   ")):
+            return ln[:160]
+    for ln in reversed(lines):
+        if "passed" in ln or "failed" in ln or "error" in ln:
+            return ln[:160]
+    return lines[-1][:160]
+
+
 # which phase() labels collapse to which run-rail name
 _RAIL_NAMES = {"planning": "plan", "executing": "exec", "reviewing": "review"}
+
+# loop banner thresholds: N identical calls inside the last _LOOP_WINDOW, or
+# this many seconds of tool calls that changed no file
+_LOOP_REPEATS = 3
+_LOOP_WINDOW = 8
+_IDLE_EDIT_SECS = 120
+
+# [/] one-key steering: the things you always end up typing by hand
+STEER_PRESETS = [
+    "You are repeating yourself — take a different approach.",
+    "Stop exploring and make the change now.",
+    "Run the tests and fix whatever fails.",
+    "Summarize what you have done so far, then continue.",
+]
 
 
 class _Dashboard:
@@ -156,6 +205,17 @@ class _Dashboard:
         self.trend: list = []                     # (met, total) per review
         self.ctx_hist: deque = deque(maxlen=24)   # executor tokens → sawtooth
         self.paused = False
+        # [a] attempt ledger: one dict per attempt, so a criterion that goes
+        # ✓→✗ between attempts is visible instead of being overwritten
+        self.ledger: list[dict] = []
+        self.last_checks = ""            # digest of the reviewer's pytest run
+        # [b] budget: per-role token/time accumulators + per-attempt cost
+        self.roles: dict[str, dict] = {}
+        self.attempt_tokens: dict[int, int] = {}
+        self.reclaimed: list[int] = []   # tokens each compaction dip gave back
+        # loop banner: repeated identical calls, or a long stretch with no edits
+        self.loop_warn: str | None = None
+        self.last_change = time.monotonic()
         self._transcript: deque[str] = deque()
         self._transcript_len = 0
         self._transcript_dropped = 0
@@ -188,6 +248,9 @@ class _Dashboard:
                 parts.append(input_line)
             return Group(*parts)
         parts = [self._render_header()]  # context bars live inside the header
+        banner = self._render_loop_banner()
+        if banner is not None:
+            parts.append(banner)
         wide = self.console.width >= 110
         timeline = self._render_timeline()
         stream = self._render_stream()
@@ -207,6 +270,23 @@ class _Dashboard:
         if input_line is not None:
             parts.append(input_line)
         return Group(*parts)
+
+    def _render_loop_banner(self):
+        """Live version of the stall detection run.py only does after the
+        fact: the same call repeating, or a long stretch of tool calls with
+        nothing written. One line, above the timeline."""
+        text = self.loop_warn
+        idle = time.monotonic() - self.last_change
+        if text is None and self.tool_count >= 4 and idle > _IDLE_EDIT_SECS:
+            text = (f"no file changes for {int(idle) // 60}:{int(idle) % 60:02d}"
+                    f" · {self.tool_count} tool calls so far")
+        if text is None:
+            return None
+        body = Text(no_wrap=True, overflow="ellipsis")
+        body.append("⚠ ", style="bold yellow")
+        body.append(text, style="yellow")
+        body.append("  [i] interrupt · [/] presets", style="dim")
+        return Panel(body, border_style="yellow")
 
     def _render_subagent(self):
         """Mini-panel for a running subagent: task, clock, and its context."""
@@ -251,23 +331,64 @@ class _Dashboard:
         return Panel(grid, title="files", title_align="left",
                      border_style="dim")
 
+    def _render_queued(self):
+        """Chip for messages waiting to be delivered. Without it a queued
+        message vanishes into pending_msgs with no way to see or undo it."""
+        st = _state
+        if st is None:
+            return None
+        msgs = list(st.pending_msgs)  # snapshot; the reader thread appends
+        if not msgs:
+            return None
+        body = Text(no_wrap=True, overflow="ellipsis")
+        body.append("✉ queued ", style="cyan")
+        body.append(" ".join(msgs[-1].split())[:70])
+        if len(msgs) > 1:
+            body.append(f" (+{len(msgs) - 1} more)", style="dim")
+        body.append(" → lands before the next model call · [e]dit [c]ancel",
+                    style="dim")
+        return body
+
+    def _render_menu(self):
+        body = Text()
+        for i, preset in enumerate(STEER_PRESETS, 1):
+            body.append(f"[{i}] ", style="bold cyan")
+            body.append(preset)
+            if i < len(STEER_PRESETS):
+                body.append("\n")
+        return Panel(body, title="steer", title_align="left",
+                     subtitle=Text("number sends · Esc cancel", style="dim"),
+                     subtitle_align="right", border_style="cyan")
+
     def _render_input_line(self):
         st = _state
         if st is None:
             return None
+        if st.menu:
+            return self._render_menu()
         if not st.focused:
+            queued = self._render_queued()
             if self.quiet:
-                return Text("› message the agent · [m] type · [z] expand",
+                hint = Text("› message the agent · [m] type · [z] expand",
                             style="blue")  # blue ≠ the cyan accents
-            return Text(
-                "› message the agent — [m] to type · [p]ause [o]transcript "
-                "[t]ools [d]iff [q]uit [z]quiet", style="blue")
+            else:
+                # no_wrap: with this many keys the line would otherwise wrap
+                # to two rows on a narrow terminal and make the whole
+                # dashboard jump every refresh
+                hint = Text(
+                    "› [m]essage [i]nterrupt [/]presets · [p]ause [o]transcript "
+                    "[t]ools [d]iff [a]ttempts [b]udget [q]uit [z]quiet",
+                    style="blue", no_wrap=True, overflow="ellipsis")
+            return Group(queued, hint) if queued is not None else hint
         # focused: a bordered composer box — the buffer wraps instead of
         # truncating, so longer instructions stay readable while typing
         body = Text(st.buffer)  # single reference read: safe without the lock
         body.append("█", style="cyan")
-        return Panel(body, title="message", title_align="left",
-                     subtitle=Text("Enter send · Esc cancel", style="dim"),
+        title = "interrupt" if st.compose_interrupt else "message"
+        sub = ("Enter send + skip the rest of this tool round · Esc cancel"
+               if st.compose_interrupt else "Enter send · Esc cancel")
+        return Panel(body, title=title, title_align="left",
+                     subtitle=Text(sub, style="dim"),
                      subtitle_align="right", border_style="cyan")
 
     def _render_header(self):
@@ -518,9 +639,19 @@ class _Dashboard:
         if self.last_verdict:
             tag = "PASSED" if self.verdict_passed else "FAILED"
             summary = " ".join(self.last_verdict[:200].split())
-            parts.append(Text(f"review: {tag} — {summary}",
-                              style="green" if self.verdict_passed else "red",
-                              no_wrap=True, overflow="ellipsis"))
+            line = Text(no_wrap=True, overflow="ellipsis")
+            line.append(f"review: {tag} — {summary}",
+                        style="green" if self.verdict_passed else "red")
+            parts.append(line)
+        # a criterion that was met and then wasn't is the signal worth
+        # noticing without opening the ledger
+        regressed = _regressions(self.ledger)
+        if regressed:
+            hint = Text(no_wrap=True, overflow="ellipsis")
+            hint.append(f"{len(regressed)} regressed", style="bold yellow")
+            hint.append(f" · {regressed[0][:60]}", style="yellow")
+            hint.append(" · [a] ledger", style="dim")
+            parts.append(hint)
         title = Text("plan")
         if len(self.trend) >= 2:  # is the retry loop converging or stuck?
             stuck = self.trend[-1][0] == self.trend[-2][0]
@@ -610,10 +741,25 @@ class ControlState:
         self.paused = False
         self.quit_requested = False
         self.pending_msgs: list[str] = []
+        self.compose_interrupt = False  # this message came from [i]
+        self.interrupt = False      # skip the rest of the current tool round
+        self.menu = False           # [/] preset picker is open
 
 
 _state: ControlState | None = None
 _input_thread: "_InputThread | None" = None
+
+
+def _queue(state: ControlState, text: str, dash=None) -> None:
+    """Append a message for the executor. Caller holds state.cond."""
+    state.pending_msgs.append(text)
+    if state.paused:
+        # delivery happens before the next model call, and pause blocks
+        # exactly there — a queued message that stayed paused would never
+        # arrive
+        state.paused = False
+        if dash is not None:
+            dash.paused = False
 
 
 def _feed_key(state: ControlState, ch: str, dash=None) -> None:
@@ -622,25 +768,29 @@ def _feed_key(state: ControlState, ch: str, dash=None) -> None:
     happens outside the lock."""
     action = None
     with state.cond:
-        if state.focused:
+        if state.menu:
+            if ch.isdigit() and 1 <= int(ch) <= len(STEER_PRESETS):
+                _queue(state, STEER_PRESETS[int(ch) - 1], dash)
+                action = "queued"
+            state.menu = False  # any other key, including Esc, just closes it
+        elif state.focused:
             if ch in ("\r", "\n"):
                 text = state.buffer.strip()
                 if text:
-                    state.pending_msgs.append(text)
-                    action = "queued"
-                    if state.paused:
-                        # delivery happens before the next model call, and
-                        # pause blocks exactly there — a queued message that
-                        # stayed paused would never arrive
-                        state.paused = False
-                        if dash is not None:
-                            dash.paused = False
+                    _queue(state, text, dash)
+                    if state.compose_interrupt:
+                        state.interrupt = True
+                        action = "interrupted"
+                    else:
+                        action = "queued"
                 state.focused = False
+                state.compose_interrupt = False
                 state.buffer = ""
             elif ch in ("\x7f", "\x08"):
                 state.buffer = state.buffer[:-1]
             elif ch == "\x1b":  # lone Esc: cancel
                 state.focused = False
+                state.compose_interrupt = False
                 state.buffer = ""
             elif ch.isprintable():
                 state.buffer += ch  # case preserved
@@ -649,6 +799,26 @@ def _feed_key(state: ControlState, ch: str, dash=None) -> None:
             if c == "m":
                 state.focused = True
                 state.buffer = ""
+            elif c == "i":
+                # same composer, but sending also abandons whatever tool calls
+                # the model queued for this round
+                state.focused = True
+                state.compose_interrupt = True
+                state.buffer = ""
+            elif c == "/":
+                state.menu = True
+            elif c == "c":  # not [x]: any unbound printable is the resume key
+                if state.pending_msgs:
+                    state.pending_msgs.clear()
+                    action = "cleared"
+            elif c == "e":
+                if state.pending_msgs:  # reopen the last one for editing
+                    state.buffer = state.pending_msgs.pop()
+                    state.focused = True
+            elif c == "a":
+                action = "ledger"
+            elif c == "b":
+                action = "budget"
             elif c == "q":
                 state.quit_requested = True
             elif c == "p":
@@ -673,12 +843,21 @@ def _feed_key(state: ControlState, ch: str, dash=None) -> None:
         if action == "queued":
             dash.print(Text("message queued — delivered before the next "
                             "model call", style="dim"))
+        elif action == "interrupted":
+            dash.print(Text("interrupting — the rest of this tool round is "
+                            "skipped and your message goes next", style="yellow"))
+        elif action == "cleared":
+            dash.print(Text("queued messages discarded", style="dim"))
         elif action == "transcript":
             _show_transcript()
         elif action == "tools":
             _show_tool_history()
         elif action == "diff":
             _show_last_diff()
+        elif action == "ledger":
+            _show_ledger()
+        elif action == "budget":
+            _show_budget()
         dash.refresh()
 
 
@@ -831,6 +1010,16 @@ def drain_messages() -> list[str]:
         return msgs
 
 
+def interrupt_requested() -> bool:
+    """True once after [i] sent a message: the caller should abandon the tool
+    calls it hasn't run yet and get back to the model. False in plain mode."""
+    if _state is None:
+        return False
+    with _state.cond:
+        flag, _state.interrupt = _state.interrupt, False
+        return flag
+
+
 def steer() -> str | None:
     """--interactive: pause after a failed verdict. Enter = plain retry
     (returns None), typed text = guidance for the next attempt, q = stop
@@ -895,6 +1084,122 @@ def _show_tool_history() -> None:
                     style="dim")
     _dash.print(Panel(text, title=f"tool history — {len(rows)} calls",
                       title_align="left", border_style="dim"))
+
+
+def _show_ledger() -> None:
+    """[a] — every attempt's criteria side by side, so you can see which one
+    flipped rather than only how the latest review scored."""
+    if _dash is None:
+        return
+    ledger = [e for e in _dash.ledger if _ledger_criteria(e)]
+    if not ledger:
+        _dash.print(Text("no reviewed attempts yet", style="dim"))
+        return
+    shown = ledger[-6:]  # a wider grid than this stops fitting the terminal
+    regressed = set(_regressions(_dash.ledger))
+    # union of criteria, in first-seen order — reviewers reword and reorder
+    names: list[str] = []
+    for e in shown:
+        for name in _ledger_criteria(e):
+            if name not in names:
+                names.append(name)
+
+    grid = Table.grid(padding=(0, 1))
+    grid.add_column(ratio=1, no_wrap=True)          # criterion
+    for _ in shown:
+        grid.add_column(justify="center", width=3)  # one column per attempt
+    grid.add_column(no_wrap=True)                   # regression marker
+    header = [Text("criterion", style="dim")]
+    header += [Text(f"a{e['n']}", style="dim") for e in shown]
+    header.append(Text(""))
+    grid.add_row(*header)
+    for name in names:
+        row = [Text(name, overflow="ellipsis")]
+        for e in shown:
+            met = _ledger_criteria(e).get(name)
+            if met is None:
+                row.append(Text("·", style="dim"))
+            elif met:
+                row.append(Text("✓", style="green"))
+            else:
+                row.append(Text("✗", style="red"))
+        row.append(Text("← regressed", style="yellow")
+                   if name in regressed else Text(""))
+        grid.add_row(*row)
+
+    body = [grid]
+    last = shown[-1]
+    tail = Text()
+    tag = "passed" if last.get("passed") else "fail"
+    tail.append(f"a{last['n']} {tag}", style="green" if last.get("passed") else "red")
+    if last.get("summary"):
+        tail.append(" · " + " ".join(last["summary"].split())[:160],
+                    style="dim")
+    body.append(tail)
+    if last.get("evidence"):
+        body.append(Text(f"checks: {last['evidence']}", style="dim"))
+    if last.get("focus"):
+        # the retry instruction the executor actually received — otherwise
+        # invisible, and the usual reason a "wrong" retry went wrong
+        body.append(Text(f"retry focus → {' '.join(last['focus'].split())[:200]}",
+                         style="cyan"))
+    _dash.print(Panel(Group(*body), title=f"attempt ledger — {len(ledger)} reviewed",
+                      title_align="left", border_style="dim"))
+
+
+def _show_budget() -> None:
+    """[b] — where the tokens and the wall clock actually went, split by the
+    role that spent them."""
+    if _dash is None:
+        return
+    with _dash._lock:
+        roles = {k: dict(v) for k, v in _dash.roles.items()}
+        per_attempt = dict(_dash.attempt_tokens)
+        reclaimed = list(_dash.reclaimed)
+    if not roles:
+        _dash.print(Text("no model calls yet", style="dim"))
+        return
+    total = sum(r["tin"] + r["tout"] for r in roles.values()) or 1
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(no_wrap=True)                  # role
+    for _ in range(4):
+        grid.add_column(justify="right")           # calls / in / out / secs
+    grid.add_column(no_wrap=True)                  # share
+    grid.add_row(*[Text(h, style="dim") for h in
+                   ("role", "calls", "in", "out", "secs", "share")])
+    for label, r in sorted(roles.items(),
+                           key=lambda kv: -(kv[1]["tin"] + kv[1]["tout"])):
+        share = (r["tin"] + r["tout"]) / total
+        bar = Text()
+        filled = round(share * 12)
+        bar.append("█" * filled, style="cyan")
+        bar.append("░" * (12 - filled), style="dim")
+        bar.append(f" {round(share * 100)}%", style="dim")
+        grid.add_row(Text(label), Text(str(r["calls"])),
+                     Text(_fmt_tok(r["tin"])), Text(_fmt_tok(r["tout"])),
+                     Text(f"{r['secs']:.0f}"), bar)
+
+    body = [grid]
+    costs = [(n, t) for n, t in sorted(per_attempt.items()) if n]
+    if costs:
+        line = Text("per attempt  ", style="dim")
+        for i, (n, tok) in enumerate(costs):
+            # a retry that costs more than the attempt before it is the loop
+            # degenerating rather than converging
+            rising = i and tok > costs[i - 1][1] * 1.25
+            line.append(f"a{n} ")
+            line.append(_fmt_tok(tok) + (" ↗" if rising else ""),
+                        style="yellow" if rising else "dim")
+            line.append("  ")
+        body.append(line)
+    if reclaimed:
+        line = Text("compaction  ", style="dim")
+        line.append(_spark(reclaimed), style="cyan")
+        line.append(f"  reclaimed {_fmt_tok(sum(reclaimed))} over "
+                    f"{len(reclaimed)} dips", style="dim")
+        body.append(line)
+    _dash.print(Panel(Group(*body), title="budget", title_align="left",
+                      border_style="dim"))
 
 
 def _show_last_diff() -> None:
@@ -975,6 +1280,16 @@ def llm_stats(label: str, secs: float, prompt_tokens, eval_tokens) -> None:
         _dash.llm_calls += 1
         _dash.llm_secs += secs
         _dash.llm_durs.append(secs)
+        tin, tout = int(prompt_tokens or 0), int(eval_tokens or 0)
+        with _dash._lock:  # read by [b] from the reader thread
+            role = _dash.roles.setdefault(
+                label, {"calls": 0, "tin": 0, "tout": 0, "secs": 0.0})
+            role["calls"] += 1
+            role["tin"] += tin
+            role["tout"] += tout
+            role["secs"] += secs
+            n = _dash.attempt_n
+            _dash.attempt_tokens[n] = _dash.attempt_tokens.get(n, 0) + tin + tout
         _dash.refresh()
     else:
         print(f"  {line}")
@@ -986,6 +1301,10 @@ def context_tokens(estimate: int, num_ctx: int, label: str = "executor") -> None
         if label == "executor":
             # the pinned bar; an executor call also means any reviewer/
             # subagent session finished, so its transient row goes away
+            # a real drop is compaction (or a context reset) handing tokens
+            # back — [b] reports how much each one bought
+            if _dash.ctx_hist and estimate < _dash.ctx_hist[-1] - 1000:
+                _dash.reclaimed.append(_dash.ctx_hist[-1] - estimate)
             _dash.tokens = estimate
             _dash.burn.append((time.monotonic(), estimate))
             _dash.ctx_hist.append(estimate)
@@ -1008,6 +1327,14 @@ def tool(name: str, arguments) -> None:
             if len(_dash.tool_history) > 500:
                 del _dash.tool_history[0]
             _dash.tool_count += 1
+            # spinning on the same call is the failure mode run.py only
+            # catches once the whole attempt is over
+            window = _dash.tool_history[-_LOOP_WINDOW:]
+            same = sum(1 for r in window
+                       if r.name == row.name and r.args_short == row.args_short)
+            if same >= _LOOP_REPEATS:
+                _dash.loop_warn = (f"{row.name} {row.args_short}".strip()
+                                   + f" ×{same} in the last {len(window)} calls")
         # files_touched is populated by diff()/file_created() using the real
         # path — not seeded here, which would key it by the truncated
         # args_short and leave a phantom "+0 −0" row when no diff follows
@@ -1261,6 +1588,42 @@ def verdict(passed: bool, summary: str) -> None:
         print(f"reviewer said: passed={passed} {summary!r}")
 
 
+def checks(output: str) -> None:
+    """The reviewer's deterministic evidence (its pytest run). Stashed as one
+    line so the ledger can show WHY an attempt was judged the way it was."""
+    if _dash:
+        _dash.last_checks = _digest_checks(output)
+
+
+def attempt_result(n: int, passed: bool, summary: str,
+                   criteria: list | None = None) -> None:
+    """Close out one attempt in the ledger. Called once per attempt, after
+    the verdict — the per-attempt history the dashboard used to overwrite."""
+    if not _dash:
+        return
+    entry = {"n": n, "passed": passed, "summary": summary,
+             "criteria": list(criteria or []), "evidence": _dash.last_checks,
+             "focus": ""}
+    with _dash._lock:
+        # a re-reported attempt (best-of promotion) replaces its own row
+        _dash.ledger = [e for e in _dash.ledger if e["n"] != n] + [entry]
+        _dash.ledger.sort(key=lambda e: e["n"])
+        del _dash.ledger[:-20]
+    _dash.last_checks = ""
+    _dash.refresh()
+
+
+def retry_focus(text: str) -> None:
+    """What the executor was actually told to do next. Attaches to the most
+    recent ledger entry."""
+    if not _dash:
+        return
+    with _dash._lock:
+        if _dash.ledger:
+            _dash.ledger[-1]["focus"] = text
+    _dash.refresh()
+
+
 def success(text: str) -> None:
     if _dash:
         _dash.tint = "green"
@@ -1307,6 +1670,10 @@ def _record_file_stats(path: str, added: int, removed: int) -> None:
         stats["edits"] += 1
         stats["hist"].append(added + removed)  # per-edit churn → sparkline
         del stats["hist"][:-8]
+        # real progress: whatever the loop banner was complaining about, the
+        # agent just wrote something
+        _dash.last_change = time.monotonic()
+        _dash.loop_warn = None
 
 
 def file_created(name: str, added: int) -> None:

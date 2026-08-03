@@ -52,6 +52,13 @@ def _bare_dashboard(**extra):
     d.trend = []
     d.ctx_hist = deque(maxlen=24)
     d.paused = False
+    d.ledger = []
+    d.last_checks = ""
+    d.roles = {}
+    d.attempt_tokens = {}
+    d.reclaimed = []
+    d.loop_warn = None
+    d.last_change = time.monotonic()
     d._transcript = deque()
     d._transcript_len = 0
     d._transcript_dropped = 0
@@ -357,7 +364,9 @@ def test_quiet_mode_collapses_render(dash, monkeypatch):
     assert "[z] expand" in out
     dash.quiet = False
     out = _render_text(dash._render())
-    assert "solo" in out and "[z]quiet" in out
+    # the expanded hint is one no-wrap line: narrow terminals ellipsize the
+    # tail rather than growing the dashboard by a row
+    assert "solo" in out and "[m]essage" in out
 
 
 def test_render_smoke_all_sections(dash, monkeypatch):
@@ -385,7 +394,7 @@ def test_render_smoke_all_sections(dash, monkeypatch):
     assert "ctx" in out                  # context bar inline in the status line
     assert "tools 2" in out and "files 1" in out  # packed into the status line
     assert "agent · m" in out            # model in the header title
-    assert "[m] to type" in out          # docked input placeholder
+    assert "[m]essage" in out            # docked input placeholder
 
 
 def test_render_plan_without_verdict(dash):
@@ -427,7 +436,7 @@ def test_input_line_placeholder_and_focus(dash, monkeypatch):
     st = ui.ControlState()
     monkeypatch.setattr(ui, "_state", st)
     out = _render_text(dash._render_input_line())
-    assert "[m] to type" in out
+    assert "[m]essage" in out
     st.focused = True
     st.buffer = "fix the tests"
     out = _render_text(dash._render_input_line())
@@ -442,6 +451,181 @@ def test_composer_wraps_long_buffer(dash, monkeypatch):
     out = _render_text(dash._render_input_line())
     assert "TAIL" in out                 # nothing truncated: the box wraps
     assert "message" in out and "Enter send" in out
+
+
+# ─── [a] attempt ledger ─────────────────────────────────────────────
+
+def _review(dash, n, passed, crits, summary="verdict"):
+    ui.criteria(crits, source=f"reviewer, attempt {n}")
+    ui.attempt_result(n, passed, summary, crits)
+
+
+def test_ledger_keeps_every_attempt(dash):
+    _review(dash, 1, False, [{"criterion": "converts", "met": False}])
+    _review(dash, 2, False, [{"criterion": "converts", "met": True}])
+    assert [e["n"] for e in dash.ledger] == [1, 2]
+    # the latest review overwrites criteria_items; the ledger does not
+    assert dash.ledger[0]["criteria"][0]["met"] is False
+
+
+def test_ledger_replaces_a_re_reported_attempt(dash):
+    _review(dash, 1, False, [{"criterion": "a", "met": False}])
+    _review(dash, 1, True, [{"criterion": "a", "met": True}])
+    assert len(dash.ledger) == 1 and dash.ledger[0]["passed"] is True
+
+
+def test_regressions_need_a_criterion_that_was_met_before():
+    assert ui._regressions([]) == []
+    one = [{"n": 1, "criteria": [{"criterion": "a", "met": False}]}]
+    assert ui._regressions(one) == []  # a single review can't regress
+    ledger = one + [{"n": 2, "criteria": [{"criterion": "a", "met": True},
+                                          {"criterion": "b", "met": True}]},
+                    {"n": 3, "criteria": [{"criterion": "a", "met": True},
+                                          {"criterion": "b", "met": False}]}]
+    assert ui._regressions(ledger) == ["b"]
+
+
+def test_ledger_panel_grids_attempts_and_marks_regression(dash):
+    printed = []
+    dash.print = lambda *a, **k: printed.append(a)
+    _review(dash, 1, False, [{"criterion": "converts csv", "met": True},
+                             {"criterion": "pytest passes", "met": True}])
+    _review(dash, 2, False, [{"criterion": "converts csv", "met": True},
+                             {"criterion": "pytest passes", "met": False}],
+            summary="tests broke")
+    ui._show_ledger()
+    out = _render_text(printed[-1][0], width=120)
+    assert "a1" in out and "a2" in out
+    assert "converts csv" in out and "pytest passes" in out
+    assert "regressed" in out
+    assert "tests broke" in out
+    assert ui._regressions(dash.ledger) == ["pytest passes"]
+
+
+def test_ledger_carries_check_evidence_and_retry_focus(dash):
+    printed = []
+    dash.print = lambda *a, **k: printed.append(a)
+    ui.checks("$ pytest -q\nFAILED test_nulls.py::test_empty - AssertionError\n"
+              "1 failed, 3 passed")
+    _review(dash, 1, False, [{"criterion": "pytest passes", "met": False}])
+    assert dash.last_checks == ""  # consumed by the attempt it belongs to
+    ui.retry_focus("fix null handling, keep the schema work")
+    ui._show_ledger()
+    out = _render_text(printed[-1][0], width=120)
+    assert "test_nulls.py::test_empty" in out
+    assert "retry focus" in out and "fix null handling" in out
+
+
+def test_regression_hint_surfaces_in_the_plan_panel(dash):
+    _review(dash, 1, False, [{"criterion": "pytest passes", "met": True}])
+    _review(dash, 2, False, [{"criterion": "pytest passes", "met": False}])
+    dash.last_verdict = "tests broke"
+    out = _render_text(dash._render_plan(), width=120)
+    assert "1 regressed" in out and "[a] ledger" in out
+
+
+def test_ledger_panel_empty_before_any_review(dash):
+    printed = []
+    dash.print = lambda *a, **k: printed.append(a)
+    ui._show_ledger()
+    assert "no reviewed attempts yet" in _render_text(printed[-1][0])
+
+
+def test_digest_checks_prefers_the_failure():
+    assert "FAILED t.py::x" in ui._digest_checks("$ pytest\nFAILED t.py::x - boom\n"
+                                                 "1 failed, 2 passed")
+    assert ui._digest_checks("$ pytest\n5 passed in 0.1s") == "5 passed in 0.1s"
+    assert ui._digest_checks("") == ""
+
+
+# ─── [b] budget ─────────────────────────────────────────────────────
+
+def test_budget_accumulates_per_role_and_attempt(dash):
+    dash.attempt_n = 1
+    ui.llm_stats("executor", 4.0, 1000, 200)
+    ui.llm_stats("executor", 2.0, 500, 100)
+    ui.llm_stats("reviewer", 1.0, 300, 50)
+    dash.attempt_n = 2
+    ui.llm_stats("executor", 3.0, 900, 100)
+    assert dash.roles["executor"] == {"calls": 3, "tin": 2400, "tout": 400,
+                                      "secs": 9.0}
+    assert dash.roles["reviewer"]["calls"] == 1
+    assert dash.attempt_tokens == {1: 2150, 2: 1000}
+
+
+def test_budget_tolerates_missing_token_counts(dash):
+    ui.llm_stats("executor", 1.0, None, None)  # ollama omitted the meta
+    assert dash.roles["executor"]["tin"] == 0
+
+
+def test_budget_panel_renders_shares_and_rising_attempts(dash):
+    printed = []
+    dash.print = lambda *a, **k: printed.append(a)
+    dash.attempt_n = 1
+    ui.llm_stats("executor", 10.0, 8000, 1000)
+    ui.llm_stats("reviewer", 2.0, 900, 100)
+    dash.attempt_n = 2
+    ui.llm_stats("executor", 12.0, 20000, 2000)
+    ui._show_budget()
+    out = _render_text(printed[-1][0], width=120)
+    assert "executor" in out and "reviewer" in out
+    assert "%" in out and "calls" in out
+    assert "per attempt" in out and "↗" in out  # a2 cost far more than a1
+
+
+def test_budget_panel_empty_before_any_call(dash):
+    printed = []
+    dash.print = lambda *a, **k: printed.append(a)
+    ui._show_budget()
+    assert "no model calls yet" in _render_text(printed[-1][0])
+
+
+def test_compaction_dip_recorded_as_reclaimed(dash):
+    ui.context_tokens(20000, 32000)
+    ui.context_tokens(24000, 32000)   # growing: not a dip
+    ui.context_tokens(9000, 32000)    # compaction
+    ui.context_tokens(8800, 32000)    # noise below the threshold
+    assert dash.reclaimed == [15000]
+
+
+# ─── loop banner ────────────────────────────────────────────────────
+
+def test_repeated_call_raises_the_loop_banner(dash):
+    for _ in range(2):
+        ui.tool("read_file", {"name": "convert.py"})
+        ui.tool_result("ok")
+    assert dash.loop_warn is None
+    ui.tool("read_file", {"name": "convert.py"})
+    assert "read_file convert.py ×3" in dash.loop_warn
+    out = _render_text(dash._render_loop_banner())
+    assert "read_file convert.py" in out and "[i] interrupt" in out
+
+
+def test_different_args_do_not_trip_the_banner(dash):
+    for i in range(6):
+        ui.tool("read_file", {"name": f"f{i}.py"})
+        ui.tool_result("ok")
+    assert dash.loop_warn is None
+    assert dash._render_loop_banner() is None
+
+
+def test_writing_a_file_clears_the_banner(dash):
+    for _ in range(3):
+        ui.tool("read_file", {"name": "convert.py"})
+        ui.tool_result("ok")
+    assert dash.loop_warn is not None
+    ui.file_created("convert.py", added=12)
+    assert dash.loop_warn is None
+    assert dash._render_loop_banner() is None
+
+
+def test_idle_banner_after_a_stretch_with_no_edits(dash):
+    for i in range(5):
+        ui.tool("grep_files", {"pattern": f"p{i}"})
+        ui.tool_result("ok")
+    dash.last_change = time.monotonic() - 200
+    out = _render_text(dash._render_loop_banner())
+    assert "no file changes for 3:20" in out
 
 
 # ─── permissions [c] per-command grant ──────────────────────────────

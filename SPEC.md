@@ -317,6 +317,22 @@ Recent UI additions (all display-only, plain-mode-safe):
   ~80 lines; driven by `write_file`/`edit_file`.
 - **Finish notification** — `ui.notify` rings the terminal bell and, on macOS, posts an
   `osascript` banner; best-effort and suppressed by `--no-notify`.
+- **Attempt ledger (`[a]`)** — `ui.attempt_result(n, passed, summary, criteria)` records one
+  row per attempt instead of letting the newest review overwrite the last; the panel grids
+  criteria × attempt, flags any criterion that was met before and isn't now (`_regressions`),
+  and shows the reviewer's pytest digest (`ui.checks`) next to the retry instruction the
+  executor actually received (`ui.retry_focus`). The regression count also surfaces inline
+  in the plan panel.
+- **Budget (`[b]`)** — `ui.llm_stats` accumulates calls/prompt/eval/secs per role label
+  (executor, reviewer, goalsmith, subagent, memory) plus tokens per attempt; the panel adds
+  share bars, marks an attempt that cost >1.25× the one before it, and reports how much each
+  compaction dip in the context sawtooth gave back.
+- **Loop banner** — a repeated `(tool, args)` inside the last 8 calls, or 2 minutes of tool
+  calls with no file mutation, raises a yellow line above the timeline; any write clears it.
+- **Steering** — queued messages render as a chip (`[e]` edit, `[c]` cancel), `[/]` opens the
+  `STEER_PRESETS` picker, and `[i]` composes an interrupt: `ui.interrupt_requested()` makes
+  `Session.send` skip the tool calls it hasn't run yet (each still gets a `[ERROR] skipped`
+  result so the history stays well-formed) and go straight back to the model with the message.
 
 ---
 

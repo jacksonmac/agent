@@ -129,6 +129,8 @@ def review(model: str, goal: str, output: str, ws: Workspace,
     # spend on two truncated files; snapshots remain the no-git fallback
     files_text = (ws.attempt_diff() if changed_files else "") \
         or ws.snapshot_files(changed_files or [])
+    checks = automated_checks(ws)
+    ui.checks(checks)  # the ledger shows this next to the verdict it produced
     user = REVIEW_USER.format(
         goal=goal,
         criteria=criteria_text,
@@ -136,7 +138,7 @@ def review(model: str, goal: str, output: str, ws: Workspace,
         todos=todos_mod.render(),
         listing=listing,
         files=files_text,
-        checks=automated_checks(ws),
+        checks=checks,
     )
     schemas = reviewer_tool_schemas() if settings.reviewer_tools else None
 

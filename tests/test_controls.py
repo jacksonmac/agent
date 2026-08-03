@@ -58,6 +58,10 @@ class DummyDash:
         self.last_llm = ""
         self.run_started = time.monotonic()
         self.llm_durs = deque(maxlen=16)
+        self.ledger = []       # the [a] panel
+        self.roles = {}        # the [b] panel
+        self.attempt_tokens = {}
+        self.reclaimed = []
         self._lock = threading.Lock()
 
     def refresh(self):
@@ -256,6 +260,152 @@ def test_z_key_toggles_quiet_mode(state):
     feed(state, "z", dash)
     assert not dash.quiet
     assert not state.paused and not state.quit_requested  # z is quiet-only
+
+
+# ─── queue management: [e]dit, [c]ancel ─────────────────────────────
+
+def test_cancel_discards_the_queue(state):
+    dash = DummyDash()
+    feed(state, "m", dash)
+    feed(state, "wrong thing\r", dash)
+    feed(state, "c", dash)
+    assert ui.drain_messages() == []
+    assert any("discarded" in str(a) for a in dash.printed)
+
+
+def test_cancel_with_nothing_queued_is_inert(state):
+    feed(state, "c")
+    assert not state.focused and not state.paused
+
+
+def test_edit_reopens_the_last_queued_message(state):
+    feed(state, "m")
+    feed(state, "use pandas\r")
+    feed(state, "e")
+    assert state.focused and state.buffer == "use pandas"
+    feed(state, "\x7f" * 6 + "pyarrow\r")
+    assert ui.drain_messages() == ["use pyarrow"]
+
+
+def test_edit_only_pulls_back_the_newest(state):
+    feed(state, "m")
+    feed(state, "first\r")
+    feed(state, "m")
+    feed(state, "second\r")
+    feed(state, "e")
+    assert state.buffer == "second"
+    feed(state, "\x1b")                      # cancelled: it stays dropped
+    assert ui.drain_messages() == ["first"]
+
+
+# ─── [i] interrupt ──────────────────────────────────────────────────
+
+def test_interrupt_queues_and_sets_the_flag(state):
+    dash = DummyDash()
+    feed(state, "i", dash)
+    assert state.focused and state.compose_interrupt
+    feed(state, "use pyarrow\r", dash)
+    assert ui.drain_messages() == ["use pyarrow"]
+    assert ui.interrupt_requested() is True
+    assert ui.interrupt_requested() is False   # consumed on read
+    assert not state.compose_interrupt
+    assert any("interrupting" in str(a) for a in dash.printed)
+
+
+def test_plain_m_does_not_interrupt(state):
+    feed(state, "m")
+    feed(state, "just a note\r")
+    assert ui.drain_messages() == ["just a note"]
+    assert ui.interrupt_requested() is False
+
+
+def test_escaping_an_interrupt_clears_the_flag(state):
+    feed(state, "i")
+    feed(state, "never mind\x1b")
+    assert not state.focused and not state.compose_interrupt
+    assert ui.drain_messages() == []
+    assert ui.interrupt_requested() is False
+
+
+def test_interrupt_requested_is_noop_in_plain_mode():
+    assert ui._state is None
+    assert ui.interrupt_requested() is False
+
+
+def test_interrupt_skips_the_rest_of_the_tool_round(scripted_llm, state, ws):
+    """[i] mid-round: the remaining calls the model asked for are abandoned,
+    but each still gets a result message so the history stays well-formed."""
+    ran = []
+
+    def fake_exec(name, args):
+        ran.append(args.get("name"))
+        feed(state, "i")           # the user hits [i] while this call runs
+        feed(state, "stop that\r")
+        return "ok"
+
+    import harness.tools as tools_mod
+    original = tools_mod.execute_tool_call
+    tools_mod.execute_tool_call = fake_exec
+    try:
+        scripted_llm.replies.append({
+            "role": "assistant", "content": "",
+            "tool_calls": [{"function": {"name": "read_file",
+                                         "arguments": {"name": f"f{i}.py"}}}
+                           for i in range(3)]})
+        scripted_llm.queue_text("stopped")
+        schemas = [{"function": {"name": "read_file"}}]
+        session = Session("m", SYS, schemas, accept_user_messages=True)
+        session.send("task")
+    finally:
+        tools_mod.execute_tool_call = original
+
+    assert ran == ["f0.py"]                 # f1/f2 never executed
+    assert session.last_tool_calls == 1
+    results = [m for m in session.messages if m["role"] == "tool"]
+    assert len(results) == 3                # every issued call still answered
+    assert "user interrupted" in results[1]["content"]
+    # and the message the user typed reaches the model on the next call
+    assert any("stop that" in str(m) for m in scripted_llm.payloads[-1]["messages"])
+
+
+# ─── [/] steering presets ───────────────────────────────────────────
+
+def test_slash_opens_the_menu_and_a_digit_sends(state):
+    dash = DummyDash()
+    feed(state, "/", dash)
+    assert state.menu
+    feed(state, "2", dash)
+    assert not state.menu
+    assert ui.drain_messages() == [ui.STEER_PRESETS[1]]
+
+
+def test_menu_ignores_out_of_range_and_closes(state):
+    feed(state, "/")
+    feed(state, "9")
+    assert not state.menu and ui.drain_messages() == []
+
+
+def test_esc_closes_the_menu(state):
+    feed(state, "/")
+    feed(state, "\x1b")
+    assert not state.menu and ui.drain_messages() == []
+
+
+def test_menu_digits_are_literal_text_while_composing(state):
+    feed(state, "m")
+    feed(state, "/2\r")
+    assert ui.drain_messages() == ["/2"]
+
+
+# ─── [a] / [b] panels ───────────────────────────────────────────────
+
+def test_ledger_and_budget_keys_print(state, monkeypatch):
+    dash = DummyDash()
+    monkeypatch.setattr(ui, "_dash", dash)
+    feed(state, "a", dash)
+    feed(state, "b", dash)
+    assert any("no reviewed attempts yet" in str(a) for a in dash.printed)
+    assert any("no model calls yet" in str(a) for a in dash.printed)
 
 
 # ─── message injection into Session ─────────────────────────────────

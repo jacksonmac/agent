@@ -541,6 +541,16 @@ this file replaced: installing the repo without one changes nothing.
   executing, and the approved command is recorded in the `permission` event.
   Non-interactive sessions auto-deny with an error the model can react to; `--yolo`
   disables the gate (evals pass it automatically) unless the policy forbids it.
+- **Live dashboard keys** — while a run is going: `[m]` message the agent (queued and
+  delivered before its next model call, with a chip showing what's waiting — `[e]`
+  edits it, `[c]` drops it), `[i]` the same but also abandons the tool calls the model
+  queued for this round, `[/]` picks one of the canned nudges in `ui.STEER_PRESETS`,
+  `[a]` the attempt ledger (every attempt's criteria side by side, so a ✓→✗ regression
+  and the exact retry instruction are visible), `[b]` the budget (tokens/time per role,
+  per-attempt cost, compaction reclaim), plus the existing `[p]ause [o]transcript
+  [t]ools [d]iff [q]uit [z]quiet`. A yellow banner appears live when the same call
+  repeats or nothing has been written for two minutes — the stall `run.py` otherwise
+  only catches once the attempt is over.
 - **Interactive steering** — `-i`/`--interactive` pauses after each failed verdict:
   Enter retries as usual, typed text is injected into the retry message as user
   guidance (logged as a `user_steer` event), and `q` ends the run with the normal
@@ -581,6 +591,21 @@ this file replaced: installing the repo without one changes nothing.
 
 - Multi-phase planning for big goals (plan → execute each phase → review each phase);
   plan-seeded todos are the first slice of this
+- **Office documents as first-class deliverables** — spreadsheets and documents first
+  (`.xlsx`/`.csv`, then `.docx`), presentations after. A new `harness/tools/docs.py`
+  adds real tools with schemas and `policy.json` entries rather than leaving it to
+  `run_python`, because small executor models drive a named tool far more reliably
+  than a library API they have to recall. The hard requirement is **editing, not just
+  authoring**: open a file the user seeded into the workspace, change the parts the
+  goal asks for, and round-trip everything else — styles, formulas, merged cells,
+  images — untouched. That pulls in two changes elsewhere:
+  - `workspace.py` must accept binary seed files and stop treating them as text for
+    change detection (mtime scanning is fine; snapshotting is not).
+  - `review.py` must extract text from `.docx`/`.xlsx`/`.pptx` in `snapshot_files` and
+    `automated_checks`, so the reviewer judges the actual content instead of being
+    handed a binary blob it can only guess about. Without this the review step silently
+    degrades to "the file exists", which is exactly the failure mode the harness exists
+    to prevent.
 
 ## License
 
