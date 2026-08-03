@@ -518,15 +518,25 @@ of argued about. The checker is the point: `harness_passed` is the reviewer's op
   `dedup_merge`). Each pairs a goal string with a `check(ws) -> (bool, detail)` that runs
   the produced code or reads the produced data.
 - **`run_evals.py`** — runs each goal as a subprocess `agent.py` invocation into
-  `evals/eval_runs/<label>/`, harvests per-run stats from that run's `events.jsonl`, writes
-  `results_<label>.json`, and prints a table. `--goals` subsets, `--attempts` and `--timeout`
-  bound each run, `--model` / `--url` / `--reviewer-model` / `--agent-args` pass through to
-  the harness, and `--compare <file>` diffs against an earlier results file.
+  `evals/eval_runs/<label>/<goal>/rep_<n>/`, harvests per-run stats from that run's
+  `events.jsonl`, writes `results_<label>.json`, and prints a table. `--goals` subsets,
+  `--attempts` and `--timeout` bound each run, `--model` / `--url` / `--reviewer-model` /
+  `--agent-args` pass through to the harness, and `--compare <file>` diffs against an
+  earlier results file.
+- **`--repeat N`** runs every goal N times. Each repeat gets its own workspace — sharing
+  one would let repeat 2 start from the files repeat 1 produced, measuring nothing. Runs
+  are repeat-major (a full sweep of the goals, then the next sweep), so an interrupted run
+  still holds one complete pass. `per_goal()` aggregates rows into `{runs, passed,
+  pass_rate, mean_attempts, mean_wall_secs, mean_tokens}`; `summarize()` reports `goals`
+  and `runs` separately (equal only at `--repeat 1`, which keeps older results files
+  comparable) and embeds `per_goal`. `_flaky()` names goals that both passed and failed
+  with nothing about the harness changing.
 - Runs are headless, so the UI takes its plain-print path and `--yolo` is passed
   automatically — the permission gate would otherwise auto-deny every `run_python`.
 
-**Current limit, and why it matters:** each goal is run **once** per label, and the executor
-samples at `temperature 0.7`. With 8 goals, one flipped goal moves the pass rate by 12.5
-points, and `print_comparison` will label that single flip `improved` or `REGRESSED` with no
-notion of whether it is noise. Comparing two labels also compares two moments in time on the
-same Ollama server. Turning this into a genuine A/B instrument is roadmap item I-12.
+**Where this is going.** `print_comparison` no longer labels a single flip `improved` or
+`REGRESSED`; it prints a pass-rate delta and, when either side has fewer than two runs per
+goal, states plainly that the comparison cannot separate a real change from a resample.
+What is still missing for a genuine A/B instrument — interleaved arms paired by
+`(goal, repeat)`, bootstrap confidence intervals, the minimum detectable effect printed
+before the run, and a tool-efficiency metric — is roadmap item I-12.

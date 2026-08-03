@@ -476,8 +476,19 @@ independently of the harness's own reviewer:
 ```bash
 venv/bin/python evals/run_evals.py --label after            # run all 8, write results_after.json
 venv/bin/python evals/run_evals.py --goals csv_cleanup      # subset
+venv/bin/python evals/run_evals.py --label after --repeat 5 # 5 runs per goal (40 runs)
 venv/bin/python evals/run_evals.py --label after --compare evals/results_baseline.json
 ```
+
+**`--repeat N` is what makes a comparison mean anything.** The executor samples at
+`temperature 0.7`, so one run per goal cannot tell a real change from a resample — a
+goal that flips may simply have rolled differently. With repeats, each goal reports a
+pass *rate* (`3/5`) instead of a bit, goals that pass **and** fail with no harness change
+are listed as flaky, and `--compare` prints a rate delta rather than the word
+"REGRESSED". Comparing two single-run labels now says so explicitly instead of implying
+a result. Every repeat gets its own workspace, so repeat 2 never starts from the files
+repeat 1 produced. Repeats run goal-major within each pass, so an interrupted run still
+holds one complete sweep of every goal.
 
 Keep `--attempts` constant across runs you compare. To capture a **baseline for the
 pre-improvement harness** (the eval suite works against whatever code is checked out):
@@ -681,9 +692,16 @@ this file replaced: installing the repo without one changes nothing.
   verdict — a hard threshold on 40 samples manufactures confidence that isn't there. When
   an interval straddles zero it says so plainly.
 
-  Build order: repeats and per-run records first (useful alone), then the tool-efficiency
-  counter, then arm config and interleaving, then intervals and the up-front MDE, then the
-  prompt-override hook last since it is the only part that touches `harness/`.
+  Build order, with the first step **done**:
+  1. **Repeats and per-run records — done.** `--repeat N` gives each goal its own
+     workspace per repeat, records a `repeat` field on every row, reports per-goal pass
+     rates, names goals that pass and fail with no harness change, and makes `--compare`
+     print a rate delta plus an explicit warning when either side has only one run.
+     Useful on its own: it already tells you which goals are flaky.
+  2. The tool-efficiency counter in `_stats_from_events`.
+  3. Arm config and interleaving.
+  4. Bootstrap intervals and the up-front minimum detectable effect.
+  5. The prompt-override hook, last — the only part that touches `harness/`.
 - Multi-phase planning for big goals (plan → execute each phase → review each phase);
   plan-seeded todos are the first slice of this
 - **Office documents as first-class deliverables** — spreadsheets and documents first
