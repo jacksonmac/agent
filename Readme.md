@@ -541,6 +541,16 @@ this file replaced: installing the repo without one changes nothing.
   executing, and the approved command is recorded in the `permission` event.
   Non-interactive sessions auto-deny with an error the model can react to; `--yolo`
   disables the gate (evals pass it automatically) unless the policy forbids it.
+- **Live dashboard keys** — while a run is going: `[m]` message the agent (queued and
+  delivered before its next model call, with a chip showing what's waiting — `[e]`
+  edits it, `[c]` drops it), `[i]` the same but also abandons the tool calls the model
+  queued for this round, `[/]` picks one of the canned nudges in `ui.STEER_PRESETS`,
+  `[a]` the attempt ledger (every attempt's criteria side by side, so a ✓→✗ regression
+  and the exact retry instruction are visible), `[b]` the budget (tokens/time per role,
+  per-attempt cost, compaction reclaim), plus the existing `[p]ause [o]transcript
+  [t]ools [d]iff [q]uit [z]quiet`. A yellow banner appears live when the same call
+  repeats or nothing has been written for two minutes — the stall `run.py` otherwise
+  only catches once the attempt is over.
 - **Interactive steering** — `-i`/`--interactive` pauses after each failed verdict:
   Enter retries as usual, typed text is injected into the retry message as user
   guidance (logged as a `user_steer` event), and `q` ends the run with the normal
@@ -581,6 +591,59 @@ this file replaced: installing the repo without one changes nothing.
 
 - Multi-phase planning for big goals (plan → execute each phase → review each phase);
   plan-seeded todos are the first slice of this
+- **Office documents as first-class deliverables** — spreadsheets and documents first
+  (`.xlsx`/`.csv`, then `.docx`), presentations after. A new `harness/tools/docs.py`
+  adds real tools with schemas and `policy.json` entries rather than leaving it to
+  `run_python`, because small executor models drive a named tool far more reliably
+  than a library API they have to recall. The hard requirement is **editing, not just
+  authoring**: open a file the user seeded into the workspace, change the parts the
+  goal asks for, and round-trip everything else untouched. A spike measured what
+  the libraries actually preserve (openpyxl 3.1.5, python-docx 1.2.0), and the two
+  formats need different treatment:
+  - **docx is safe.** python-docx keeps the underlying XML tree and repackages
+    every part it has no model for, so a plain save and a real paragraph edit both
+    preserved content controls, tracked changes, TOC fields, headers/footers,
+    tables and images — zero parts dropped.
+  - **xlsx needs a guard.** openpyxl preserved more than its reputation suggests
+    (charts, images, conditional formatting, data validation, defined names,
+    comments and merges all survived), but it silently drops anything it has no
+    model for: `<extLst>` extensions such as sparklines vanish from *inside* a
+    part that still exists, `customXml/` is dropped, `vbaProject.bin` is dropped
+    unless `keep_vba=True`, and `data_only=True` replaces every formula with a
+    cached value — turning "read the numbers" into "destroy the spreadsheet" if
+    the same workbook is later saved.
+  So the edit tools fingerprint the file before and after and refuse to write a
+  result that lost anything the edit did not ask to remove. A refusal surfaces to
+  the model as a tool error it can react to, which is the harness's existing
+  pattern; silently shipping a damaged workbook is not.
+
+  The work is in four steps, in this order:
+
+  1. **The fidelity guard** — `harness/office.py`. **Done.** Fingerprints an OPC
+     package three ways (part inventory, a scan for known-unmodelled constructs,
+     and a formula count), because the losses are not all visible at the package
+     level — a sparkline disappears from *inside* a part that still exists. No
+     third-party dependencies: it reads the zip directly, so it works whether or
+     not openpyxl is installed and can judge a file written by anything.
+     `office.describe()` turns a loss list into the refusal the model sees.
+  2. **xlsx tools** — `read_sheet` / `write_sheet` / `edit_cells` in
+     `harness/tools/docs.py`, with `policy.json` entries. Always `keep_vba=True`,
+     never `data_only=True` on a path that ends in a save, and every edit runs
+     through `office.check_edit` before the result is published. Ships the format
+     picked first, with the guard already behind it.
+  3. **Reviewer extraction** (`review.py`) — extract text from `.xlsx`/`.docx` in
+     `snapshot_files` and `automated_checks` so the reviewer judges real content
+     instead of a binary blob. Without it every verdict on a document deliverable
+     degrades to "the file exists", which is the exact failure the review loop
+     exists to catch. `workspace.py` needs the matching change: accept binary seed
+     files and stop treating them as text for change detection (mtime scanning is
+     fine; snapshotting is not).
+  4. **docx tools** — read paragraphs and tables, rewrite a paragraph, append
+     sections. Cheaper than xlsx because step 1 proved no guard is needed.
+
+  Deferred until the above is in real use: `.pptx`, and surgical zip-level patching
+  (rewriting a single part and leaving the rest byte-identical), which is the
+  fallback if the guard turns out to refuse edits people legitimately want.
 
 ## License
 

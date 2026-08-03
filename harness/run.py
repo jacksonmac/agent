@@ -231,6 +231,8 @@ def main(model: str, goal: str, task: str, ws: Workspace, log: RunLog,
             if verdict.criteria:
                 ui.criteria(verdict.criteria,
                             source=f"reviewer, attempt {attempt}")
+            ui.attempt_result(attempt, passed, verdict.summary(),
+                              verdict.criteria)
             attempts.append({"attempt": attempt, "output": answer,
                              "files": changed_files, "passed": passed,
                              "verdict": verdict.summary(),
@@ -290,6 +292,9 @@ def main(model: str, goal: str, task: str, ws: Workspace, log: RunLog,
                 user_msg += ("\n\nUSER GUIDANCE for this retry (follow it, it "
                              "overrides the feedback above where they conflict):\n"
                              + guidance)
+            # the instruction the executor is about to receive, in the ledger:
+            # a retry aimed at the wrong thing is invisible otherwise
+            ui.retry_focus(user_msg)
             prev_answer = answer
         else:
             ui.warn(f"hit max attempts ({max_attempts}) without meeting the goal")

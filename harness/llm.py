@@ -306,17 +306,27 @@ class Session:
                 return msg["content"]
 
             self.messages.append(msg)
+            interrupted = False
             for tc in tool_calls:
                 func_info = tc["function"]
                 tool_name = func_info["name"]
                 tool_args = func_info.get("arguments", {})
-                self.last_tool_calls += 1
-                ui.tool(tool_name, tool_args)
-                if tool_name not in self._allowed:
-                    result = f"[ERROR] tool '{tool_name}' is not available in this context"
+                if interrupted:
+                    # [i]: the user has already told us this round is going
+                    # nowhere. Every issued call still needs a result message
+                    # or the history stops making sense to the model.
+                    result = ("[ERROR] skipped: the user interrupted before "
+                              "this call ran")
                 else:
-                    result = execute_tool_call(tool_name, tool_args)
-                ui.tool_result(result)
+                    self.last_tool_calls += 1
+                    ui.tool(tool_name, tool_args)
+                    if tool_name not in self._allowed:
+                        result = f"[ERROR] tool '{tool_name}' is not available in this context"
+                    else:
+                        result = execute_tool_call(tool_name, tool_args)
+                    ui.tool_result(result)
+                    if self.accept_user_messages and ui.interrupt_requested():
+                        interrupted = True
                 # load_skill returns instructions the model must actually read —
                 # it gets its own larger cap (skills.py already trims the body)
                 max_chars = (settings.skill_body_max if tool_name == "load_skill"
