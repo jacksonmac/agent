@@ -360,13 +360,24 @@ Recent UI additions (all display-only, plain-mode-safe):
 - **Budget (`[b]`)** — `ui.llm_stats` accumulates calls/prompt/eval/secs per role label
   (executor, reviewer, goalsmith, subagent, memory) plus tokens per attempt; the panel adds
   share bars, marks an attempt that cost >1.25× the one before it, and reports how much each
-  compaction dip in the context sawtooth gave back.
-- **Loop banner** — a repeated `(tool, args)` inside the last 8 calls, or 2 minutes of tool
-  calls with no file mutation, raises a yellow line above the timeline; any write clears it.
+  compaction dip in the context sawtooth gave back. Tokens spent before attempt 1 is
+  announced — the goalsmith turn, and on `--best-of` the entire candidate round — are
+  bucketed under attempt 0 and shown as `setup`, so a best-of run does not hide most of its
+  cost from the panel that exists to show it.
+- **Loop banner** — a repeated `(tool, args)` inside the last 8 calls, or 2 minutes with at
+  least 4 tool calls and no file mutation, raises a yellow line above the timeline. It clears
+  on a write **and** when the next call has a different signature: a banner naming a call the
+  agent has stopped making is worse than none. The idle arm counts `tools_since_change`, not
+  the run-cumulative `tool_count`, so it reports a current stall rather than latching on
+  forever after the run's first four calls.
 - **Steering** — queued messages render as a chip (`[e]` edit, `[c]` cancel), `[/]` opens the
   `STEER_PRESETS` picker, and `[i]` composes an interrupt: `ui.interrupt_requested()` makes
   `Session.send` skip the tool calls it hasn't run yet (each still gets a `[ERROR] skipped`
   result so the history stays well-formed) and go straight back to the model with the message.
+  The flag is scoped to one `send()`: it is dropped on entry, so an interrupt raised during a
+  turn the model answers in text cannot silently truncate a later turn's tool calls.
+  Ledger reads in `_render_plan` and `_show_ledger` snapshot under the dashboard lock —
+  `attempt_result` sorts that list, and CPython empties a list for the duration of a sort.
 
 ---
 

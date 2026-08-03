@@ -277,6 +277,11 @@ class Session:
         from .tools import execute_tool_call  # late import: tools pull in llm helpers
         self.messages.append({"role": "user", "content": user})
         self.last_tool_calls = 0
+        # An interrupt is scoped to the turn it was raised in. If the model
+        # answered that turn in text, nothing consumed the flag — dropping it
+        # here stops a stale [i] from silently skipping tool calls in a later
+        # turn the user never interrupted.
+        ui.interrupt_requested()
 
         for round_num in range(self.max_tool_rounds):
             # safe point: the previous round's tools have fully executed and

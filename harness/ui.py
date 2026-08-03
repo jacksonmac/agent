@@ -215,7 +215,9 @@ class _Dashboard:
         self.reclaimed: list[int] = []   # tokens each compaction dip gave back
         # loop banner: repeated identical calls, or a long stretch with no edits
         self.loop_warn: str | None = None
+        self.loop_sig: tuple | None = None   # the (name, args) that raised it
         self.last_change = time.monotonic()
+        self.tools_since_change = 0
         self._transcript: deque[str] = deque()
         self._transcript_len = 0
         self._transcript_dropped = 0
@@ -277,7 +279,10 @@ class _Dashboard:
         nothing written. One line, above the timeline."""
         text = self.loop_warn
         idle = time.monotonic() - self.last_change
-        if text is None and self.tool_count >= 4 and idle > _IDLE_EDIT_SECS:
+        # tools_since_change, not tool_count: the signal is "it has done
+        # several things and produced nothing", which a cumulative counter
+        # would report forever after the first four calls of the run
+        if text is None and self.tools_since_change >= 4 and idle > _IDLE_EDIT_SECS:
             text = (f"no file changes for {int(idle) // 60}:{int(idle) % 60:02d}"
                     f" · {self.tool_count} tool calls so far")
         if text is None:
@@ -644,8 +649,12 @@ class _Dashboard:
                         style="green" if self.verdict_passed else "red")
             parts.append(line)
         # a criterion that was met and then wasn't is the signal worth
-        # noticing without opening the ledger
-        regressed = _regressions(self.ledger)
+        # noticing without opening the ledger. Snapshot under the lock:
+        # attempt_result() sorts this list, and CPython empties a list for
+        # the duration of a sort — an unlocked read can see nothing there.
+        with self._lock:
+            ledger = list(self.ledger)
+        regressed = _regressions(ledger)
         if regressed:
             hint = Text(no_wrap=True, overflow="ellipsis")
             hint.append(f"{len(regressed)} regressed", style="bold yellow")
@@ -1091,12 +1100,14 @@ def _show_ledger() -> None:
     flipped rather than only how the latest review scored."""
     if _dash is None:
         return
-    ledger = [e for e in _dash.ledger if _ledger_criteria(e)]
+    with _dash._lock:  # runs on the reader thread; attempt_result sorts
+        snapshot = list(_dash.ledger)
+    ledger = [e for e in snapshot if _ledger_criteria(e)]
     if not ledger:
         _dash.print(Text("no reviewed attempts yet", style="dim"))
         return
     shown = ledger[-6:]  # a wider grid than this stops fitting the terminal
-    regressed = set(_regressions(_dash.ledger))
+    regressed = set(_regressions(snapshot))
     # union of criteria, in first-seen order — reviewers reword and reorder
     names: list[str] = []
     for e in shown:
@@ -1180,9 +1191,17 @@ def _show_budget() -> None:
                      Text(f"{r['secs']:.0f}"), bar)
 
     body = [grid]
+    # bucket 0 is everything spent before attempt 1 was announced: the
+    # goalsmith turn and, on --best-of, the whole candidate round. Filtering
+    # it out hid two thirds of a best-of run from the panel meant to show
+    # where the tokens went.
+    setup = per_attempt.get(0, 0)
     costs = [(n, t) for n, t in sorted(per_attempt.items()) if n]
-    if costs:
+    if costs or setup:
         line = Text("per attempt  ", style="dim")
+        if setup:
+            line.append("setup ", style="dim")
+            line.append(f"{_fmt_tok(setup)}  ", style="dim")
         for i, (n, tok) in enumerate(costs):
             # a retry that costs more than the attempt before it is the loop
             # degenerating rather than converging
@@ -1327,14 +1346,22 @@ def tool(name: str, arguments) -> None:
             if len(_dash.tool_history) > 500:
                 del _dash.tool_history[0]
             _dash.tool_count += 1
+            _dash.tools_since_change += 1
             # spinning on the same call is the failure mode run.py only
             # catches once the whole attempt is over
             window = _dash.tool_history[-_LOOP_WINDOW:]
+            sig = (row.name, row.args_short)
             same = sum(1 for r in window
                        if r.name == row.name and r.args_short == row.args_short)
             if same >= _LOOP_REPEATS:
+                _dash.loop_sig = sig
                 _dash.loop_warn = (f"{row.name} {row.args_short}".strip()
                                    + f" ×{same} in the last {len(window)} calls")
+            elif _dash.loop_sig is not None and sig != _dash.loop_sig:
+                # the agent moved on — a banner naming a call it is no longer
+                # making is worse than no banner
+                _dash.loop_sig = None
+                _dash.loop_warn = None
         # files_touched is populated by diff()/file_created() using the real
         # path — not seeded here, which would key it by the truncated
         # args_short and leave a phantom "+0 −0" row when no diff follows
@@ -1673,7 +1700,9 @@ def _record_file_stats(path: str, added: int, removed: int) -> None:
         # real progress: whatever the loop banner was complaining about, the
         # agent just wrote something
         _dash.last_change = time.monotonic()
+        _dash.tools_since_change = 0
         _dash.loop_warn = None
+        _dash.loop_sig = None
 
 
 def file_created(name: str, added: int) -> None:
