@@ -562,10 +562,19 @@ of argued about. The checker is the point: `harness_passed` is the reviewer's op
   that the pass-rate difference cannot be called real. The parsed experiment is stored in
   the results file so it remains self-describing.
 
+- **Intervals, not verdicts.** `bootstrap_ci` takes a percentile bootstrap over the
+  per-pair differences — non-parametric because paired pass differences are −1/0/+1 and
+  nothing about them is normal — seeded so a report does not change its numbers on re-run.
+  Each delta prints with its 95% interval and a marker when the interval includes zero.
+  `mde_pass_rate(pairs, discordance)` is `z·√d/√n`, the half-width for paired ±1
+  differences; `print_budget` prints it before the run with its assumption attached, plus
+  the repeat count that would resolve 15 points. No ship/don't-ship verdict is produced,
+  by design.
+
 **Where this is going.** `print_comparison` no longer labels a single flip `improved` or
 `REGRESSED`; it prints a pass-rate delta and, when either side has fewer than two runs per
 goal, states plainly that the comparison cannot separate a real change from a resample.
-Repeats, tool efficiency, and interleaved paired arms are in. What is still missing for a
-full A/B instrument — bootstrap confidence intervals, the minimum detectable effect printed
-before the run starts, and the `prompts.py` override hook that would let an arm vary prompt
-wording — is roadmap item I-12, steps 4 and 5.
+Repeats, tool efficiency, interleaved paired arms, and bootstrap intervals with an up-front
+minimum detectable effect are all in. The one remaining piece — the `prompts.py` override
+hook that would let an arm vary prompt wording rather than only flags — is roadmap item
+I-12, step 5, and is the only part of the feature that touches `harness/`.

@@ -420,7 +420,8 @@ def test_arm_report_flags_too_few_discordant_pairs(capsys):
     run_evals.print_arms(exp, rows)
     out = capsys.readouterr().out
     assert "paired against 'a'" in out
-    assert "too few to call the pass-rate difference real" in out
+    assert "pairs changed outcome" in out
+    assert "correspondingly wide" in out
 
 
 def test_arm_report_stays_quiet_with_enough_flips(capsys):
@@ -430,7 +431,7 @@ def test_arm_report_stays_quiet_with_enough_flips(capsys):
     rows = ([dict(_row("g", i, False), arm="a") for i in range(1, 9)] +
             [dict(_row("g", i, True), arm="b") for i in range(1, 9)])
     run_evals.print_arms(exp, rows)
-    assert "too few to call" not in capsys.readouterr().out
+    assert "correspondingly wide" not in capsys.readouterr().out
 
 
 def test_shipped_experiment_files_are_valid():
@@ -440,3 +441,80 @@ def test_shipped_experiment_files_are_valid():
     assert files, "no example experiments shipped"
     for f in files:
         run_evals.load_experiment(f)
+
+
+# ─── intervals and the up-front budget (A/B step 4) ─────────────────
+
+def test_bootstrap_ci_brackets_a_known_mean():
+    import run_evals
+    lo, hi = run_evals.bootstrap_ci([1.0] * 40 + [3.0] * 40, seed=1)
+    assert lo < 2.0 < hi
+    assert hi - lo < 1.0                       # 80 samples is a tight interval
+
+
+def test_bootstrap_ci_on_no_difference_straddles_zero():
+    """Two identical arms must not produce a 'finding'."""
+    import run_evals
+    lo, hi = run_evals.bootstrap_ci([0.0] * 40, seed=1)
+    assert lo == 0.0 and hi == 0.0
+    lo, hi = run_evals.bootstrap_ci([1.0, -1.0] * 20, seed=1)
+    assert lo < 0 < hi
+
+
+def test_bootstrap_ci_narrows_with_more_pairs():
+    import run_evals
+    vals = [1.0, -1.0, 0.0, 1.0]
+    narrow = run_evals.bootstrap_ci(vals * 40, seed=2)
+    wide = run_evals.bootstrap_ci(vals, seed=2)
+    assert (narrow[1] - narrow[0]) < (wide[1] - wide[0])
+
+
+def test_bootstrap_ci_handles_degenerate_input():
+    import run_evals
+    assert run_evals.bootstrap_ci([]) == (0.0, 0.0)
+    assert run_evals.bootstrap_ci([0.4]) == (0.4, 0.4)
+
+
+def test_bootstrap_ci_is_deterministic_for_a_seed():
+    """A report that changed its numbers on re-run would be untrustworthy."""
+    import run_evals
+    vals = [1.0, 0.0, -1.0, 1.0, 0.0]
+    assert run_evals.bootstrap_ci(vals, seed=3) == run_evals.bootstrap_ci(vals, seed=3)
+
+
+def test_mde_shrinks_with_pairs_and_is_honest_about_zero():
+    import run_evals
+    assert run_evals.mde_pass_rate(0) == 1.0
+    small, big = run_evals.mde_pass_rate(10), run_evals.mde_pass_rate(160)
+    assert small > big
+    assert 0.14 < run_evals.mde_pass_rate(40) < 0.16   # the ~15 points claimed
+
+
+def test_budget_note_states_what_the_run_cannot_answer(capsys):
+    import run_evals
+    run_evals.print_budget(goals=3, repeats=2, arms=2)
+    out = capsys.readouterr().out
+    assert "6 paired observations" in out
+    assert "inconclusive" in out and "correct answer" in out
+    assert "repeats" in out                 # tells you what would be enough
+
+
+def test_budget_note_silent_without_a_comparison(capsys):
+    import run_evals
+    run_evals.print_budget(goals=8, repeats=5, arms=1)
+    assert capsys.readouterr().out == ""
+
+
+def test_arm_report_prints_intervals_not_verdicts(capsys):
+    import run_evals
+    exp = {"name": "x", "arms": {"a": {"flags": [], "description": ""},
+                                 "b": {"flags": [], "description": ""}}}
+    rows = ([dict(_row("g", i, i % 2 == 0, wall=90.0), arm="a") for i in range(1, 11)] +
+            [dict(_row("g", i, i % 2 == 0, wall=60.0), arm="b") for i in range(1, 11)])
+    run_evals.print_arms(exp, rows)
+    out = capsys.readouterr().out
+    assert "95% CI" in out
+    assert "interval includes 0" in out          # pass rate: identical arms
+    assert "-30.0" in out                        # wall: a real, resolved change
+    for word in ("ship", "SHIP", "significant", "REGRESSED", "improved"):
+        assert word not in out

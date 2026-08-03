@@ -507,6 +507,14 @@ of `agent.py` flags:
           "no-self-check": {"flags": ["--no-self-check"]}}}
 ```
 
+Before anything runs, the tool states how many paired observations you will have and
+the smallest pass-rate difference they can resolve (with the assumption behind that
+number spelled out). Each reported delta then carries a **percentile bootstrap 95%
+interval**, marked when it includes zero. There is no ship/don't-ship verdict: a
+threshold applied to forty samples manufactures confidence that isn't there. In practice
+the pass-rate interval is usually wide and the cost and tool-efficiency intervals are
+tight — which is the real reason to run overnight.
+
 The arms run **interleaved** — innermost in the loop, so the two runs of a `(goal, repeat)`
 pair happen seconds apart. Whatever drifts across a long night (server load, model
 residency) then drifts for both sides of every pair instead of landing on whichever arm
@@ -742,7 +750,13 @@ this file replaced: installing the repo without one changes nothing.
      runs them innermost so each `(goal, repeat)` pair is adjacent in time, pairs the
      results, and reports mean deltas plus a won/lost/unchanged split. It refuses an
      experiment it cannot honestly run rather than ignoring an arm's variable.
-  4. Bootstrap intervals and the up-front minimum detectable effect.
+  4. **Intervals and the up-front MDE — done.** Every paired delta carries a
+     percentile bootstrap 95% interval over the per-pair differences, flagged when
+     it includes zero. Before the first run the tool prints how many paired
+     observations the experiment will have and the smallest pass-rate difference
+     they could resolve, with its assumption stated — so an experiment that could
+     never answer its question says so in the first second. There is deliberately
+     no ship/don't-ship verdict.
   5. The prompt-override hook, last — the only part that touches `harness/`.
 - Multi-phase planning for big goals (plan → execute each phase → review each phase);
   plan-seeded todos are the first slice of this

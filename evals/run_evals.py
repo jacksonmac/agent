@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import random
 import re
 import subprocess
 import sys
@@ -298,6 +300,9 @@ def paired_deltas(control: list[dict], variant: list[dict]) -> dict:
     def num(r, k):
         return r.get(k) or 0
 
+    def series(f):
+        return [f(y) - f(x) for x, y in pairs]
+
     wins = sum(1 for x, y in pairs if y["checker_passed"] and not x["checker_passed"])
     losses = sum(1 for x, y in pairs if x["checker_passed"] and not y["checker_passed"])
     return {
@@ -308,7 +313,79 @@ def paired_deltas(control: list[dict], variant: list[dict]) -> dict:
         "token_delta": round(mean(lambda r: num(r, "prompt_tokens") + num(r, "eval_tokens"))),
         "tool_call_delta": round(mean(lambda r: num(r, "tool_calls")), 1),
         "tool_repeat_delta": round(mean(lambda r: num(r, "tool_repeats")), 1),
+        # raw per-pair differences, so the caller can put an interval on
+        # each without re-deriving the pairing
+        "series": {
+            "pass": series(lambda r: float(bool(r["checker_passed"]))),
+            "wall": series(lambda r: r["wall_secs"]),
+            "tokens": series(lambda r: float(num(r, "prompt_tokens")
+                                             + num(r, "eval_tokens"))),
+            "tool_calls": series(lambda r: float(num(r, "tool_calls"))),
+            "tool_repeats": series(lambda r: float(num(r, "tool_repeats"))),
+        },
     }
+
+
+def bootstrap_ci(values: list[float], resamples: int = 5000,
+                 alpha: float = 0.05, seed: int = 0) -> tuple:
+    """Percentile bootstrap interval for the mean of `values`.
+
+    Non-parametric on purpose: paired pass differences are -1/0/+1 and
+    nothing about them is normal, so resampling the pairs we actually have
+    beats assuming a distribution we do not.
+    """
+    n = len(values)
+    if n == 0:
+        return (0.0, 0.0)
+    if n == 1:
+        return (values[0], values[0])
+    rng = random.Random(seed)
+    means = []
+    for _ in range(resamples):
+        total = 0.0
+        for _ in range(n):
+            total += values[rng.randrange(n)]
+        means.append(total / n)
+    means.sort()
+    lo = means[int(alpha / 2 * resamples)]
+    hi = means[min(resamples - 1, int((1 - alpha / 2) * resamples))]
+    return (lo, hi)
+
+
+def mde_pass_rate(pairs: int, discordance: float = 0.25, z: float = 1.96) -> float:
+    """Smallest pass-rate difference `pairs` paired runs could resolve.
+
+    Paired differences are -1/0/+1 with standard deviation ≈ sqrt(d) where d
+    is the share of pairs that change outcome, so the half-width of the
+    interval is z·sqrt(d)/sqrt(n). d has to be assumed up front — that is
+    the honest part: the number is quoted with its assumption attached,
+    because more churn than assumed widens the interval.
+    """
+    if pairs <= 0:
+        return 1.0
+    return z * math.sqrt(discordance) / math.sqrt(pairs)
+
+
+def print_budget(goals: int, repeats: int, arms: int) -> None:
+    """Say what this run can and cannot answer, before it starts.
+
+    An experiment that could never resolve the effect it is looking for
+    should say so in the first second, not after a night.
+    """
+    pairs = goals * repeats
+    if arms < 2:
+        return
+    mde = mde_pass_rate(pairs)
+    print(f"\n{pairs} paired observations per comparison.")
+    print(f"  Smallest pass-rate difference this can resolve: ~{mde:.2f} "
+          f"({mde * 100:.0f} points), assuming a quarter of pairs change "
+          f"outcome. A smaller true effect will come back inconclusive, and "
+          f"that is the correct answer rather than a failure.")
+    if mde > 0.2:
+        need = math.ceil((1.96 ** 2 * 0.25) / (0.15 ** 2) / max(goals, 1))
+        print(f"  To resolve 15 points you would need about {need} repeats "
+              f"({goals * need} pairs). Cost and tool-efficiency deltas are "
+              f"continuous and will be far better resolved than this.")
 
 
 def print_arms(experiment: dict, results: list[dict]) -> None:
@@ -332,20 +409,29 @@ def print_arms(experiment: dict, results: list[dict]) -> None:
             print(f"  {name}: no comparable pairs")
             continue
         print(f"  {name}: {d['pairs']} pairs")
-        print(f"    pass rate   {d['pass_delta']:+.3f}   "
-              f"({d['wins']} won, {d['losses']} lost, "
+
+        def row(label, key, value, fmt):
+            lo, hi = bootstrap_ci(d["series"][key])
+            straddles = lo <= 0 <= hi
+            mark = "  (interval includes 0)" if straddles else ""
+            print(f"    {label:<11} {value:{fmt}}   95% CI ["
+                  f"{lo:{fmt}}, {hi:{fmt}}]{mark}")
+            return straddles
+
+        row("pass rate", "pass", d["pass_delta"], "+.3f")
+        print(f"                ({d['wins']} won, {d['losses']} lost, "
               f"{d['pairs'] - d['discordant']} unchanged)")
-        print(f"    wall secs   {d['wall_delta']:+.1f}")
-        print(f"    tokens      {d['token_delta']:+d}")
-        print(f"    tool calls  {d['tool_call_delta']:+.1f}   "
-              f"repeats {d['tool_repeat_delta']:+.1f}")
+        row("wall secs", "wall", d["wall_delta"], "+.1f")
+        row("tokens", "tokens", d["token_delta"], "+.0f")
+        row("tool calls", "tool_calls", d["tool_call_delta"], "+.1f")
+        row("repeats", "tool_repeats", d["tool_repeat_delta"], "+.1f")
+        # No verdict. An interval that includes zero is the finding, not a
+        # failure to find one, and a threshold applied to it would only
+        # manufacture confidence this many samples cannot support.
         if d["discordant"] < 6:
-            # a paired proportion test on this many flips has no power worth
-            # the name; saying so is the point of the whole exercise
-            print(f"    NOTE: only {d['discordant']} goals changed outcome. "
-                  f"That is too few to call the pass-rate difference real — "
-                  f"the cost and tool numbers above are the ones this run "
-                  f"can actually speak to.")
+            print(f"    NOTE: only {d['discordant']} pairs changed outcome. "
+                  f"The pass-rate interval above is correspondingly wide — "
+                  f"the cost and tool rows are what this run can speak to.")
 
 
 def _flaky(goals: dict) -> list[str]:
@@ -457,6 +543,8 @@ def main():
         for name, spec in arms.items():
             print(f"  arm {name}: {' '.join(spec['flags']) or '(no extra flags)'}",
                   flush=True)
+
+    print_budget(len(goals), args.repeat, len(arms))
 
     results = []
     n = 0
