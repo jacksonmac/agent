@@ -12,6 +12,7 @@ from .. import hooks, permissions, policy, runlog, ui
 from ..skills import load_skill
 from ..todos import set_todos
 from ..workspace import Workspace
+from .docs import edit_cells, read_sheet, write_sheet
 from .execute import run_python, run_script, run_shell
 from .files import edit_file, grep_files, list_files, read_file, write_file
 from .subagent import spawn_subagent
@@ -34,6 +35,9 @@ _WORKSPACE_TOOLS = {
     "run_python": run_python,
     "run_script": run_script,
     "run_shell": run_shell,
+    "read_sheet": read_sheet,
+    "edit_cells": edit_cells,
+    "write_sheet": write_sheet,
 }
 
 
@@ -63,6 +67,54 @@ def _apply_policy_to_schemas() -> None:
 
 
 TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_sheet",
+            "description": "Read a worksheet from an .xlsx/.xlsm file in your workspace as text. Formula cells show as '=B2+C2 -> 260' so you can see both the formula and its value. Use this instead of read_file for spreadsheets — they are binary.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Workbook filename, e.g. 'sales.xlsx'."},
+                    "sheet": {"type": "string", "description": "Worksheet name (default: the first sheet)."},
+                    "max_rows": {"type": "integer", "description": "Rows to read (default 200)."},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_cells",
+            "description": "Set individual cells in an existing workbook, leaving everything else untouched. Values starting with '=' are written as formulas. The edit is discarded with an explanation if saving it would destroy anything else in the file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Workbook filename, e.g. 'sales.xlsx'."},
+                    "cells": {"type": "object", "description": "A1-style references to values, e.g. {\"B2\": 42, \"D2\": \"=B2+C2\"}."},
+                    "sheet": {"type": "string", "description": "Worksheet name (default: the first sheet)."},
+                },
+                "required": ["name", "cells"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_sheet",
+            "description": "Create a new workbook, or replace one worksheet of an existing one, from a list of rows. Other sheets in an existing workbook are preserved.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Workbook filename, e.g. 'report.xlsx'."},
+                    "rows": {"type": "array", "items": {"type": "array"}, "description": "Rows, each a list of cell values."},
+                    "sheet": {"type": "string", "description": "Worksheet name (default: the first/active sheet)."},
+                },
+                "required": ["name", "rows"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {

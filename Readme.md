@@ -42,6 +42,7 @@ flowchart TB
         MCP["tools/mcp.py<br/><i>Docker MCP gateway</i>"]
         SUB["tools/subagent.py<br/><i>scoped child Session</i>"]
         SKILLS["skills.py<br/><i>load_skill + SKILLS index</i>"]
+        DOCS["tools/docs.py<br/><i>read_sheet/edit_cells/write_sheet</i>"]
     end
 
     subgraph gates ["Gates & observers"]
@@ -87,7 +88,8 @@ flowchart TB
     TOOLS -->|"fire(pre/post_tool)"| HOOKS
     POLICY -->|"require_approval, allow_yolo"| PERM
     POLICY -.->|"drops disabled tools<br/>from TOOL_SCHEMAS"| TOOLS
-    TOOLS --> FILES & EXEC & WEB & MCP & SUB & TODOS & SKILLS
+    TOOLS --> FILES & EXEC & WEB & MCP & SUB & TODOS & SKILLS & DOCS
+    DOCS -->|"check_edit before publishing"| OFFICE
     SUB -->|"child Session"| LLM
     FILES & EXEC -->|"ws.resolve() jail"| WS
     REVIEW -->|"attempt_diff / snapshot_files"| WS
@@ -98,8 +100,8 @@ flowchart TB
     RUN & REVIEW & LLM & CLI -.->|"read"| CONFIG
 ```
 
-`office.py` has no caller yet — it is the fidelity guard the planned document tools
-will sit behind (see the Roadmap).
+`office.py` is the fidelity guard the spreadsheet tools in `tools/docs.py` sit behind:
+no workbook edit is published unless fingerprinting proves it destroyed nothing else.
 
 ## The run loop, end to end
 
@@ -453,6 +455,7 @@ harness/
     ├── files.py      # read/write/edit/list/grep, all jailed
     ├── execute.py    # run_python / run_script / run_shell (policy allowlist)
     ├── subagent.py   # spawn_subagent: scoped child sessions
+    ├── docs.py       # read_sheet / edit_cells / write_sheet, behind office.py
     ├── web.py        # web_search (ddgs), fetch_page (trafilatura)
     └── mcp.py        # Docker MCP Toolkit gateway client
 skills/               # model-loadable skills, one SKILL.md per subdirectory
@@ -729,11 +732,15 @@ this file replaced: installing the repo without one changes nothing.
      third-party dependencies: it reads the zip directly, so it works whether or
      not openpyxl is installed and can judge a file written by anything.
      `office.describe()` turns a loss list into the refusal the model sees.
-  2. **xlsx tools** — `read_sheet` / `write_sheet` / `edit_cells` in
-     `harness/tools/docs.py`, with `policy.json` entries. Always `keep_vba=True`,
-     never `data_only=True` on a path that ends in a save, and every edit runs
-     through `office.check_edit` before the result is published. Ships the format
-     picked first, with the guard already behind it.
+  2. **xlsx tools — done.** `read_sheet`, `edit_cells` and `write_sheet` in
+     `harness/tools/docs.py`. Reads show a formula cell as `=B2+C2 -> 260`, since
+     the model needs the formula to edit it and the value to judge it. Writes never
+     touch the original: the file is copied, edited, fingerprinted against the
+     original by `office.check_edit`, and only swapped in if nothing else was lost —
+     otherwise the copy is deleted and the model gets `office.describe()`, which
+     tells it not to retry the same call. `keep_vba` is set for `.xlsm`, and
+     `data_only` is never used on a path that ends in a save. openpyxl is optional,
+     like the web tools: absent, they return an actionable error.
   3. **Reviewer extraction** (`review.py`) — extract text from `.xlsx`/`.docx` in
      `snapshot_files` and `automated_checks` so the reviewer judges real content
      instead of a binary blob. Without it every verdict on a document deliverable

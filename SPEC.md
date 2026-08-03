@@ -180,6 +180,15 @@ workspace in). `TOOL_SCHEMAS` is the Ollama tool-schema list advertised to model
   wholesale, validates before mutating, and updates the UI and reviewer view.
 - `spawn_subagent` (`tools/subagent.py`) — see §13.
 - `load_skill` (`skills.py`) — see §20. Read-only, never permission-gated.
+- Spreadsheet tools (`tools/docs.py`, jailed like the file tools, and not
+  permission-gated for the same reason): `read_sheet` renders a worksheet as text with
+  formula cells shown as `=B2+C2 -> 260`; `edit_cells` sets A1-style references;
+  `write_sheet` creates a workbook or replaces one sheet of an existing one. **Every write
+  goes through `office.check_edit` (§21) on a copy** — the original is replaced only if the
+  fingerprint proves nothing else was destroyed, and otherwise the copy is deleted and the
+  model receives `office.describe()`. `keep_vba` is set for `.xlsm`; `data_only` is never
+  used on a path that ends in a save, because it would replace every formula with its
+  cached value. openpyxl is optional and its absence yields an actionable error.
 - Web tools (`tools/web.py`): `web_search` (DuckDuckGo via optional `ddgs`), `fetch_page`
   (readability via optional `trafilatura`, else a tag-stripping fallback; blocks
   local/private hosts; capped at `page_text_max`).
