@@ -108,7 +108,7 @@ User (CLI) ──► Harness (this product) ──HTTP──► Ollama server (L
 |---|---|---|
 | **Operator (primary)** | A technically proficient developer running goals from a terminal. Comfortable with CLI flags, Python, and git. Uses the product frequently and interactively; expects the dashboard, permission prompts, and readable reports. | Favored |
 | **Automation user** | The same developer (or a scheduler such as cron/CI) invoking the harness non-interactively with `--yolo`. Needs deterministic non-TTY behavior: plain output, auto-deny or auto-allow permissions, machine-readable artifacts. | Favored |
-| **Harness developer** | A contributor modifying `harness/` itself. Relies on the pytest suite (372 tests) and the eval suite to validate changes. | Secondary |
+| **Harness developer** | A contributor modifying `harness/` itself. Relies on the pytest suite (417 tests) and the eval suite to validate changes. | Secondary |
 | **Extension author** | A user writing `commands/*.md` templates, `hooks.json` entries, or attaching MCP tools. Needs stable placeholder/frontmatter contracts. | Secondary |
 
 ### 2.4 Operating Environment
@@ -367,7 +367,7 @@ Objective measurement of harness and model changes. **Priority: Medium.**
 ### 5.4 Software Quality Attributes
 
 - **QA-1 — Robustness:** Non-core subsystems (review parsing, report generation, memory writing, notifications, hooks, optional web tools) shall degrade or fall back rather than abort a run; the run loop is the only component allowed to end a run.
-- **QA-2 — Testability:** The harness shall be fully exercisable headless; the pytest suite (372 tests under `tests/`) covers the loop, sessions, streaming, review, tools, permissions, policy, hooks, memory, history, resume, subagents, todos, commands, skills, git evidence, sandbox, reporting, and office fidelity. Dashboard rendering and the interactive key controls are covered headlessly, so a TTY is not required to exercise them.
+- **QA-2 — Testability:** The harness shall be fully exercisable headless; the pytest suite (417 tests under `tests/`) covers the loop, sessions, streaming, review, tools, permissions, policy, hooks, memory, history, resume, subagents, todos, commands, skills, git evidence, sandbox, reporting, and office fidelity. Dashboard rendering and the interactive key controls are covered headlessly, so a TTY is not required to exercise them.
 - **QA-3 — Measurability:** Any behavior change shall be benchmarkable with the eval suite against a baseline (REQ-59/60); real token counts and per-phase timings shall be logged per run.
 - **QA-4 — Observability:** Every significant action (LLM call, tool call, permission decision, hook, attempt, verdict) shall appear in `events.jsonl`; a human shall be able to reconstruct a run from `transcript.md` or `report.html` alone.
 - **QA-5 — Portability:** macOS and Linux, TTY and non-TTY, with and without optional packages.

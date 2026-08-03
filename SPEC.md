@@ -383,7 +383,7 @@ Recent UI additions (all display-only, plain-mode-safe):
 
 ## 18. Testing
 
-`pytest` suite under `tests/` (372 tests across 26 modules) covering the loop phases, sessions,
+`pytest` suite under `tests/` (417 tests across 26 modules) covering the loop phases, sessions,
 streaming, review, tools, permissions, policy, hooks, memory, history, resume, subagents,
 todos, commands, skills, git evidence, sandbox, report, and office fidelity.
 Run with `venv/bin/python -m pytest tests/`.
