@@ -12,6 +12,7 @@ import os
 import subprocess
 import time
 
+from . import office
 from .llm import truncate_middle
 
 _IGNORED_DIRS = {"__pycache__", ".pytest_cache", ".git", "venv", ".venv",
@@ -174,9 +175,17 @@ class Workspace:
         chunks, used = [], 0
         for name in dict.fromkeys(names):  # dedupe, keep order
             try:
-                with open(self.resolve(name)) as f:
-                    content = f.read()
-            except (OSError, ValueError) as e:
+                path = self.resolve(name)
+                # office formats are zips: read as text and the reviewer gets
+                # binary noise and judges nothing, which quietly turns every
+                # verdict on a document deliverable into "the file exists"
+                if office.is_office_package(path):
+                    content = (office.extract_text(path)
+                               or "(no extractable text)")
+                else:
+                    with open(path) as f:
+                        content = f.read()
+            except (OSError, ValueError, UnicodeDecodeError) as e:
                 chunks.append(f"--- {name} --- [unreadable: {e}]")
                 continue
             snippet = truncate_middle(content, per_file)

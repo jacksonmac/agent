@@ -58,7 +58,9 @@ def _bare_dashboard(**extra):
     d.attempt_tokens = {}
     d.reclaimed = []
     d.loop_warn = None
+    d.loop_sig = None
     d.last_change = time.monotonic()
+    d.tools_since_change = 0
     d._transcript = deque()
     d._transcript_len = 0
     d._transcript_dropped = 0
@@ -626,6 +628,93 @@ def test_idle_banner_after_a_stretch_with_no_edits(dash):
     dash.last_change = time.monotonic() - 200
     out = _render_text(dash._render_loop_banner())
     assert "no file changes for 3:20" in out
+
+
+# ─── review fixes: banner decay, setup cost, locked ledger ──────────
+
+def test_banner_clears_when_the_agent_moves_on(dash):
+    """Regression: loop_warn was only cleared by a file write, so a banner
+    naming a call the agent had long since stopped making stayed on screen."""
+    for _ in range(3):
+        ui.tool("read_file", {"name": "convert.py"})
+        ui.tool_result("ok")
+    assert dash.loop_warn is not None
+    ui.tool("grep_files", {"pattern": "nulls"})   # different work, no write
+    assert dash.loop_warn is None and dash.loop_sig is None
+    assert dash._render_loop_banner() is None
+
+
+def test_repeat_of_a_different_call_replaces_the_banner(dash):
+    for _ in range(3):
+        ui.tool("read_file", {"name": "a.py"})
+        ui.tool_result("ok")
+    first = dash.loop_warn
+    for _ in range(3):
+        ui.tool("read_file", {"name": "b.py"})
+        ui.tool_result("ok")
+    assert dash.loop_warn != first and "b.py" in dash.loop_warn
+
+
+def test_idle_banner_counts_tools_since_the_last_write(dash):
+    """Regression: tool_count is cumulative, so once a run had made four
+    calls the idle banner could fire forever regardless of later writes."""
+    for i in range(5):
+        ui.tool("grep_files", {"pattern": f"p{i}"})
+        ui.tool_result("ok")
+    dash.last_change = time.monotonic() - 200
+    assert dash._render_loop_banner() is not None      # stalled: nothing written
+    ui.file_created("out.py", added=10)                # progress resets both
+    assert dash.tools_since_change == 0
+    dash.last_change = time.monotonic() - 200          # idle again, but quiet
+    assert dash._render_loop_banner() is None
+    for i in range(4):
+        ui.tool("grep_files", {"pattern": f"q{i}"})
+        ui.tool_result("ok")
+    assert dash._render_loop_banner() is not None      # four more, still nothing
+
+
+def test_budget_shows_pre_attempt_cost(dash):
+    """Regression: --best-of spends its whole candidate round before attempt 1
+    is announced, so its tokens landed in bucket 0 and were filtered out of
+    the panel that exists to show where tokens went."""
+    printed = []
+    dash.print = lambda *a, **k: printed.append(a)
+    dash.attempt_n = 0                       # goalsmith + candidate round
+    ui.llm_stats("executor", 30.0, 50000, 4000)
+    dash.attempt_n = 1
+    ui.llm_stats("executor", 10.0, 9000, 500)
+    assert dash.attempt_tokens[0] == 54000
+    ui._show_budget()
+    out = _render_text(printed[-1][0], width=120)
+    assert "setup" in out and "54.0k" in out
+
+
+def test_ledger_reads_are_taken_under_the_lock(dash):
+    """The render and reader threads must snapshot rather than iterate the
+    live list — attempt_result sorts it, and CPython empties a list while
+    sorting. Asserts the lock is actually held during the read."""
+    import threading
+    holder = threading.Lock()
+    seen = []
+
+    class WatchedLock:
+        def __enter__(self):
+            seen.append("locked")
+            return holder.__enter__()
+
+        def __exit__(self, *a):
+            return holder.__exit__(*a)
+
+    _review(dash, 1, False, [{"criterion": "a", "met": True}])
+    _review(dash, 2, False, [{"criterion": "a", "met": False}])
+    dash._lock = WatchedLock()
+    dash.print = lambda *a, **k: None
+    seen.clear()
+    ui._show_ledger()
+    assert seen, "_show_ledger read the ledger without taking the lock"
+    seen.clear()
+    _render_text(dash._render_plan())
+    assert seen, "_render_plan read the ledger without taking the lock"
 
 
 # ─── permissions [c] per-command grant ──────────────────────────────

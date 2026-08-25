@@ -42,6 +42,7 @@ flowchart TB
         MCP["tools/mcp.py<br/><i>Docker MCP gateway</i>"]
         SUB["tools/subagent.py<br/><i>scoped child Session</i>"]
         SKILLS["skills.py<br/><i>load_skill + SKILLS index</i>"]
+        DOCS["tools/docs.py<br/><i>read_sheet/edit_cells/write_sheet</i>"]
     end
 
     subgraph gates ["Gates & observers"]
@@ -87,7 +88,8 @@ flowchart TB
     TOOLS -->|"fire(pre/post_tool)"| HOOKS
     POLICY -->|"require_approval, allow_yolo"| PERM
     POLICY -.->|"drops disabled tools<br/>from TOOL_SCHEMAS"| TOOLS
-    TOOLS --> FILES & EXEC & WEB & MCP & SUB & TODOS & SKILLS
+    TOOLS --> FILES & EXEC & WEB & MCP & SUB & TODOS & SKILLS & DOCS
+    DOCS -->|"check_edit before publishing"| OFFICE
     SUB -->|"child Session"| LLM
     FILES & EXEC -->|"ws.resolve() jail"| WS
     REVIEW -->|"attempt_diff / snapshot_files"| WS
@@ -98,8 +100,8 @@ flowchart TB
     RUN & REVIEW & LLM & CLI -.->|"read"| CONFIG
 ```
 
-`office.py` has no caller yet — it is the fidelity guard the planned document tools
-will sit behind (see the Roadmap).
+`office.py` is the fidelity guard the spreadsheet tools in `tools/docs.py` sit behind:
+no workbook edit is published unless fingerprinting proves it destroyed nothing else.
 
 ## The run loop, end to end
 
@@ -123,7 +125,7 @@ sequenceDiagram
     C->>C: settings.model / executor_model /<br/>reviewer_model / goalsmith_model
     C->>C: load policy.json → shell/network/<br/>execution/limits, drop disabled tools
     C->>C: create Workspace + RunLog, configure<br/>hooks.json + permission gate
-    C->>C: system prompt += AGENT.md + SKILLS index<br/>+= previous-run summary (--workspace)
+    C->>C: system prompt += AGENT.md + SKILLS index<br/>+= previous-run summary (resume)
     opt -sg (smart goal)
         C->>G: make_goal_task(goalsmith_model or model, prompt)
         G->>O: chat (GOALSMITH_SYSTEM)
@@ -230,16 +232,16 @@ Who produces what, and who consumes it:
 | Conversation history | `llm.Session.messages` — grows with every turn, compacted between attempts | Ollama `/api/chat` payload | `list[{role, content, tool_calls?}]` |
 | Stream deltas | Ollama line-JSON chunks, aggregated in `llm._consume_stream` | `ui.stream_delta` (live panel / progressive print); Session sees only the final message | text fragments |
 | Tool calls | Ollama reply `tool_calls` | `tools.execute_tool_call` → permission check → hooks → dispatch → result appended back as a `role: tool` message | name + JSON args → capped string |
-| Permission decision | `permissions.check()` (y/n/a prompt, `_always` grants, non-TTY auto-deny) | `execute_tool_call` (denial returned to the model as `[ERROR]`), `permission` events | `None` (allow) or error string |
+| Permission decision | `permissions.check()` (y/n/a/c prompt, `_always` / base-command grants, non-TTY auto-deny) | `execute_tool_call` (denial returned to the model as `[ERROR]`), `permission` events | `None` (allow) or error string |
 | Todo checklist | `set_todos` tool → `todos.current` | dashboard panel, `REVIEW_USER` ("self-reported — verify") | `[{text, status}]` |
 | Subagent summary | child `Session` in `tools/subagent.py` (fresh context, executor model) | parent's tool result, capped like any other | string |
 | Changed files | `workspace.files_changed_this_attempt()` (mtime scan — catches files written by *any* tool) | `review.py` snapshots, `run.py` stall gate, logs | `list[str]` relative paths |
-| Review evidence | `workspace.snapshot_files()` + `review.automated_checks()` (pytest) | `REVIEW_USER` prompt | capped text blocks |
+| Review evidence | `workspace.attempt_diff()` (git), falling back to `workspace.snapshot_files()`, + `review.automated_checks()` (pytest) | `REVIEW_USER` prompt | capped text blocks |
 | `Verdict` | `review.parse_verdict()` (JSON → re-ask → YES/NO → default NO) | `run.py` pass/retry decision, retry feedback | `{passed, criteria[], feedback}` |
 | Retry message | `run.py` from `Verdict.unmet()` + feedback history | same executor `Session` (preferred) or a fresh one | `RETRY_CONTINUE` / `RETRY_NOTE` template |
 | `events.jsonl` | `runlog.log_event()` called from `run.py`, `llm.py`, `tools/`, `hooks.py`, `permissions.py` | `report.py`, `evals/run_evals.py`, the resume summary, you | one JSON object per line |
 | Memory note | `memory.update_agent_md()` — goalsmith-model call at run end, bullets appended as a dated section | `<workspace>/AGENT.md` → next run's system prompt | markdown section, trimmed to budget |
-| Resume summary | `cli._load_resume_context()` — mechanical, from the previous run's `events.jsonl` / `attempt_history.json` | executor system prompt on `--workspace` reuse | capped text block |
+| Resume summary | `cli._load_resume_context()` — mechanical, from the previous run's `events.jsonl` / `attempt_history.json` | executor system prompt on `--workspace` / `-r` reuse | capped text block |
 | Hook commands | user-authored `hooks.json` at the repo root | `hooks.fire()` on pre/post_tool, attempt_end, run_end (observe-only) | shell commands with `{placeholders}` |
 | `runs/history.db` | `history.record()` at run end | `agent.py history` / `history --stats` | sqlite row per run |
 | `report.html` | `report.py` at the end of every run | your browser | self-contained HTML |
@@ -281,7 +283,10 @@ and a bad attempt can be rolled back with plain git. Snapshots remain the fallba
 git is unavailable or the diff is empty.
 
 Reuse a previous workspace (to continue earlier work) with
-`--workspace runs/run_.../workspace`.
+`--workspace runs/run_.../workspace`, or let the harness find it: `-r/--resume`
+takes a run id from `agent.py history`, a run/workspace directory, or nothing at
+all (bare `--resume` picks the latest run). With `-r` and no goal source, the
+previous run's goal is reused too.
 
 ## The tool belt
 
@@ -322,8 +327,10 @@ Claude Code:
   and the final state is handed to the reviewer labeled *self-reported — verify against
   the workspace*, so claimed-done vs actually-done is visible.
 - **`spawn_subagent`** — delegates a self-contained subtask (exploration, research, a
-  contained build step) to a fresh child session with its own context and a smaller
-  tool-round budget (`subagent_max_rounds`, default 8). Only the child's final summary
+  contained build step) to a fresh child session with its own context and its own
+  tool-round budget (`policy.limits.subagent_max_rounds`, default 20 — deliberately more
+  than the executor's 15, since the child starts from an empty context and has to
+  rediscover the workspace). Only the child's final summary
   returns to the parent, capped like any tool result — the parent's context stays small.
   Subagents can't spawn subagents, and the child doesn't get `set_todos` (the checklist
   belongs to the parent). There's no CLI flag: the **executor decides** to call it when a
@@ -370,6 +377,8 @@ python3 agent.py -g "..." --mcp                                    # + Docker MC
 python3 agent.py -g "..." --mcp --mcp-profile work                 # specific MCP Toolkit profile
 python3 agent.py -g "Delegate the file survey to a subagent, then write a report"  # invites spawn_subagent
 python3 agent.py -g "..." --workspace runs/latest/workspace        # continue earlier work
+python3 agent.py -r                                                # same, but resume the latest run + its goal
+python3 agent.py -r 42 -g "now add tests"                          # resume run 42 from `agent.py history`
 python3 agent.py -g "..." -i                                       # steer failed attempts by hand (--interactive)
 python3 agent.py -g "..." --sandbox                                # execute tools inside a Docker container
 python3 agent.py -g "..." --no-git                                 # snapshot evidence instead of git diffs
@@ -391,8 +400,9 @@ model commits to filenames and a verification step before touching tools), the
 fix failures before the reviewer sees it). `--best-of N` additionally runs N independent
 first attempts in separate `candidate_*` workspaces, reviews each, and continues the loop
 from the winner. On a real terminal you get a live rich dashboard (attempt/phase/token
-budget/tool log/todos/streaming panel); piped output falls back to plain lines with
-progressive streaming. Every run ends by writing a self-contained **`report.html`**
+budget/tool log/todos/criteria/streaming panel, plus on-demand overlays for the transcript,
+tool history, last diff, attempt ledger and per-role budget); piped output falls back to
+plain lines with progressive streaming. Every run ends by writing a self-contained **`report.html`**
 into the run dir (regenerate with `python3 -m harness.report runs/latest`), recording
 a row in `runs/history.db`, and appending a memory note to the workspace AGENT.md.
 
@@ -432,22 +442,26 @@ harness/
 ├── history.py        # sqlite run index (agent.py history)
 ├── commands.py       # commands/*.md loader (-c)
 ├── skills.py         # skills/<name>/SKILL.md index + load_skill tool
+├── office.py         # office-doc fidelity guard (stdlib-only OPC fingerprint)
 ├── hooks.py          # observe-only hooks.json event hooks
 ├── policy.py         # policy.json loader/validator: the guardrails as data
-├── permissions.py    # y/n/a gate for the policy's gated tools (--yolo)
+├── permissions.py    # y/n/a/c gate for the policy's gated tools (--yolo)
 ├── run.py            # the execute → review → retry loop (+ plan/self-check/best-of)
 ├── ui.py             # rich live dashboard, plain-print fallback
+├── keys.py           # non-blocking single-key TTY reads for the dashboard
 ├── report.py         # self-contained report.html per run
 └── tools/
     ├── __init__.py   # registry, Ollama schemas, execute_tool_call dispatch
     ├── files.py      # read/write/edit/list/grep, all jailed
     ├── execute.py    # run_python / run_script / run_shell (policy allowlist)
     ├── subagent.py   # spawn_subagent: scoped child sessions
+    ├── docs.py       # read_sheet / edit_cells / write_sheet, behind office.py
     ├── web.py        # web_search (ddgs), fetch_page (trafilatura)
     └── mcp.py        # Docker MCP Toolkit gateway client
 skills/               # model-loadable skills, one SKILL.md per subdirectory
 tests/                # pytest suite for the harness itself (venv/bin/python -m pytest)
 evals/                # benchmark goals + runner for measuring harness changes
+└── experiments/      # A/B arm definitions (--experiment)
 ```
 
 ## Requirements
@@ -466,8 +480,69 @@ independently of the harness's own reviewer:
 ```bash
 venv/bin/python evals/run_evals.py --label after            # run all 8, write results_after.json
 venv/bin/python evals/run_evals.py --goals csv_cleanup      # subset
+venv/bin/python evals/run_evals.py --label after --repeat 5 # 5 runs per goal (40 runs)
 venv/bin/python evals/run_evals.py --label after --compare evals/results_baseline.json
+venv/bin/python evals/run_evals.py --label plan --repeat 5 \
+    --experiment evals/experiments/self-check.json      # A/B two arms, interleaved
 ```
+
+Each run also records how much of the work was wasted motion — total tool calls, the
+share that errored, and the share that repeated a call identical to an earlier one in
+the same run. `--compare` prints all three. A change that leaves the pass rate alone but
+halves the repeat rate is a real improvement, and this is the only place it shows up.
+
+**`--repeat N` is what makes a comparison mean anything.** The executor samples at
+`temperature 0.7`, so one run per goal cannot tell a real change from a resample — a
+goal that flips may simply have rolled differently. With repeats, each goal reports a
+pass *rate* (`3/5`) instead of a bit, goals that pass **and** fail with no harness change
+are listed as flaky, and `--compare` prints a rate delta rather than the word
+"REGRESSED". Comparing two single-run labels now says so explicitly instead of implying
+a result. Every repeat gets its own workspace, so repeat 2 never starts from the files
+repeat 1 produced. Repeats run goal-major within each pass, so an interrupted run still
+holds one complete sweep of every goal.
+
+**`--experiment FILE` runs two or more arms head to head.** An arm is a name plus a set
+of `agent.py` flags:
+
+```json
+{"name": "is the self-check turn worth its tokens?",
+ "arms": {"baseline":      {"description": "the loop as shipped"},
+          "no-self-check": {"flags": ["--no-self-check"]}}}
+```
+
+Before anything runs, the tool states how many paired observations you will have and
+the smallest pass-rate difference they can resolve (with the assumption behind that
+number spelled out). Each reported delta then carries a **percentile bootstrap 95%
+interval**, marked when it includes zero. There is no ship/don't-ship verdict: a
+threshold applied to forty samples manufactures confidence that isn't there. In practice
+the pass-rate interval is usually wide and the cost and tool-efficiency intervals are
+tight — which is the real reason to run overnight.
+
+The arms run **interleaved** — innermost in the loop, so the two runs of a `(goal, repeat)`
+pair happen seconds apart. Whatever drifts across a long night (server load, model
+residency) then drifts for both sides of every pair instead of landing on whichever arm
+ran second. Results are paired by `(goal, repeat)` and reported as a mean difference in
+pass rate, wall seconds, tokens and tool calls, with the won/lost/unchanged split spelled
+out. When fewer than six goals actually changed outcome, the report says the pass-rate
+difference cannot be called real and points you at the cost numbers instead. The arm
+definitions are copied into the results file, so it still says what it tested months later.
+
+An arm can also vary **prompt wording**, which no flag can express:
+
+```json
+{"arms": {"baseline": {},
+          "terse": {"prompts": {"PLAN_PROMPT": "List the files you will create…"}}}}
+```
+
+The runner writes each arm's overrides beside that run's workspace and points
+`AGENT_PROMPT_OVERRIDES` at the file; `harness/prompts.py` applies it at import, so every
+consumer of the template sees the same text, and the `run_start` event records which
+templates were replaced. Set the variable yourself to try a prompt outside the eval suite.
+
+Validation is strict throughout: an unknown key, a single arm, a non-list `flags`, or a
+prompt name that is not a real template is an error rather than a silently ignored setting
+— an experiment whose variable is quietly dropped would compare two identical arms and
+report the difference as a finding.
 
 Keep `--attempts` constant across runs you compare. To capture a **baseline for the
 pre-improvement harness** (the eval suite works against whatever code is checked out):
@@ -477,6 +552,8 @@ git stash                                                    # park the new harn
 venv/bin/python evals/run_evals.py --label baseline
 git stash pop
 venv/bin/python evals/run_evals.py --label after --compare evals/results_baseline.json
+venv/bin/python evals/run_evals.py --label plan --repeat 5 \
+    --experiment evals/experiments/self-check.json      # A/B two arms, interleaved
 ```
 
 ### Picking a bigger reviewer model
@@ -560,7 +637,7 @@ this file replaced: installing the repo without one changes nothing.
 - **Streaming** — tokens render live (a rolling panel in the dashboard, progressive
   print in plain mode); `--no-stream` waits for complete responses.
 - **Permission prompts** — the tools named in the policy's `execution.require_approval`
-  (by default `run_shell`/`run_python`/`run_script`) pause for y/n/a approval before
+  (by default `run_shell`/`run_python`/`run_script`) pause for y/n/a/c approval before
   executing, and the approved command is recorded in the `permission` event.
   Non-interactive sessions auto-deny with an error the model can react to; `--yolo`
   disables the gate (evals pass it automatically) unless the policy forbids it.
@@ -585,7 +662,8 @@ this file replaced: installing the repo without one changes nothing.
   lessons into the workspace `AGENT.md` (dated sections, oldest trimmed, user
   preamble untouched); the file is injected back into the executor's system prompt
   on the next run. `--no-memory` skips it.
-- **Session resume** — reusing a workspace with `--workspace runs/<run>/workspace`
+- **Session resume** — `-r/--resume` (bare = latest run, or a history id, or a
+  directory) and `--workspace runs/<run>/workspace`
   auto-injects a mechanical summary of that run (goal, verdict, feedback, files)
   so the next session builds on the work instead of redoing it.
 - **Custom commands** — `commands/<name>.md` files: a goal template with `{args}`
@@ -609,9 +687,25 @@ this file replaced: installing the repo without one changes nothing.
 - **Run history** — every run appends to `runs/history.db`; `agent.py history`
   lists past runs (`--limit N`, default 20), `history --stats` shows pass-rate
   per executor model.
+- **A/B experiments** — `evals/run_evals.py --experiment FILE --repeat N` runs two or
+  more arms (flag sets, prompt-wording variants, or both) interleaved, pairs them by
+  `(goal, repeat)`, and reports pass rate, cost and tool-efficiency deltas with bootstrap
+  95% intervals. It states before starting what size effect the run could resolve, and
+  never issues a ship/don't-ship verdict. See *Measuring changes* above.
 
 ## Roadmap
 
+- **Trustworthy verdicts** — the reviewer is the component everything else depends on, and
+  its accuracy has never been measured: every eval row records both the reviewer's verdict
+  and the programmatic checker's, and nothing compares them. The false-pass rate matters
+  most, because a false pass *ends the run* and hands you broken work with a green tick,
+  while a false fail merely costs one attempt. **[VERIFICATION.md](VERIFICATION.md)** is a
+  five-phase proposal: measure the confusion matrix first (and let that measurement cancel
+  the rest if the problem turns out to be small), then require evidence for a PASS, make the
+  eval checkers prove they reject wrong answers, and require the agent's own verifier to
+  fail against the previous attempt before its pass counts for anything.
+  [PLAN.md](PLAN.md) is the execution plan: numbered work items with acceptance criteria,
+  a decision gate after the measurement phase, and a risk register.
 - Multi-phase planning for big goals (plan → execute each phase → review each phase);
   plan-seeded todos are the first slice of this
 - **Office documents as first-class deliverables** — spreadsheets and documents first
@@ -649,11 +743,15 @@ this file replaced: installing the repo without one changes nothing.
      third-party dependencies: it reads the zip directly, so it works whether or
      not openpyxl is installed and can judge a file written by anything.
      `office.describe()` turns a loss list into the refusal the model sees.
-  2. **xlsx tools** — `read_sheet` / `write_sheet` / `edit_cells` in
-     `harness/tools/docs.py`, with `policy.json` entries. Always `keep_vba=True`,
-     never `data_only=True` on a path that ends in a save, and every edit runs
-     through `office.check_edit` before the result is published. Ships the format
-     picked first, with the guard already behind it.
+  2. **xlsx tools — done.** `read_sheet`, `edit_cells` and `write_sheet` in
+     `harness/tools/docs.py`. Reads show a formula cell as `=B2+C2 -> 260`, since
+     the model needs the formula to edit it and the value to judge it. Writes never
+     touch the original: the file is copied, edited, fingerprinted against the
+     original by `office.check_edit`, and only swapped in if nothing else was lost —
+     otherwise the copy is deleted and the model gets `office.describe()`, which
+     tells it not to retry the same call. `keep_vba` is set for `.xlsm`, and
+     `data_only` is never used on a path that ends in a save. openpyxl is optional,
+     like the web tools: absent, they return an actionable error.
   3. **Reviewer extraction** (`review.py`) — extract text from `.xlsx`/`.docx` in
      `snapshot_files` and `automated_checks` so the reviewer judges real content
      instead of a binary blob. Without it every verdict on a document deliverable
@@ -661,8 +759,6 @@ this file replaced: installing the repo without one changes nothing.
      exists to catch. `workspace.py` needs the matching change: accept binary seed
      files and stop treating them as text for change detection (mtime scanning is
      fine; snapshotting is not).
-  4. **docx tools** — read paragraphs and tables, rewrite a paragraph, append
-     sections. Cheaper than xlsx because step 1 proved no guard is needed.
 
   Deferred until the above is in real use: `.pptx`, and surgical zip-level patching
   (rewriting a single part and leaving the rest byte-identical), which is the

@@ -1,0 +1,8 @@
+{
+  "name": "is the self-check turn worth its tokens?",
+  "arms": {
+    "baseline": {"description": "the loop as shipped"},
+    "no-self-check": {"flags": ["--no-self-check"],
+                      "description": "skip the verify-and-fix turn"}
+  }
+}

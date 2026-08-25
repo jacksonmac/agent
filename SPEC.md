@@ -33,9 +33,9 @@ or the attempt budget runs out.
 Representative CLI flags (full list in `harness/cli.py:parse_args`):
 `--model`, `-rm/--reviewer-model`, `-em/--executor-model`, `-gm/--goalsmith-model`,
 `--attempts`, `--best-of N`, `--no-plan`, `--no-self-check`, `--no-memory`, `--no-skills`,
-`--no-stream`,
-`--no-notify`, `--yolo`, `--url`, `--num-ctx`, `--full-context`, `--no-reviewer-tools`,
-`--mcp`, `--mcp-profile`, `--workspace DIR`.
+`--no-stream`, `--no-notify`, `--yolo`, `--url`, `--num-ctx`, `--full-context`,
+`--no-reviewer-tools`, `--mcp`, `--mcp-profile`, `--workspace DIR`, `--policy FILE`,
+`--sandbox`, `--sandbox-image`, `--no-git`, `-i/--interactive`, `-r/--resume`.
 
 ---
 
@@ -52,7 +52,10 @@ at startup and everything else reads from it. Notable defaults:
 - Per-role sampling (`RoleOptions`): executor `temperature=0.7`, reviewer `0.1`,
   goalsmith `0.3`; each has `think=True`.
 - Feature toggles: `full_context`, `reviewer_tools`, `memory`, `skills`, `stream`, `notify`,
-  `plan_first`, `self_check`, `subagent_max_rounds = 8`.
+  `plan_first`, `self_check`, `interactive`, `subagent_max_rounds = 20`.
+- `workspace_git = True` — commit per attempt so the reviewer judges a real diff (`--no-git`).
+- `sandbox = False`, `sandbox_image = "python:3.12-slim"` — `--sandbox` runs the execute
+  tools inside a per-workspace Docker container.
 
 ---
 
@@ -88,6 +91,12 @@ Returns `run_passed: bool`. Sequence:
    `history.db` (§12), fire the `run_end` hook, write the memory note (§presentation note:
    `ui.phase("writing memory note")`), then `ui.stop()`, print the timing summary, and print
    the run-artifact paths.
+
+Every system and user template the loop sends lives in `harness/prompts.py` —
+`EXECUTOR_SYSTEM`, `PLAN_PROMPT`, `EXECUTE_AFTER_PLAN`, `SELF_CHECK_PROMPT`,
+`RETRY_CONTINUE`, `RETRY_NOTE`, `REVIEWER_SYSTEM`, `REVIEW_USER`, `GOALSMITH_SYSTEM`,
+`SUBAGENT_SYSTEM`. Keeping them in one module is what makes a prompt change a reviewable
+one-file diff, and is a precondition for A/B-testing prompt wording (RD I-12).
 
 ### `_run_attempt` (one executor attempt)
 `ws.begin_attempt()` marks the mtime baseline. Then:
@@ -156,13 +165,30 @@ workspace in). `TOOL_SCHEMAS` is the Ollama tool-schema list advertised to model
   literal, `file:line` results). `write_file`/`edit_file` now emit a **display-only** unified
   diff via `ui.diff(...)`; the string returned to the model is unchanged.
 - Exec tools (`tools/execute.py`, cwd = workspace): `run_python` (`python3 -c`, 120s),
-  `run_script` (a saved `.py`, 120s), `run_shell` (allowlisted: `pip pip3 python3 pytest ls
-  mkdir cat echo`; shell metacharacters `; | & < > ` $` rejected; `shell=False` + `shlex`;
-  360s). These three are the permission-gated set.
+  `run_script` (a saved `.py`, 120s), `run_shell` (360s). Under the default
+  `shell.mode: "allowlist"` the command must be a single plain command from
+  `policy.shell.allowed` (`pip pip3 python3 pytest ls mkdir cat echo`), shell
+  metacharacters `; | & < > ` $` and newline are rejected, and it runs `shell=False` via
+  `shlex` — so the allowlist cannot be bypassed by chaining. Under `shell.mode: "any"`,
+  **or under `--sandbox` where the container is the guardrail**, the command goes to a real
+  shell (`sh -c`) with no filtering. An empty `allowed` list refuses everything, naming the
+  policy. These three tools are the default permission-gated set.
+- `--sandbox` runs the exec tools in one long-lived Docker container per workspace
+  (`--sandbox-image`, default `python:3.12-slim`, workspace bind-mounted at `/ws`, removed
+  at exit), so `pip install`s persist across calls within a run.
 - `set_todos` (`todos.py`) — the executor's self-maintained checklist; replaces the list
   wholesale, validates before mutating, and updates the UI and reviewer view.
 - `spawn_subagent` (`tools/subagent.py`) — see §13.
 - `load_skill` (`skills.py`) — see §20. Read-only, never permission-gated.
+- Spreadsheet tools (`tools/docs.py`, jailed like the file tools, and not
+  permission-gated for the same reason): `read_sheet` renders a worksheet as text with
+  formula cells shown as `=B2+C2 -> 260`; `edit_cells` sets A1-style references;
+  `write_sheet` creates a workbook or replaces one sheet of an existing one. **Every write
+  goes through `office.check_edit` (§21) on a copy** — the original is replaced only if the
+  fingerprint proves nothing else was destroyed, and otherwise the copy is deleted and the
+  model receives `office.describe()`. `keep_vba` is set for `.xlsm`; `data_only` is never
+  used on a path that ends in a save, because it would replace every formula with its
+  cached value. openpyxl is optional and its absence yields an actionable error.
 - Web tools (`tools/web.py`): `web_search` (DuckDuckGo via optional `ddgs`), `fetch_page`
   (readability via optional `trafilatura`, else a tag-stripping fallback; blocks
   local/private hosts; capped at `page_text_max`).
@@ -171,12 +197,16 @@ workspace in). `TOOL_SCHEMAS` is the Ollama tool-schema list advertised to model
 
 ## 6. Permission gate (`harness/permissions.py`)
 
-The gated set is `{run_shell, run_python, run_script}` (subprocess spawners; file tools are
-jailed and reversible, web tools are read-only). `check()`:
-- `--yolo` or a prior "always" grant → allow.
+The gated set is the active policy's `execution.require_approval` (§22), which defaults to
+`{run_shell, run_python, run_script}` — subprocess spawners; file tools are jailed and
+reversible, web tools are read-only. `check()`:
+- `--yolo` or a prior "always" grant → allow. A policy with `allow_yolo: false` refuses
+  `--yolo` outright, so a locked-down deployment cannot be waved through from the CLI.
 - Non-interactive session (`stdin` not a TTY) → auto-deny with an actionable error (warns
   once, suggests `--yolo`).
-- Otherwise an interactive `ui.confirm` y/n/a prompt; "always" grants the tool for the whole
+- Otherwise an interactive `ui.confirm_tool` card showing the full command/code, offering
+  **y** (once), **n**, **a** (this tool for the whole run) and — for `run_shell` — **c**,
+  which grants the derived base command (e.g. every later `pytest …`) for the rest of the
   run. Every decision is logged as a `permission` event. The gate lives in
   `execute_tool_call`, so executor, reviewer, and subagents all share it.
 
@@ -191,7 +221,14 @@ run dir so runs can't contaminate each other.
 - `begin_attempt()` / `files_changed_this_attempt()` detect changed files by mtime (with 1s
   slack), regardless of which tool wrote them — the reviewer judges real files, not claims.
 - `snapshot_files(names)` reads changed files with per-file and total caps for the reviewer.
-- `--workspace DIR` reuses an existing directory to continue earlier work.
+- **Git evidence** (`workspace_git`, on by default, `--no-git` to disable): `init_git()`
+  creates a repo inside `workspace/`, `commit_attempt(n)` commits after each attempt, and
+  `attempt_diff()` hands the reviewer a real unified diff of that attempt. `review.py`
+  prefers the diff and falls back to `snapshot_files` when there is no git — a diff shows
+  every change within the budget two truncated snapshots would spend.
+- `--workspace DIR` reuses an existing directory to continue earlier work; `-r/--resume`
+  resolves one for you from a history id, a run/workspace path, or — bare — the latest run,
+  and reuses that run's goal when no goal source is given.
 
 ---
 
@@ -199,9 +236,11 @@ run dir so runs can't contaminate each other.
 
 `review(model, goal, output, ws, criteria, changed_files)` always returns a `Verdict`:
 - Builds `REVIEW_USER` from the goal, criteria (or an instruction to derive 3–6
-  binary-checkable ones), the capped output, the todo list, the file listing, the changed-file
-  snapshot, and `automated_checks(ws)` — which runs pytest on any `test_*.py` in the workspace
-  and returns capped output.
+  binary-checkable ones), the capped output, the todo list, the file listing, the change
+  evidence (`ws.attempt_diff()` where git is enabled, else `snapshot_files`), and
+  `automated_checks(ws)` — which runs pytest on any `test_*.py` in the workspace and returns
+  capped output. The check output is also handed to `ui.checks()` so the attempt ledger can
+  show it beside the verdict it produced (§17).
 - By default the reviewer gets a **read-only-ish tool subset**
   (`read_file, list_files, run_script, run_shell`) so it can inspect/run code itself;
   `--no-reviewer-tools` disables that.
@@ -261,7 +300,8 @@ that session/verdict.
 
 `spawn_subagent(task, kind)` runs a scoped child `Session` with `SUBAGENT_SYSTEM` (plus the
 skills index when skills exist, §20), the executor model, and the normal tool belt **minus** `spawn_subagent` (a depth guard blocks
-recursion) and `set_todos` (the checklist belongs to the parent). Only the child's final text
+recursion) and `set_todos` (the checklist belongs to the parent). The child gets its own
+round budget, `settings.subagent_max_rounds` (default 20). Only the child's final text
 is returned to the parent, capped like any tool result. The UI nests the child's tool lines
 under a `└` prefix.
 
@@ -302,7 +342,10 @@ listing them. The gateway is closed in `cli.main`'s `finally`.
 
 A single module-level singleton with a swappable backend: a **rich `Live` dashboard** when
 `rich` is importable and stdout is a real TTY, and a **plain-`print` fallback** otherwise
-(evals, pytest, pipes). All harness code calls module functions (`ui.phase`, `ui.tool`,
+(evals, pytest, pipes). Keystrokes come from `harness/keys.py`, which reads single keys
+non-blocking via termios **cbreak** rather than raw mode — `ISIG` stays on so Ctrl-C still
+raises `KeyboardInterrupt`, and output post-processing is left alone so rich rendering is
+not mangled. It restores the terminal on exit via `atexit`, and no-ops on a non-TTY. All harness code calls module functions (`ui.phase`, `ui.tool`,
 `ui.answer`, …). The dashboard shows a header (goal/model/attempt/phase with a spinner), a
 context-token progress bar (green/yellow/red), a rolling recent-tools panel, a live streaming
 tail, the todo checklist, and the last verdict. Persistent lines (answers, verdicts, warnings)
@@ -326,22 +369,49 @@ Recent UI additions (all display-only, plain-mode-safe):
 - **Budget (`[b]`)** — `ui.llm_stats` accumulates calls/prompt/eval/secs per role label
   (executor, reviewer, goalsmith, subagent, memory) plus tokens per attempt; the panel adds
   share bars, marks an attempt that cost >1.25× the one before it, and reports how much each
-  compaction dip in the context sawtooth gave back.
-- **Loop banner** — a repeated `(tool, args)` inside the last 8 calls, or 2 minutes of tool
-  calls with no file mutation, raises a yellow line above the timeline; any write clears it.
+  compaction dip in the context sawtooth gave back. Tokens spent before attempt 1 is
+  announced — the goalsmith turn, and on `--best-of` the entire candidate round — are
+  bucketed under attempt 0 and shown as `setup`, so a best-of run does not hide most of its
+  cost from the panel that exists to show it.
+- **Loop banner** — a repeated `(tool, args)` inside the last 8 calls, or 2 minutes with at
+  least 4 tool calls and no file mutation, raises a yellow line above the timeline. It clears
+  on a write **and** when the next call has a different signature: a banner naming a call the
+  agent has stopped making is worse than none. The idle arm counts `tools_since_change`, not
+  the run-cumulative `tool_count`, so it reports a current stall rather than latching on
+  forever after the run's first four calls.
 - **Steering** — queued messages render as a chip (`[e]` edit, `[c]` cancel), `[/]` opens the
   `STEER_PRESETS` picker, and `[i]` composes an interrupt: `ui.interrupt_requested()` makes
   `Session.send` skip the tool calls it hasn't run yet (each still gets a `[ERROR] skipped`
   result so the history stays well-formed) and go straight back to the model with the message.
+  The flag is scoped to one `send()`: it is dropped on entry, so an interrupt raised during a
+  turn the model answers in text cannot silently truncate a later turn's tool calls.
+  Ledger reads in `_render_plan` and `_show_ledger` snapshot under the dashboard lock —
+  `attempt_result` sorts that list, and CPython empties a list for the duration of a sort.
 
 ---
 
 ## 18. Testing
 
-`pytest` suite under `tests/` (181 tests) covering the loop phases, sessions, streaming,
-review, tools, permissions, hooks, memory, history, resume, subagents, todos, commands,
-skills, and report. Because tests run without a TTY, the UI uses its plain fallback and no rich behavior is
-exercised. Run with `venv/bin/python -m pytest tests/`.
+`pytest` suite under `tests/` (438 tests across 27 modules) covering the loop phases, sessions,
+streaming, review, tools, permissions, policy, hooks, memory, history, resume, subagents,
+todos, commands, skills, git evidence, sandbox, report, and office fidelity.
+Run with `venv/bin/python -m pytest tests/`.
+
+Two things the suite does that its headless setting might suggest it cannot:
+
+- **Rich rendering is exercised.** `tests/test_ui_dashboard.py` builds a `_Dashboard` with
+  `object.__new__` (skipping `Live`), drives the real `ui.*` functions against it, and
+  renders panels through a `rich.Console(record=True)` to assert on the output text. The
+  plain fallback is still what the *rest* of the suite sees, and `pytest.importorskip("rich")`
+  keeps these tests optional.
+- **Interactive controls are exercised without a TTY.** `tests/test_controls.py` drives the
+  pure per-key state machine `ui._feed_key` directly — no thread, no terminal, no sleeps —
+  and uses an injectable `FakeSource` for the reader-thread tests. The real `KeyReader` is
+  tested against a `pty` pair, skipped where `termios` is unavailable.
+
+Optional third-party packages are handled the same way throughout: `tests/test_office.py`
+skips its openpyxl/python-docx round-trips via `importorskip` and keeps its hand-built OPC
+packages running everywhere (11 always, 4 conditional).
 
 ---
 
@@ -414,7 +484,125 @@ legitimate edit and only the calling tool knows that. `describe(problems)` rende
 refusal the model receives — it states that the original is untouched and that retrying the
 same call will not help, since a bare error otherwise invites an identical retry.
 
+**Text extraction.** `extract_text(path)` renders an office package as readable text —
+worksheets as `A2=north  B2=260  C2==B2*2 -> 520` under their real sheet names, documents
+and slides as paragraphs. `workspace.snapshot_files` routes any office package through it,
+so the reviewer judges content rather than zip bytes; without this a verdict on a document
+deliverable degrades to "the file exists". Stdlib-only for the same reason as the
+fingerprint, and it handles **both** string encodings: the inline strings openpyxl writes
+and the shared strings Excel writes — an extractor that handled only one would silently
+lose every label in files produced by the other. It never raises: an unparseable package
+returns a note.
+
 **Tests** (`tests/test_office.py`): two tiers. Hand-built OPC packages exercise the logic
 with no third-party dependency (including the loss-inside-a-surviving-part case); real
 openpyxl/python-docx round-trips pin the measurements above and skip via
 `pytest.importorskip` when those optional packages are absent.
+
+---
+
+## 22. Policy (`harness/policy.py`)
+
+The guardrails as data rather than constants scattered through the code. `policy.json` at
+the repo root is loaded by `cli.main` (`--policy FILE` to point elsewhere) into a frozen
+`Policy` dataclass, and `configure()` installs it as module state — the same pattern as
+`permissions.py` and `hooks.py`, since the tool functions are called from deep inside the
+loop and threading a policy through every signature would buy nothing.
+
+Four sections, each a frozen dataclass with the built-in defaults shown:
+
+| Section | Fields |
+| --- | --- |
+| `shell` | `mode` (`"allowlist"` \| `"any"`), `allowed` (`pip`, `pip3`, `python3`, `pytest`, `ls`, `mkdir`, `cat`, `echo`) |
+| `network` | `web_search`, `fetch_page`, `block_private_addresses`, `allowed_domains` (`["*"]`) |
+| `execution` | `require_approval` (the three run_* tools), `allow_yolo`, `sandbox` (`"optional"`) |
+| `limits` | `max_attempts = 5`, `max_tool_rounds = 15`, `subagent_max_rounds = 20` |
+
+Behavior worth knowing:
+
+- **Validation is strict and loud.** An unknown key raises `PolicyError` naming the key
+  rather than being ignored — a policy that silently drops a typo'd restriction would be
+  worse than no policy.
+- **Disabled tools are never advertised.** `tools._apply_policy_to_schemas()` removes them
+  from `TOOL_SCHEMAS` in place (every module holds a reference to that same list), so the
+  model is not dangled a tool that will refuse — reaching for one costs a whole tool round.
+  The tool functions still refuse independently.
+- **`domain_allowed(host)`** matches a pattern containing `*` with `fnmatch`; a plain domain
+  matches itself and its subdomains, so `example.com` covers `www.example.com`.
+- **The resolved policy is logged** in the `run_start` event via `as_dict()`, so what a run
+  was allowed to do is answerable afterwards from `events.jsonl` by someone who wasn't there.
+- A missing `policy.json` means the built-in defaults, which are exactly the constants the
+  file replaced: installing the repo without one changes nothing. `policy.strict.json` and
+  `policy.open.json` ship as ready-made alternatives.
+
+---
+
+## 23. Eval suite (`evals/`)
+
+Benchmark goals with **programmatic checkers**, so harness changes can be measured instead
+of argued about. The checker is the point: `harness_passed` is the reviewer's opinion, while
+`checker_passed` is Python that opens the produced files and asserts on them.
+
+- **`goals.py`** — 8 `Goal` records (4 multi-file projects: `pkg_stats`, `cli_wordcount`,
+  `todo_app`, `site_gen`; 4 data/file tasks: `csv_cleanup`, `log_parse`, `json_to_csv`,
+  `dedup_merge`). Each pairs a goal string with a `check(ws) -> (bool, detail)` that runs
+  the produced code or reads the produced data.
+- **`run_evals.py`** — runs each goal as a subprocess `agent.py` invocation into
+  `evals/eval_runs/<label>/<goal>/rep_<n>/`, harvests per-run stats from that run's
+  `events.jsonl`, writes `results_<label>.json`, and prints a table. `--goals` subsets,
+  `--attempts` and `--timeout` bound each run, `--model` / `--url` / `--reviewer-model` /
+  `--agent-args` pass through to the harness, and `--compare <file>` diffs against an
+  earlier results file.
+- **Tool efficiency** — `_stats_from_events` counts `tool` events, those whose `ok` is
+  false, and those whose `(name, args)` was already seen in that run. `per_goal` turns them
+  into `mean_tool_calls`, `tool_error_rate` and `tool_repeat_rate`, both rates as shares of
+  calls rather than runs so arms of unequal length compare. Runs predating this (or that
+  timed out) carry `None` and contribute zero rather than dividing by zero.
+- **`--repeat N`** runs every goal N times. Each repeat gets its own workspace — sharing
+  one would let repeat 2 start from the files repeat 1 produced, measuring nothing. Runs
+  are repeat-major (a full sweep of the goals, then the next sweep), so an interrupted run
+  still holds one complete pass. `per_goal()` aggregates rows into `{runs, passed,
+  pass_rate, mean_attempts, mean_wall_secs, mean_tokens}`; `summarize()` reports `goals`
+  and `runs` separately (equal only at `--repeat 1`, which keeps older results files
+  comparable) and embeds `per_goal`. `_flaky()` names goals that both passed and failed
+  with nothing about the harness changing.
+- Runs are headless, so the UI takes its plain-print path and `--yolo` is passed
+  automatically — the permission gate would otherwise auto-deny every `run_python`.
+
+- **`--experiment FILE`** (`load_experiment`) declares named arms, each a list of extra
+  `agent.py` flags. Validation is strict and names the offending key — following
+  `policy.py`, because an experiment that silently drops an arm's variable would report a
+  difference between two identical arms. An arm carrying `prompts` is rejected outright
+  until the `prompts.py` override hook exists (step 5), rather than run with its variable
+  ignored. Arms run **innermost** in the loop, so both runs of a `(goal, repeat)` pair are
+  adjacent in wall-clock time and share whatever drifted; `paired_deltas` then pairs on
+  `(goal, repeat)` and reports mean differences in pass, wall seconds, tokens, tool calls
+  and repeated calls, plus won/lost/unchanged. Below six discordant pairs the report states
+  that the pass-rate difference cannot be called real. The parsed experiment is stored in
+  the results file so it remains self-describing.
+
+- **Intervals, not verdicts.** `bootstrap_ci` takes a percentile bootstrap over the
+  per-pair differences — non-parametric because paired pass differences are −1/0/+1 and
+  nothing about them is normal — seeded so a report does not change its numbers on re-run.
+  Each delta prints with its 95% interval and a marker when the interval includes zero.
+  `mde_pass_rate(pairs, discordance)` is `z·√d/√n`, the half-width for paired ±1
+  differences; `print_budget` prints it before the run with its assumption attached, plus
+  the repeat count that would resolve 15 points. No ship/don't-ship verdict is produced,
+  by design.
+
+- **Prompt overrides.** An arm's `prompts` map is written beside its run and named by
+  `AGENT_PROMPT_OVERRIDES`; `harness/prompts.py` reads it at import time
+  (`apply_overrides`), replacing module-level templates by name. Only upper-case string
+  globals are replaceable, names are validated against the real set, and a bad name raises
+  rather than leaving the arm on the stock prompt. `run.py` logs the replaced names in
+  `run_start`, so which prompts a run used is answerable from `events.jsonl`. The runner
+  also strips the variable from the control arm's environment, so an operator who has it
+  exported does not silently contaminate the baseline.
+
+**Where this is going.** `print_comparison` no longer labels a single flip `improved` or
+`REGRESSED`; it prints a pass-rate delta and, when either side has fewer than two runs per
+goal, states plainly that the comparison cannot separate a real change from a resample.
+All five steps of roadmap item I-12 are in: repeats, tool efficiency, interleaved paired
+arms, bootstrap intervals with an up-front minimum detectable effect, and prompt overrides.
+What the suite still cannot do is decide for you — by design. It reports effects with
+intervals and says when an interval includes zero.

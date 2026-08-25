@@ -368,6 +368,38 @@ def test_interrupt_skips_the_rest_of_the_tool_round(scripted_llm, state, ws):
     assert any("stop that" in str(m) for m in scripted_llm.payloads[-1]["messages"])
 
 
+def test_interrupt_does_not_leak_into_the_next_turn(scripted_llm, state):
+    """Regression: [i] pressed during a turn the model answers in TEXT left
+    the flag set, and the next turn — which the user never interrupted —
+    silently dropped every tool call after the first."""
+    ui._feed_key(state, "i")
+    for ch in "stop that\r":
+        ui._feed_key(state, ch)
+    schemas = [{"function": {"name": "read_file"}}]
+
+    scripted_llm.queue_text("answered without tools")
+    s1 = Session("m", SYS, schemas, accept_user_messages=True)
+    s1.send("turn one")
+    assert state.interrupt is False          # consumed, not carried forward
+
+    ran = []
+    import harness.tools as tools_mod
+    original = tools_mod.execute_tool_call
+    tools_mod.execute_tool_call = lambda n, a: (ran.append(a.get("name")), "ok")[1]
+    try:
+        scripted_llm.replies.append({
+            "role": "assistant", "content": "",
+            "tool_calls": [{"function": {"name": "read_file",
+                                         "arguments": {"name": f"f{i}.py"}}}
+                           for i in range(3)]})
+        scripted_llm.queue_text("done")
+        s2 = Session("m", SYS, schemas, accept_user_messages=True)
+        s2.send("turn two")
+    finally:
+        tools_mod.execute_tool_call = original
+    assert ran == ["f0.py", "f1.py", "f2.py"]
+
+
 # ─── [/] steering presets ───────────────────────────────────────────
 
 def test_slash_opens_the_menu_and_a_digit_sends(state):
@@ -532,6 +564,13 @@ def _bare_dashboard():
     d._transcript_dropped = 0
     d._lock = threading.Lock()
     d.tool_rows = deque(maxlen=10)
+    d.tool_history = []
+    d.tool_count = 0
+    d.tools_since_change = 0
+    d.loop_warn = None
+    d.loop_sig = None
+    d.last_change = time.monotonic()
+    d.files_touched = {}
     d.refresh = lambda: None
     return d
 

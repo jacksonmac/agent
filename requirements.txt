@@ -8,8 +8,9 @@ pytest
 #   ddgs
 #   trafilatura
 
-# Optional, only needed for the office round-trip tests in tests/test_office.py
-# (harness/office.py itself is stdlib-only and always runs):
+# Optional, only needed for the spreadsheet tools (read_sheet / edit_cells /
+# write_sheet) and the office round-trip tests. harness/office.py itself is
+# stdlib-only and always runs:
 #   openpyxl
 #   python-docx
 rich>=13

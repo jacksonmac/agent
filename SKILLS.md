@@ -161,7 +161,7 @@ CLI: **`--no-skills`** turns the whole feature off for a run (sets
 `settings.skills = False`).
 
 Read-only and cheap: `load_skill` is **not** permission-gated — it never triggers
-a y/n/a prompt, because loading instructions can't touch the workspace.
+a y/n/a/c prompt, because loading instructions can't touch the workspace.
 
 ## Observability
 

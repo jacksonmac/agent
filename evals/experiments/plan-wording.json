@@ -1,0 +1,12 @@
+{
+  "name": "does a terser plan prompt help or hurt?",
+  "arms": {
+    "baseline": {"description": "the shipped PLAN_PROMPT"},
+    "terse": {
+      "description": "a much shorter plan instruction",
+      "prompts": {
+        "PLAN_PROMPT": "Task:\n{task}\n\nList the files you will create and the single command you will run to prove it works. No prose."
+      }
+    }
+  }
+}

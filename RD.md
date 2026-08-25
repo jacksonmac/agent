@@ -100,7 +100,7 @@ User (CLI) ──► Harness (this product) ──HTTP──► Ollama server (L
 - **F8 — Extensibility:** MCP gateway tools, user hooks, and saved commands.
 - **F9 — Persistence & reporting:** transcript, machine-readable event log, self-contained HTML report, sqlite run history, and AGENT.md memory notes.
 - **F10 — Presentation:** live rich terminal dashboard with a plain-print fallback, streaming, diffs, and notifications.
-- **F11 — Evaluation suite:** 8 benchmark goals with programmatic checkers for A/B-testing harness changes and models.
+- **F11 — Evaluation suite:** 8 benchmark goals with programmatic checkers for benchmarking harness changes and models. Statistically sound A/B comparison (repeats, paired arms, significance) is I-12.
 
 ### 2.3 User Classes and Characteristics
 
@@ -108,7 +108,7 @@ User (CLI) ──► Harness (this product) ──HTTP──► Ollama server (L
 |---|---|---|
 | **Operator (primary)** | A technically proficient developer running goals from a terminal. Comfortable with CLI flags, Python, and git. Uses the product frequently and interactively; expects the dashboard, permission prompts, and readable reports. | Favored |
 | **Automation user** | The same developer (or a scheduler such as cron/CI) invoking the harness non-interactively with `--yolo`. Needs deterministic non-TTY behavior: plain output, auto-deny or auto-allow permissions, machine-readable artifacts. | Favored |
-| **Harness developer** | A contributor modifying `harness/` itself. Relies on the pytest suite (~161 tests) and the eval suite to validate changes. | Secondary |
+| **Harness developer** | A contributor modifying `harness/` itself. Relies on the pytest suite (438 tests) and the eval suite to validate changes. | Secondary |
 | **Extension author** | A user writing `commands/*.md` templates, `hooks.json` entries, or attaching MCP tools. Needs stable placeholder/frontmatter contracts. | Secondary |
 
 ### 2.4 Operating Environment
@@ -125,7 +125,7 @@ User (CLI) ──► Harness (this product) ──HTTP──► Ollama server (L
 - **CO-2:** All model I/O goes through Ollama's `/api/chat` endpoint and its tool-calling schema; no other LLM providers are supported.
 - **CO-3:** Python 3.10+ standard library preferred; runtime dependencies are limited to `requests` and `rich`, with optional extras degrading gracefully.
 - **CO-4:** All agent file/exec activity must stay inside the per-run workspace jail; nothing is written to the repo root during a run.
-- **CO-5:** Code execution safety relies on a command allowlist and metacharacter rejection, not OS-level sandboxing (containers are a roadmap item — see Appendix).
+- **CO-5:** Code execution safety relies by default on a command allowlist and metacharacter rejection rather than OS-level isolation; `--sandbox` adds a per-workspace Docker container (I-1), but it is opt-in, so the allowlist is what carries the guarantee in the default configuration.
 - **CO-6:** Hooks are strictly observational: they must never be able to block or mutate a run.
 - **CO-7:** The UI must function without `rich` and without a TTY (plain-print fallback), since the eval suite and tests run headless.
 - **CO-8:** Configuration is a single module-level `Settings` singleton mutated once at CLI startup and read-only everywhere else.
@@ -185,7 +185,7 @@ A reviewer model judges the workspace artifacts — not the executor's claims �
 
 #### 3.3.2 Functional Requirements
 
-- **REQ-16:** The review prompt shall include the goal, the criteria (or an instruction to derive 3–6 binary-checkable ones), the capped executor output, the todo checklist labeled *self-reported — verify*, a workspace file listing, capped snapshots of the files changed this attempt, and automated check output.
+- **REQ-16:** The review prompt shall include the goal, the criteria (or an instruction to derive 3–6 binary-checkable ones), the capped executor output, the todo checklist labeled *self-reported — verify*, a workspace file listing, the evidence for what changed this attempt, and automated check output. Change evidence shall be the attempt's unified git diff where git evidence is enabled, falling back to capped per-file snapshots otherwise.
 - **REQ-17:** Automated checks shall run pytest against any `test_*.py` files in the workspace and include capped output as evidence.
 - **REQ-18:** The reviewer shall by default receive a read-only tool subset (`read_file`, `list_files`, `run_script`, `run_shell`) so it can gather evidence but not modify the work; `--no-reviewer-tools` shall remove even those. Tool restriction shall be enforced by the session's allowed-tool set, not by prompt text alone.
 - **REQ-19:** Verdict parsing shall be resilient: extract the first balanced JSON object (tolerating code fences); on failure re-ask once in strict mode; then fall back to YES/NO regex matching; then default to `passed = False`. Review shall never raise and never abort the run.
@@ -204,7 +204,7 @@ The executor's capabilities: file manipulation, code execution, web access, self
 - **REQ-23:** File tools (`write_file`, `read_file` with offset/`max_chars` paging, `list_files` recursive with sizes and junk filtering, `edit_file` exact unique-snippet replace with a close-match hint on miss, `grep_files` regex or literal returning `file:line` results) shall operate only on paths resolved through the workspace jail.
 - **REQ-24:** `write_file` and `edit_file` shall emit a display-only unified diff to the UI; the string returned to the model shall be unchanged by this.
 - **REQ-25:** Execution tools shall run with the workspace as cwd and per-call timeouts: `run_python` (`python3 -c`, 120 s), `run_script` (saved `.py`, 120 s), `run_shell` (360 s).
-- **REQ-26:** `run_shell` shall accept only a single plain command whose executable is on the allowlist (`pip`, `pip3`, `python3`, `pytest`, `ls`, `mkdir`, `cat`, `echo`), shall reject shell metacharacters (`;`, `|`, `&`, `<`, `>`, backtick, `$`), and shall execute with `shell=False` via `shlex` splitting.
+- **REQ-26:** Under the default `shell.mode: "allowlist"`, `run_shell` shall accept only a single plain command whose executable is on `policy.shell.allowed` (by default `pip`, `pip3`, `python3`, `pytest`, `ls`, `mkdir`, `cat`, `echo`), shall reject shell metacharacters (`;`, `|`, `&`, `<`, `>`, backtick, `$`, newline), and shall execute with `shell=False` via `shlex` splitting. An empty `allowed` list shall refuse every command with an error naming the policy. Under `shell.mode: "any"`, or under `--sandbox` where the container is the guardrail, the command shall be handed to a real shell (`sh -c`) with no allowlist or metacharacter filtering.
 - **REQ-27:** `web_search` shall use DuckDuckGo via the optional `ddgs` package; `fetch_page` shall extract readable text via optional `trafilatura` with a tag-stripping fallback, shall refuse local and private-network addresses, and shall cap returned text at `page_text_max`. Missing optional packages shall produce actionable error strings, not crashes.
 - **REQ-28:** `set_todos` shall replace the executor's checklist wholesale after validation, update the live dashboard, be logged as `todos` events, and deliver its final state to the reviewer marked as self-reported.
 - **REQ-29:** Tool results returned to the model shall be capped at `tool_result_max` characters.
@@ -218,7 +218,7 @@ Delegation of self-contained subtasks to a fresh child session, keeping the pare
 
 #### 3.5.2 Functional Requirements
 
-- **REQ-31:** `spawn_subagent(task, kind)` shall run a child session under `SUBAGENT_SYSTEM` on the executor model with a smaller tool-round budget (`subagent_max_rounds`, default 8).
+- **REQ-31:** `spawn_subagent(task, kind)` shall run a child session under `SUBAGENT_SYSTEM` on the executor model with its own tool-round budget (`subagent_max_rounds`, default 20).
 - **REQ-32:** The child's tool belt shall exclude `spawn_subagent` (depth guard — no recursive spawning) and `set_todos` (the checklist belongs to the parent).
 - **REQ-33:** Only the child's final text shall be returned to the parent, capped like any tool result; each spawn shall be bracketed by `subagent_start`/`subagent_end` events, and the UI shall nest the child's tool lines under a `└` prefix.
 
@@ -234,7 +234,7 @@ Per-run filesystem containment and continuation of earlier work. **Priority: Hig
 - **REQ-35:** Path resolution shall raise on any name that escapes the workspace root (`../`, absolute paths); every file/exec tool shall use this resolver.
 - **REQ-36:** Changed-file detection shall be mtime-based (with 1 s slack) from an attempt-start baseline, so files written by any means (file tool, script, shell) are caught.
 - **REQ-37:** `snapshot_files` shall read changed files for the reviewer with per-file and total character caps.
-- **REQ-38:** `--workspace DIR` shall reuse an existing workspace, and the harness shall inject a mechanical summary of the previous run (goal, verdict, feedback, files — derived from its `events.jsonl` / `attempt_history.json`) into the executor system prompt.
+- **REQ-38:** `--workspace DIR` shall reuse an existing workspace, and the harness shall inject a mechanical summary of the previous run (goal, verdict, feedback, files — derived from its `events.jsonl` / `attempt_history.json`) into the executor system prompt. `-r/--resume` shall select that workspace by run id, by directory, or — bare — by the latest run, and shall reuse the previous run's goal when no goal source is given.
 
 ### 3.7 LLM Sessions & Context Management
 
@@ -286,7 +286,7 @@ Terminal UX for interactive and headless use. **Priority: Medium.**
 
 #### 3.10.2 Functional Requirements
 
-- **REQ-54:** When `rich` is importable and stdout is a TTY, the harness shall render a live dashboard showing goal/model/attempt/phase with elapsed time, a color-coded context-token progress bar, a rolling recent-tools panel, a live streaming tail, the todo checklist, and the last verdict; persistent lines (answers, verdicts, warnings) shall print above the live region.
+- **REQ-54:** When `rich` is importable and stdout is a TTY, the harness shall render a live dashboard showing goal/model/attempt/phase with elapsed time, a color-coded context-token progress bar, a rolling recent-tools panel, a live streaming tail, the todo checklist, the criteria checklist, per-file change totals, and the last verdict; it shall warn inline when a tool call repeats or no file has changed for an extended period; and it shall offer on-demand overlays for the transcript, tool history, last diff, the per-attempt criteria ledger, and the per-role token budget. Persistent lines (answers, verdicts, warnings) shall print above the live region.
 - **REQ-55:** Without `rich` or a TTY, all the same information shall degrade to plain progressive printing; no harness feature may depend on the rich backend being present.
 - **REQ-56:** Final answers shall render as Markdown (with a plain-text fallback on parse failure); file writes/edits shall show unified diff previews capped at ~80 lines; per-call LLM stats (seconds, prompt→eval tokens) shall be displayed.
 - **REQ-57:** On run completion the harness shall ring the terminal bell and, on macOS, post a notification banner; both best-effort and suppressed by `--no-notify`.
@@ -301,7 +301,7 @@ Objective measurement of harness and model changes. **Priority: Medium.**
 #### 3.11.2 Functional Requirements
 
 - **REQ-59:** `evals/` shall provide 8 benchmark goals (4 multi-file projects, 4 data/file-processing tasks), each with seeded input files and a programmatic checker that judges the workspace independently of the harness's own reviewer.
-- **REQ-60:** `evals/run_evals.py` shall support `--label` (names the results JSON), `--goals` (subset), `--compare <baseline.json>` (before/after diff), model overrides (e.g. `--reviewer-model`), and `--agent-args` for arbitrary harness-flag A/B tests; eval runs shall pass `--yolo` automatically.
+- **REQ-60:** `evals/run_evals.py` shall support `--label` (names the results JSON), `--goals` (subset), `--experiment FILE` (two or more named arms, run interleaved within each goal/repeat and compared pairwise, with strict validation that refuses an arm whose variable cannot yet be applied), `--repeat N` (N runs per goal, each in its own workspace, recorded per run and aggregated into a per-goal pass rate), `--compare <baseline.json>` (before/after diff reporting a pass-rate delta, naming goals that both pass and fail across repeats, and warning explicitly when either side has only one run per goal), model overrides (e.g. `--reviewer-model`), and `--agent-args` for arbitrary harness-flag A/B tests; eval runs shall pass `--yolo` automatically.
 
 ---
 
@@ -310,7 +310,7 @@ Objective measurement of harness and model changes. **Priority: Medium.**
 ### 4.1 User Interfaces
 
 - **UI-1:** The sole user interface is the command line: `python3 agent.py <goal-source> [flags]` plus the `history` subcommand. There is no GUI; the per-run `report.html` is a static artifact opened in a browser.
-- **UI-2:** Interactive elements: the live rich dashboard (§3.10), streaming output, y/n/a permission prompts, and terminal-bell/banner notifications. All are TTY-conditional with plain fallbacks.
+- **UI-2:** Interactive elements: the live rich dashboard (§3.10), streaming output, y/n/a/c permission prompts, single-key dashboard controls (pause, message, interrupt, attempt ledger, budget, transcript, quit), and terminal-bell/banner notifications. All are TTY-conditional with plain fallbacks.
 - **UI-3:** Errors surfaced to the model use a uniform `[ERROR] ...` string convention; errors surfaced to the user are printed as warnings above the live region and never silently swallowed at run level.
 
 ### 4.2 Hardware Interfaces
@@ -349,8 +349,8 @@ Objective measurement of harness and model changes. **Priority: Medium.**
 ### 5.2 Safety Requirements
 
 - **SF-1:** The workspace jail (REQ-35) shall prevent the agent from reading or writing any file outside its per-run `workspace/`, protecting the host system and the harness's own code from agent action.
-- **SF-2:** Arbitrary shell execution shall be impossible via `run_shell`: allowlist + metacharacter rejection + `shell=False` (REQ-26).
-- **SF-3:** Code-executing tools (`run_shell`, `run_python`, `run_script`) shall require explicit interactive approval (y/n/a) unless `--yolo` was given; non-interactive sessions shall auto-deny with an actionable error rather than silently executing (see §5.3).
+- **SF-2:** Under the default policy, arbitrary shell execution shall be impossible via `run_shell`: allowlist + metacharacter rejection + `shell=False` (REQ-26). This guarantee is explicitly waived by `shell.mode: "any"` and by `--sandbox`, both of which hand over a real shell — the container, not the allowlist, is the boundary in the sandboxed case.
+- **SF-3:** Code-executing tools (the policy's `execution.require_approval`, by default `run_shell`, `run_python`, `run_script`) shall require explicit interactive approval (y/n/a, plus `c` to grant a base command for the run) unless `--yolo` was given — and a policy may forbid `--yolo` outright via `allow_yolo: false`; non-interactive sessions shall auto-deny with an actionable error rather than silently executing (see §5.3).
 - **SF-4:** `fetch_page`'s private-address block shall prevent the agent from being steered into probing the local network (SSRF-style).
 - **SF-5:** Failed runs shall be clearly labeled (`final_output_UNVERIFIED.txt`) so unverified output is never mistaken for verified output.
 
@@ -367,7 +367,7 @@ Objective measurement of harness and model changes. **Priority: Medium.**
 ### 5.4 Software Quality Attributes
 
 - **QA-1 — Robustness:** Non-core subsystems (review parsing, report generation, memory writing, notifications, hooks, optional web tools) shall degrade or fall back rather than abort a run; the run loop is the only component allowed to end a run.
-- **QA-2 — Testability:** The harness shall be fully exercisable headless; the pytest suite (~161 tests under `tests/`) covers the loop, sessions, streaming, review, tools, permissions, hooks, memory, history, resume, subagents, todos, commands, and reporting.
+- **QA-2 — Testability:** The harness shall be fully exercisable headless; the pytest suite (438 tests under `tests/`) covers the loop, sessions, streaming, review, tools, permissions, policy, hooks, memory, history, resume, subagents, todos, commands, skills, git evidence, sandbox, reporting, and office fidelity. Dashboard rendering and the interactive key controls are covered headlessly, so a TTY is not required to exercise them.
 - **QA-3 — Measurability:** Any behavior change shall be benchmarkable with the eval suite against a baseline (REQ-59/60); real token counts and per-phase timings shall be logged per run.
 - **QA-4 — Observability:** Every significant action (LLM call, tool call, permission decision, hook, attempt, verdict) shall appear in `events.jsonl`; a human shall be able to reconstruct a run from `transcript.md` or `report.html` alone.
 - **QA-5 — Portability:** macOS and Linux, TTY and non-TTY, with and without optional packages.
@@ -390,14 +390,16 @@ Objective measurement of harness and model changes. **Priority: Medium.**
 
 | # | Issue | Status |
 |---|---|---|
-| I-1 | **Sandboxed execution** — replace the `run_shell` allowlist with container-based isolation for exec tools. | Open (roadmap) |
+| I-1 | **Sandboxed execution** — container-based isolation for the exec tools. | **Closed** — `--sandbox` runs them in a per-workspace Docker container (`tools/execute.py`, `tests/test_sandbox.py`). The allowlist remains the default: the container is opt-in, so `policy.shell` still carries the guarantee when it is off. |
 | I-2 | **Untrusted-network deployment** — plain-HTTP LAN transport to Ollama; TLS/auth story is TBD if the server ever leaves the trusted LAN. | Open |
 | I-3 | **Multi-phase planning** — plan → execute-per-phase → review-per-phase for large goals. | Open (roadmap) |
-| I-4 | **Git-aware workspace** — commit per attempt and give the reviewer real diffs instead of mtime-based snapshots. | Open (roadmap) |
-| I-5 | **Reviewer model selection** — the default reviewer is the executor's model; a benchmarked ~30B-class default is TBD pending eval A/B runs. | Open |
+| I-4 | **Git-aware workspace** — commit per attempt and give the reviewer real diffs instead of mtime-based snapshots. | **Closed** — `workspace_git` (on by default, `--no-git`): `init_git`/`commit_attempt`/`attempt_diff`, consumed by `review.py` with snapshots as the no-git fallback (`tests/test_git_evidence.py`). |
+| I-5 | **Reviewer model selection** — the default reviewer is the executor's model; a benchmarked ~30B-class default is TBD pending eval A/B runs. Unblocked by I-12: `--experiment` can now compare reviewer models with paired repeats and an interval; the benchmarking run itself is still to be done. | Open |
 | I-6 | **Subagent discoverability** — smaller executor models rarely call `spawn_subagent` unless the goal names delegation explicitly; whether the harness should suggest delegation automatically is TBD. | Open |
 | I-7 | **Windows client support** — the harness targets macOS/Linux; Windows-as-client (path handling, notifications, symlinks for `runs/latest`) is untested and TBD. | Open |
-| I-8 | **Office-document tools** — first-class read/edit/write tools for `.xlsx`/`.csv` and `.docx` (presentations later) in `harness/tools/docs.py`, with `policy.json` entries. Editing an existing file with full round-trip fidelity is the requirement, not just authoring a new one. | Open (roadmap) |
-| I-9 | **Binary-aware review evidence** — `review.py` currently snapshots deliverables as text; office formats need extraction (docx/xlsx/pptx → text) in `snapshot_files` and `automated_checks`, or the verdict degrades to "the file exists". Blocks I-8. | Open (roadmap) |
+| I-8 | **Office-document tools** — first-class read/edit/write tools for `.xlsx`/`.csv` and `.docx` (presentations later) in `harness/tools/docs.py`. Editing an existing file with full round-trip fidelity is the requirement, not just authoring a new one. **xlsx tools landed** (`read_sheet`/`edit_cells`/`write_sheet`, every write gated by I-10's fingerprint); I-9's reviewer extraction has landed; docx tools remain. | Open (roadmap) |
+| I-9 | **Binary-aware review evidence** — office deliverables were snapshotted as text, so the reviewer saw zip bytes and every verdict degraded to "the file exists". **Closed** — `office.extract_text` (stdlib-only, handles inline and shared strings) wired into `workspace.snapshot_files`. | **Closed** — `harness/office.py`, `harness/workspace.py`, `tests/test_office.py` |
 | I-10 | **xlsx edit fidelity guard** — measured (openpyxl 3.1.5): charts, images, conditional formatting, data validation, defined names, comments and merges survive a round-trip, but `<extLst>` constructs (sparklines, slicers, x14 rules) are dropped from *inside* surviving parts, `customXml/` is dropped, `vbaProject.bin` needs `keep_vba=True`, and `data_only=True` destroys every formula. Edit tools must fingerprint before/after (part inventory + unmodelled-construct scan + formula count) and refuse the write on any unrequested loss. Blocks I-8 for xlsx only — python-docx 1.2.0 round-trips docx losslessly, including content controls, tracked changes and fields. | **Closed** — `harness/office.py` + `tests/test_office.py` |
 | I-11 | **Presentations (`.pptx`) and surgical part-level patching** — deferred until I-8 is in real use. Patching (rewrite one OPC part, leave the rest byte-identical) is the fallback if I-10's guard refuses edits users legitimately want; there is no point building it before that is observed. | Open (deferred) |
+| I-13 | **Verdict trustworthiness** — the harness's central claim (a verdict means something because an independent model judged real artifacts) has never been measured. `harness_passed` and `checker_passed` are recorded side by side on every eval row and never compared, so the false-pass rate — the error that ends a run and ships broken work under a green tick — is unknown. Five-phase proposal in **VERIFICATION.md**, with the work broken down in **PLAN.md**: measure the confusion matrix per run and per criterion with clustered intervals; require evidence for a PASS and add an `unverified` criterion state; make the eval checkers prove they reject wrong answers; require the agent's own verifier to fail against the previous attempt's commit before its pass counts; and an adversarial recheck on the PASS path only. Phase 0 is explicitly allowed to cancel the rest. | Open (proposal) |
+| I-12 | **A/B testing for the main loop** — the eval suite ran each goal once per label at `temperature 0.7`, so it could not separate a real change from resampling. **Closed** — `--repeat N` with per-repeat workspaces and per-goal pass rates; tool-efficiency metrics (call count, error rate, repeated-call share); `--experiment FILE` arms run interleaved and paired by `(goal, repeat)`; bootstrap 95% intervals on every delta with the minimum detectable effect printed before the run; and prompt-template overrides via `AGENT_PROMPT_OVERRIDES`, logged in `run_start`. Deliberately reports effects and intervals rather than a ship/don't-ship verdict. Unblocks I-5. | **Closed** — `evals/run_evals.py`, `harness/prompts.py`, `tests/test_evals.py` |

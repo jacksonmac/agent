@@ -9,6 +9,7 @@ import shutil
 import time
 
 from . import hooks as hooks_mod
+from . import prompts as prompts_mod
 from . import permissions
 from . import todos as todos_mod
 from . import ui
@@ -165,7 +166,11 @@ def main(model: str, goal: str, task: str, ws: Workspace, log: RunLog,
               criteria=criteria or [], best_of=best_of,
               plan_first=settings.plan_first, self_check=settings.self_check,
               policy=settings.policy.as_dict(), yolo=permissions.is_yolo(),
-              sandbox=settings.sandbox)
+              sandbox=settings.sandbox,
+              # which prompts this run actually used: an A/B arm that varies
+              # prompt wording must be answerable from events.jsonl, not just
+              # from whoever launched it
+              prompt_overrides=list(prompts_mod.OVERRIDDEN))
     log.transcript(f"# Agent run {time.strftime('%Y-%m-%dT%H:%M:%S')}\n\n"
                    f"**Goal:** {goal}\n\n**Task:** {task}\n\n")
     if criteria:
